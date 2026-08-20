@@ -1,0 +1,107 @@
+# Rules control which commands Codex may run outside the sandbox. Behavioral
+# expectations belong in AGENTS.md. Do not blanket-allow shells, wrappers, or
+# tools that can hide arbitrary commands.
+
+# Read-only file, text, and process inspection.
+prefix_rule(
+    pattern=[[
+        "rg",
+        "grep",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "jq",
+        "ps",
+        "pgrep",
+    ]],
+    decision="allow",
+    match=["rg --files", "grep -n pattern file.txt", "ps"],
+    not_match=["find . -delete", "rtk rg --files"],
+)
+
+# Read-only Git inspection.
+prefix_rule(
+    pattern=["git", [
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "ls-tree",
+    ]],
+    decision="allow",
+    match=["git status", "git diff --check", "git show HEAD"],
+    not_match=["git push", "git reset --hard"],
+)
+
+# Read-only GitHub inspection. Mutating subcommands are handled separately.
+prefix_rule(
+    pattern=["gh", "pr", ["view", "list", "checks", "diff", "status"]],
+    decision="allow",
+    match=["gh pr view 123", "gh pr checks 123"],
+    not_match=["gh pr create", "gh pr merge 123"],
+)
+
+prefix_rule(
+    pattern=["gh", "issue", ["view", "list", "status"]],
+    decision="allow",
+    match=["gh issue view 123", "gh issue list"],
+    not_match=["gh issue create", "gh issue close 123"],
+)
+
+prefix_rule(
+    pattern=["gh", "repo", ["view", "list"]],
+    decision="allow",
+    match=["gh repo view owner/repo", "gh repo list owner"],
+    not_match=["gh repo delete owner/repo"],
+)
+
+prefix_rule(
+    pattern=["gh", "run", ["view", "list", "watch"]],
+    decision="allow",
+    match=["gh run view 123", "gh run list"],
+    not_match=["gh run cancel 123", "gh run rerun 123"],
+)
+
+# Repository deletion is never an incidental development action.
+prefix_rule(
+    pattern=["gh", "repo", "delete"],
+    decision="forbidden",
+    justification="Delete repositories manually after verifying the exact target.",
+    match=["gh repo delete owner/repo --yes"],
+    not_match=["gh repo view owner/repo"],
+)
+
+# Destructive local Git cleanup is blocked. Use focused, recoverable changes.
+prefix_rule(
+    pattern=["git", "reset", "--hard"],
+    decision="forbidden",
+    justification="Use a focused reversible edit instead of discarding the worktree.",
+    match=["git reset --hard", "git reset --hard HEAD~1"],
+    not_match=["git reset HEAD file.txt"],
+)
+
+prefix_rule(
+    pattern=["git", "clean"],
+    decision="forbidden",
+    justification="Inspect and remove exact generated files instead of cleaning broadly.",
+    match=["git clean -fd", "git clean -fdx"],
+    not_match=["git status --short"],
+)
+
+# Force-pushing rewrites remote history. Normal authorized pushes remain
+# available because they do not match this rule.
+prefix_rule(
+    pattern=["git", "push", ["--force", "-f", "--force-with-lease"]],
+    decision="forbidden",
+    justification="Push normally or perform the history rewrite manually after verifying the remote target.",
+    match=["git push --force", "git push -f", "git push --force-with-lease"],
+    not_match=["git push", "git push origin feature"],
+)

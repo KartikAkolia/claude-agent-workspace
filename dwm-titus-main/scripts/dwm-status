@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fifo=
+fifo_dir=
+pids=()
+power_poll_interval=${DWM_STATUS_POWER_POLL_INTERVAL:-30}
+power_supply_dir=${DWM_STATUS_POWER_SUPPLY_DIR:-/sys/class/power_supply}
+
+cleanup() {
+	if ((${#pids[@]} > 0)); then
+		kill "${pids[@]}" 2>/dev/null || true
+	fi
+	if [[ -n ${fifo_dir:-} && -d $fifo_dir ]]; then
+		rm -rf "$fifo_dir"
+	fi
+}
+
+publish() {
+	local power volume
+
+	power=$(power_text)
+	volume=$(volume_text)
+
+	xsetroot -name "$power | $volume"
+}
+
+volume_text() {
+	local mute volume
+
+	if command -v pactl >/dev/null 2>&1; then
+		mute=$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | awk '{ print $2 }')
+		volume=$(pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null |
+			awk 'match($0, /[0-9]+%/) { print substr($0, RSTART, RLENGTH); exit }')
+		if [[ $mute == yes ]]; then
+			printf 'VOL muted\n'
+		else
+			printf 'VOL %s\n' "${volume:-n/a}"
+		fi
+	elif command -v wpctl >/dev/null 2>&1; then
+		wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null |
+			awk '
+				{
+					volume = int(($2 * 100) + 0.5) "%"
+					if ($3 == "[MUTED]") {
+						print "VOL muted"
+					} else {
+						print "VOL " volume
+					}
+				}
+			' || printf 'VOL n/a\n'
+	else
+		printf 'VOL n/a\n'
+	fi
+}
+
+power_text() {
+	local battery capacity status
+
+	for battery in "$power_supply_dir"/BAT*; do
+		[[ -e $battery ]] || continue
+		capacity=$(cat "$battery/capacity" 2>/dev/null || printf n/a)
+		status=$(cat "$battery/status" 2>/dev/null || printf unknown)
+		printf 'BAT %s%% %s\n' "$capacity" "$status"
+		return
+	done
+
+	printf 'AC\n'
+}
+
+watch_pactl() {
+	command -v pactl >/dev/null 2>&1 || return 0
+	pactl subscribe 2>/dev/null |
+		while IFS= read -r event; do
+			case $event in
+			*" on sink"* | *" on server"* | *" on card"*)
+				printf 'audio\n' >"$fifo"
+				;;
+			esac
+		done
+}
+
+watch_power_events() {
+	command -v udevadm >/dev/null 2>&1 || return 0
+	udevadm monitor --udev --subsystem-match=power_supply 2>/dev/null |
+		while IFS= read -r _event; do
+			printf 'power\n' >"$fifo"
+		done
+}
+
+watch_power_poll() {
+	while :; do
+		sleep "$power_poll_interval"
+		printf 'power\n' >"$fifo"
+	done
+}
+
+fifo_dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/dwm-status.XXXXXX")
+fifo=$fifo_dir/events
+mkfifo "$fifo"
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+publish
+watch_pactl &
+pids+=("$!")
+watch_power_events &
+pids+=("$!")
+watch_power_poll &
+pids+=("$!")
+
+exec 3<>"$fifo"
+while IFS= read -r _event <&3; do
+	publish
+done

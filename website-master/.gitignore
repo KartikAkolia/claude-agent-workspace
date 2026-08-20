@@ -1,0 +1,19 @@
+# ignore all logs
+.vscode/
+.venv/
+__pycache__/
+*.py[cod]
+public/
+resources/
+dist/
+.astro/
+.astro-content/
+*.log
+node_modules/
+.lighthouseci/
+test-results/
+playwright-report/
+.env
+*.sh
+!.github/scripts/*.sh
+.DS_Store

@@ -1,0 +1,95 @@
+name: Label PRs by Type of Change
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize]
+
+jobs:
+  label-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+
+    steps:
+      - name: Check PR body for Type of Change
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const prBody = context.payload.pull_request.body || '';
+            const labelsToAdd = [];
+
+            // Check for Type of Change checkboxes
+            if (/\[x\]\s*New feature/i.test(prBody)) {
+              labelsToAdd.push('new feature');
+            }
+            if (/\[x\]\s*Bug fix/i.test(prBody)) {
+              labelsToAdd.push('bug');
+            }
+            if (/\[x\]\s*Documentation update/i.test(prBody)) {
+              labelsToAdd.push('documentation');
+            }
+            if (/\[x\]\s*Hotfix/i.test(prBody)) {
+              labelsToAdd.push('hotfix');
+            }
+            if (/\[x\]\s*UI\/UX improvement/i.test(prBody)) {
+              labelsToAdd.push('UI update');
+            }
+
+            // Check changed files for automatic labeling
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number
+            });
+
+            const hasRustFiles = files.some(file => file.filename.endsWith('.rs'));
+            const hasShellFiles = files.some(file => file.filename.endsWith('.sh'));
+            const hasMarkdownFiles = files.some(file => file.filename.endsWith('.md'));
+
+            if (hasRustFiles) {
+              labelsToAdd.push('rust');
+            }
+            if (hasShellFiles) {
+              labelsToAdd.push('script');
+            }
+            if (hasMarkdownFiles) {
+              labelsToAdd.push('documentation');
+            }
+
+            // Extract referenced issues and get their labels
+            const issueRegex = /(?:Fixes|Resolves|Closes):?\s*#(\d+)/gi;
+            const issueMatches = [...prBody.matchAll(issueRegex)];
+            const issueNumbers = [...new Set(issueMatches.map(match => parseInt(match[1])))];
+
+            for (const issueNumber of issueNumbers) {
+              try {
+                const issue = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber
+                });
+                
+                // Add labels from referenced issues that contain a colon
+                const issueLabels = issue.data.labels
+                  .map(label => typeof label === 'string' ? label : label.name)
+                  .filter(name => name.includes(':'));
+                
+                labelsToAdd.push(...issueLabels);
+              } catch (error) {
+                console.log(`Could not fetch issue #${issueNumber}: ${error.message}`);
+              }
+            }
+
+            // Remove duplicates and add labels
+            const uniqueLabels = [...new Set(labelsToAdd)];
+            
+            if (uniqueLabels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: uniqueLabels
+              });
+            }

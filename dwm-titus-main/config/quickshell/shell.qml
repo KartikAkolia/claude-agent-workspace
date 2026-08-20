@@ -1,0 +1,466 @@
+//@ pragma UseQApplication
+
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Services.SystemTray
+import qs.controlcenter
+import qs.controls
+import qs.health
+import qs.launcher
+import qs.network
+import qs.notifications
+import qs.panel
+import qs.power
+import qs.settings
+import qs.state
+
+pragma ComponentBehavior: Bound
+
+ShellRoot {
+    id: root
+
+    property var selectedPanelWindow: null
+    readonly property var defaultPanelWindow: panelVariants.instances.length > 0
+        ? panelVariants.instances[0] : null
+    readonly property var activePanelWindow: selectedPanelWindow && selectedPanelWindow.screen
+        ? selectedPanelWindow : defaultPanelWindow
+    readonly property var activePanelScreen: activePanelWindow && activePanelWindow.screen
+        ? activePanelWindow.screen
+        : (Quickshell.screens.length > 0 ? Quickshell.screens[0] : null)
+
+    function selectPanelPopup(panel, popupId) {
+        if (!panel || !panel.screen) {
+            return;
+        }
+
+        if (popupId !== "bluetooth") bluetoothModel.close();
+        if (popupId !== "controlcenter") controlCenterModel.close();
+        if (popupId !== "controls") controlsModel.close();
+        if (popupId !== "network") networkModel.close();
+        if (popupId !== "power") powerMenuModel.close();
+        root.selectedPanelWindow = panel;
+    }
+
+    DwmState {
+        id: dwmState
+    }
+
+    SystemClock {
+        id: clock
+
+        precision: SystemClock.Minutes
+    }
+
+    LauncherModel {
+        id: launcherModel
+    }
+
+    PowerMenuModel {
+        id: powerMenuModel
+    }
+
+    NetworkModel {
+        id: networkModel
+    }
+
+    ControlsModel {
+        id: controlsModel
+    }
+
+    BluetoothModel {
+        id: bluetoothModel
+    }
+
+    ControlCenterModel {
+        id: controlCenterModel
+    }
+
+    SystemHealthModel {
+        id: systemHealthModel
+    }
+
+    SettingsModel {
+        id: settingsModel
+    }
+
+    LazyLoader {
+        active: true
+
+        component: Item {
+            Component.onCompleted: {
+                networkModel.refresh();
+                controlsModel.refresh();
+            }
+        }
+    }
+
+    NotificationModel {
+        id: notificationModel
+    }
+
+    IpcHandler {
+        target: "launcher"
+
+        function close(): void {
+            launcherModel.close();
+        }
+
+        function open(): void {
+            launcherModel.open();
+        }
+
+        function toggle(): void {
+            launcherModel.toggle();
+        }
+    }
+
+    IpcHandler {
+        target: "power"
+
+        function close(): void {
+            powerMenuModel.close();
+        }
+
+        function open(): void {
+            powerMenuModel.open();
+        }
+
+        function toggle(): void {
+            powerMenuModel.toggle();
+        }
+    }
+
+    IpcHandler {
+        target: "network"
+
+        function close(): void {
+            networkModel.close();
+        }
+
+        function open(): void {
+            networkModel.open();
+        }
+
+        function refresh(): void {
+            networkModel.refresh();
+        }
+
+        function status(): string {
+            return networkModel.statusText;
+        }
+
+        function toggle(): void {
+            networkModel.toggle();
+        }
+    }
+
+    IpcHandler {
+        target: "controls"
+
+        function close(): void {
+            controlsModel.close();
+        }
+
+        function bluetoothStatus(): string {
+            return controlsModel.bluetoothText;
+        }
+
+        function open(): void {
+            controlsModel.open();
+        }
+
+        function refresh(): void {
+            controlsModel.refresh();
+        }
+
+        function micStatus(): string {
+            return controlsModel.micText;
+        }
+
+        function mediaStatus(): string {
+            return controlsModel.mediaText;
+        }
+
+        function mediaNext(): void {
+            controlsModel.mediaNext();
+        }
+
+        function mediaPlayPause(): void {
+            controlsModel.mediaPlayPause();
+        }
+
+        function mediaPrevious(): void {
+            controlsModel.mediaPrevious();
+        }
+
+        function toggle(): void {
+            controlsModel.toggle();
+        }
+
+        function volumeDown(): void {
+            controlsModel.volumeDown();
+        }
+
+        function volumeStatus(): string {
+            return controlsModel.volumeDisplayText;
+        }
+
+        function volumeSet(percent: int): void {
+            controlsModel.volumeSet(percent);
+        }
+
+        function volumeToggleMute(): void {
+            controlsModel.volumeToggleMute();
+        }
+
+        function volumeUp(): void {
+            controlsModel.volumeUp();
+        }
+    }
+
+    IpcHandler {
+        target: "notifications"
+
+        function clear(): void {
+            notificationModel.clear();
+        }
+
+        function count(): int {
+            return notificationModel.notifications.length;
+        }
+
+        function clearHistory(): void {
+            notificationModel.clearHistory();
+        }
+
+        function closeHistory(): void {
+            notificationModel.closeHistory();
+        }
+
+        function historyCount(): int {
+            return notificationModel.history.length;
+        }
+
+        function historyLatestSummary(): string {
+            return notificationModel.historyLatestSummary();
+        }
+
+        function openHistory(): void {
+            notificationModel.openHistory();
+        }
+
+        function toggleHistory(): void {
+            notificationModel.toggleHistory();
+        }
+    }
+
+    IpcHandler {
+        target: "controlcenter"
+
+        function close(): void {
+            controlCenterModel.close();
+        }
+
+        function open(): void {
+            controlCenterModel.open();
+        }
+
+        function openKeybinds(): void {
+            controlCenterModel.openKeybinds();
+        }
+
+        function refresh(): void {
+            controlCenterModel.refresh();
+        }
+
+        function toggle(): void {
+            controlCenterModel.toggle();
+        }
+    }
+
+    IpcHandler {
+        target: "systemhealth"
+
+        function close(): void {
+            systemHealthModel.close();
+        }
+
+        function open(): void {
+            systemHealthModel.openOnScreen(root.activePanelScreen);
+        }
+
+        function refresh(): void {
+            systemHealthModel.refresh();
+        }
+
+        function toggle(): void {
+            if (systemHealthModel.visible) {
+                systemHealthModel.close();
+            } else {
+                systemHealthModel.openOnScreen(root.activePanelScreen);
+            }
+        }
+    }
+
+    IpcHandler {
+        target: "settings"
+
+        function close(): void {
+            settingsModel.close();
+        }
+
+        function currentSection(): string {
+            return settingsModel.selectedSectionId;
+        }
+
+        function displayCount(): int {
+            return settingsModel.displayOutputs.length;
+        }
+
+        function displayStatus(): string {
+            return settingsModel.displayState;
+        }
+
+        function inputCount(): int {
+            return settingsModel.inputDevices.length;
+        }
+
+        function inputStatus(): string {
+            return settingsModel.inputState;
+        }
+
+        function open(): void {
+            settingsModel.open();
+        }
+
+        function refresh(): void {
+            settingsModel.refresh();
+        }
+
+        function select(section: string): void {
+            settingsModel.selectSection(section);
+        }
+
+        function status(): string {
+            return settingsModel.discoveryState;
+        }
+
+        function toggle(): void {
+            settingsModel.toggle();
+        }
+    }
+
+    IpcHandler {
+        target: "tray"
+
+        function count(): int {
+            return SystemTray.items.values.length;
+        }
+
+        function ids(): string {
+            const items = SystemTray.items.values;
+            const ids = [];
+
+            for (let i = 0; i < items.length; i++) {
+                ids.push(items[i].id || items[i].title || items[i].tooltipTitle || "unknown");
+            }
+
+            return ids.join("\n");
+        }
+
+        function details(): string {
+            const items = SystemTray.items.values;
+            const rows = [];
+
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                rows.push([
+                    item.id || "unknown",
+                    item.title || "",
+                    item.icon || "",
+                    item.hasMenu ? "menu" : "no-menu",
+                    item.status === undefined || item.status === null ? "" : item.status
+                ].join("\t"));
+            }
+
+            return rows.join("\n");
+        }
+    }
+
+    LauncherWindow {
+        launcherModel: launcherModel
+    }
+
+    PowerMenuWindow {
+        powerMenuModel: powerMenuModel
+        panelWindow: root.activePanelWindow
+    }
+
+    Variants {
+        id: panelVariants
+
+        model: Quickshell.screens
+
+        DwmPanel {
+            required property var modelData
+
+            screen: modelData
+            state: dwmState
+            clock: clock
+            networkModel: networkModel
+            controlsModel: controlsModel
+            bluetoothModel: bluetoothModel
+            controlCenterModel: controlCenterModel
+            powerMenuModel: powerMenuModel
+            primaryPanel: modelData === Quickshell.screens[0]
+            onPopupRequested: (panel, popupId) => root.selectPanelPopup(panel, popupId)
+        }
+    }
+
+    NetworkWindow {
+        networkModel: networkModel
+        panelWindow: root.activePanelWindow
+    }
+
+    NotificationPopupWindow {
+        notificationModel: notificationModel
+        panelWindow: root.defaultPanelWindow
+    }
+
+    NotificationHistoryWindow {
+        notificationModel: notificationModel
+    }
+
+    ControlsWindow {
+        controlsModel: controlsModel
+        panelWindow: root.activePanelWindow
+    }
+
+    BluetoothWindow {
+        bluetoothModel: bluetoothModel
+        panelWindow: root.activePanelWindow
+    }
+
+    ControlCenterWindow {
+        controlCenterModel: controlCenterModel
+        launcherModel: launcherModel
+        panelWindow: root.activePanelWindow
+        powerMenuModel: powerMenuModel
+        healthModel: systemHealthModel
+        settingsModel: settingsModel
+    }
+
+    UtilityDetailWindow {
+        controlCenterModel: controlCenterModel
+    }
+
+    SystemHealthWindow {
+        healthModel: systemHealthModel
+        screen: systemHealthModel.targetScreen ? systemHealthModel.targetScreen : root.activePanelScreen
+    }
+
+    SettingsWindow {
+        settingsModel: settingsModel
+    }
+}

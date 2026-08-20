@@ -1,0 +1,43 @@
+---
+title: "Flatseal: The Best Flatpak Addon"
+
+date: 2023-02-10
+url: /flatseal-required-flatpak-addon/
+image: images/2023-thumbs/flatseal-required-flatpak-addon.webp
+categories:
+  - Linux
+tags:
+  - Flatpak
+  - Flatseal
+draft: false
+---
+Managing Flatpak permissions and file storage outside of the flatpak can be difficult to manage. Flatseal fixes all that!
+<!--more-->
+
+## Installing Flatseal
+
+```
+flatpak install flathub com.github.tchx84.Flatseal
+```
+
+## Using Flatseal
+
+View each flatpak permissions
+
+![Perms](/images/2023/flatseal-required-flatpak-addon/perms.webp)
+
+See user modified permissions
+
+![User Perms](/images/2023/flatseal-required-flatpak-addon/user-perms.webp)
+
+Reset permissions in the top right corner
+
+The thing I use the most is filesystem access. This lets you specify the flatpak can read from other parts in the filesystem.
+
+![Filesystem](/images/2023/flatseal-required-flatpak-addon/filesystem.webp)
+
+This is the best way to manage and maintain flatpaks with ease and it's the first thing I install after the base flatpak!
+
+## Walkthrough Video
+
+{{< youtube IfDUXZfDhEI >}}

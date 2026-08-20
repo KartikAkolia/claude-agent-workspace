@@ -1,0 +1,61 @@
+pragma Singleton
+
+import Quickshell
+
+Singleton {
+    function helperCommand(helper, action, args, preferManaged) {
+        const argv = args || [];
+        const managedScript = "\"$data_dir/scripts/" + helper + "\"";
+        const dataDir = "data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/dwm-titus";
+        const runManaged = "[ -x " + managedScript + " ] && exec " + managedScript + " \"$@\"";
+        const runPath = "command -v " + helper + " >/dev/null 2>&1 && exec " + helper + " \"$@\"";
+        const fallback = "exec " + managedScript + " \"$@\"";
+        const orderedChecks = preferManaged
+            ? [runManaged, runPath, fallback]
+            : [runPath, runManaged, fallback];
+        const script = [dataDir].concat(orderedChecks).join("; ");
+
+        const command = ["sh", "-c", script, helper];
+        if (action !== undefined && action !== null) {
+            command.push(action);
+        }
+
+        return command.concat(argv);
+    }
+
+    function launcherHelperCommand(action, args) {
+        return helperCommand("dwm-quickshell-launcher", action, args, true);
+    }
+
+    function networkHelperCommand(action, args) {
+        return helperCommand("dwm-quickshell-network", action, args, false);
+    }
+
+    function controlsHelperCommand(action, args) {
+        return helperCommand("dwm-quickshell-controls", action, args, true);
+    }
+
+    function controlCenterHelperCommand(action, args) {
+        return helperCommand("dwm-quickshell-controlcenter", action, args, true);
+    }
+
+    function lockHelperCommand() {
+        return helperCommand("dwm-lock", undefined, [], true);
+    }
+
+    function systemHealthHelperCommand(action, args) {
+        return helperCommand("dwm-system-health", action, args, true);
+    }
+
+    function settingsProviderCommand(action, args) {
+        return helperCommand("dwm-settings-provider", action, args, true);
+    }
+
+    function settingsDisplayCommand(action, args) {
+        return helperCommand("dwm-settings-display", action, args, true);
+    }
+
+    function settingsInputCommand(action, args) {
+        return helperCommand("dwm-settings-input", action, args, true);
+    }
+}

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_TERMINALS=(
+	alacritty
+	kitty
+	st
+	warp-terminal
+	xterm
+)
+
+print_only=0
+if [[ ${1:-} == "--print-command" ]]; then
+	print_only=1
+	shift
+fi
+
+find_herdr() {
+	local candidate
+
+	case ${DWM_HERDR:-1} in
+	0 | false | no)
+		return 1
+		;;
+	esac
+
+	if [[ -n ${DWM_HERDR_COMMAND:-} ]]; then
+		if command -v "$DWM_HERDR_COMMAND" >/dev/null 2>&1; then
+			command -v "$DWM_HERDR_COMMAND"
+			return
+		fi
+		if [[ -x $DWM_HERDR_COMMAND ]]; then
+			printf '%s\n' "$DWM_HERDR_COMMAND"
+			return
+		fi
+		return 1
+	fi
+
+	if candidate=$(command -v herdr 2>/dev/null); then
+		printf '%s\n' "$candidate"
+		return
+	fi
+
+	candidate="${HOME:-}/.local/bin/herdr"
+	if [[ -n ${HOME:-} && -x $candidate ]]; then
+		printf '%s\n' "$candidate"
+		return
+	fi
+
+	return 1
+}
+
+terminals=()
+
+if [[ ${DWM_TERMINAL:-} != "" ]]; then
+	terminals+=("$DWM_TERMINAL")
+fi
+
+terminals+=("${DEFAULT_TERMINALS[@]}")
+
+for terminal in "${terminals[@]}"; do
+	if command -v "$terminal" >/dev/null 2>&1; then
+		if ((print_only)); then
+			printf '%s\n' "$terminal"
+			exit 0
+		fi
+
+		if (($# == 0)) && herdr=$(find_herdr); then
+			exec "$terminal" -e "$herdr"
+		fi
+
+		exec "$terminal" "$@"
+	fi
+done
+
+printf '%s\n' \
+	'dwm-terminal: no supported terminal emulator found.' \
+	'' \
+	'Install one of: alacritty, kitty, st, warp-terminal, xterm.' \
+	'Or set DWM_TERMINAL to an installed terminal command.' >&2
+
+exit 127
