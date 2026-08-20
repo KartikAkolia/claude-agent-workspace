@@ -81,3 +81,19 @@ Files written to `C:\Users\Kartik\Downloads\Github\` root, confirmed on disk. `c
 
 ### Completion Evidence
 Kartik confirmed via terminal screenshot (2026-08-20): `claude` launched from `~\Downloads\Github` shows no home-directory warning and no `/init` prompt, meaning the `CLAUDE.md` → `AGENTS.md` chain resolved correctly.
+
+## Phase 6: Version control
+
+Status: complete (2026-08-20)
+
+### Objective
+Put the whole folder under git and back it up to a private GitHub repo, using the `gh` CLI already authenticated on Kartik's machine.
+
+### Outcomes
+Private repo created at `github.com/KartikAkolia/claude-agent-workspace`, full folder tree pushed (2,889 objects, 37.66 MiB), including the five reference codebases by Kartik's explicit choice.
+
+### Exit Criteria
+`git push` succeeds, repo visible on GitHub as private.
+
+### Completion Evidence
+Terminal output (2026-08-20): `gh repo create claude-agent-workspace --private --source=. --remote=origin --push` succeeded, `✓ Pushed commits to https://github.com/KartikAkolia/claude-agent-workspace.git`. Default branch is `master`.

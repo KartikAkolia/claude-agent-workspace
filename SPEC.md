@@ -25,6 +25,8 @@ A single Windows folder (`C:\Users\Kartik\Downloads\Github`) connected to this C
 
 File layout as described in `AGENTS.md`'s Repository Map. No APIs, no build system, no runtime; this is documentation and configuration, not code.
 
+Version control: private GitHub repo at `github.com/KartikAkolia/claude-agent-workspace`, default branch `master`. Includes the full folder tree, the five reference codebases included by Kartik's explicit choice rather than excluded.
+
 ## Testing & CI
 
 None. Validation is manual: confirm on-disk state directly, never report something done without having verified it.
