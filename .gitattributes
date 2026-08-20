@@ -1,0 +1,18 @@
+# Let Git auto-detect text files and normalize line endings consistently.
+# Stored as LF in the repo, checked out as your platform's native ending.
+# This replaces per-file autocrlf guessing, which is what caused the
+# repeated "LF will be replaced by CRLF" warnings.
+* text=auto
+
+# Windows-native scripts should always keep CRLF on checkout regardless of platform.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files should never be touched by line-ending conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
