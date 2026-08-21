@@ -32,12 +32,19 @@ The 9 custom skills and the `pr-review-toolkit` plugin's components (e.g. `revie
 
 ### Restart required (resolved, cont'd)
 
-Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bash, html]`, now `[bash, html, powershell]`) so `get_symbols_overview` can parse `.ps1` files. Confirmed post-restart on 2026-08-21: Serena's project activation now reports `Active language servers: bash, html, powershell`, and `get_symbols_overview` on `winutil-main/Compile.ps1` (this repo itself has no `.ps1` files; tested read-only against a reference clone) returns real symbols instead of erroring.
+Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bash, html]`, now `[bash, html, powershell]`) so `get_symbols_overview` can parse `.ps1` files. Confirmed post-restart on 2026-08-21: Serena's project activation now reports `Active language servers: bash, html, powershell`, and `get_symbols_overview` on `winutil-main/Compile.ps1` (this repo itself has no `.ps1` files; tested read-only against a reference clone) returns real symbols instead of erroring. Committed and pushed as `ad9aaa9`.
+
+### This session's work (2026-08-21, cont'd): ROADMAP decisions + doc restructuring
+
+1. **ROADMAP.md candidate items closed out** — Kartik decided on the two still-open candidates from the prior session's proposal list: item 3 (scaffold a new project from `claude-agent-templates/`) marked `Status: deferred`, no specific project named yet; item 4 (revisit declined GitHub/Notion/Asana connectors) marked `Status: declined`, reaffirmed, no new need surfaced. Both now carry explicit status lines instead of open-ended prose.
+
+2. **Root-level markdown restructured into `docs/`** — Kartik wanted the loose root-level markdown files given real structure. Invoked `engineering-documentation` and `engineering-architecture` skills to frame the options (no other skill/plugin/connector in the catalog applied — this was a local filesystem reorg, not a code/PR/external-service task). Key constraint: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md` are auto-discovered by CLI tools (Claude Code, Codex, Gemini CLI) specifically because they sit at repo root — moving them risks reintroducing the `/init`-prompt problem Phase 5 solved. Presented three options; Kartik picked **Option A**: create `docs/`, move only the four non-scaffold files (`handoff.md`, `headroom-setup-plan.md`, `vscode-integration-plan.md`, `cowork-skills-2026-08-21.md`) into it via `git mv`, leave the six scaffold files at root untouched. Used Serena's `replace_in_files` (dry-run first, then applied) to bulk-update every cross-reference across 9 files (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `.serena/memories/core.md`, `.serena/memories/conventions.md`, `.claude/skills/productivity-update/SKILL.md`, plus the two moved files referencing each other) to the new `docs/` paths. Verified with a follow-up grep that no stray root-level path references remained. Committed and pushed as `1eac197`.
 
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
-- `ROADMAP.md` / `TASKS.md` — phase status (all 6 phases complete, no active phase) and possible future work.
+- `ROADMAP.md` / `TASKS.md` — phase status (all 6 phases complete, no active phase) and possible future work. Stays at root; not moved into `docs/`.
+- `docs/` — new as of 2026-08-21: holds the four non-scaffold markdown files (this one, `headroom-setup-plan.md`, `vscode-integration-plan.md`, `cowork-skills-2026-08-21.md`). `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` remain at root by design, for CLI tool auto-discovery.
 - `docs/vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
 - `Github\.claude\skills\` — the 9 custom `SKILL.md` files from this session.
 - `docs/cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
@@ -48,7 +55,9 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 2. ~~Post-restart check: confirm the 9 new skills and `pr-review-toolkit` actually trigger.~~ Done, confirmed 2026-08-21.
 3. ~~Post-restart check: confirm `get_symbols_overview` on `productivity/dashboard.html` now succeeds.~~ Done, confirmed 2026-08-21.
 4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
-5. No further roadmap work is queued — check with Kartik for next direction.
+5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
+6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
+7. No further roadmap work is queued — check with Kartik for next direction.
 
 ## Notes
 
