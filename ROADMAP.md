@@ -64,13 +64,7 @@ CLI and VS Code extension both installed and confirmed working (2026-08-20). Git
 See `vscode-integration-plan.md`'s verification checklist.
 
 ### Completion Evidence
-`claude plugin list` shows `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` installed at project scope; `Github\.claude\skills\` contains the 9 custom skill folders, each with a `SKILL.md`.
-
-### Exit Criteria
-See `vscode-integration-plan.md`'s verification checklist.
-
-### Completion Evidence
-Terminal screenshots confirming `claude` launches signed in inside VS Code (2026-08-20); Extensions panel confirming "Claude Code for VS Code" v2.1.238 installed and enabled.
+Terminal screenshots confirming `claude` launches signed in inside VS Code (2026-08-20); Extensions panel confirming "Claude Code for VS Code" v2.1.238 installed and enabled. `claude plugin list` shows `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` installed at project scope; `Github\.claude\skills\` contains the 9 custom skill folders, each with a `SKILL.md`. All 9 confirmed live-invocable and producing grounded (non-generic) output in a dedicated test pass on 2026-08-21 — see `handoff.md`.
 
 ## Phase 5: Root-level project scaffold
 
@@ -103,3 +97,25 @@ Private repo created at `github.com/KartikAkolia/claude-agent-workspace`, full f
 
 ### Completion Evidence
 Terminal output (2026-08-20): `gh repo create claude-agent-workspace --private --source=. --remote=origin --push` succeeded, `✓ Pushed commits to https://github.com/KartikAkolia/claude-agent-workspace.git`. Default branch is `master`.
+
+## Candidate Next Steps (none started — proposed 2026-08-21)
+
+All 6 phases above are complete; no phase is currently active (see `TASKS.md`). The items below are candidates surfaced by re-reading every doc in this tree plus this session's skill-testing findings, not decided work — each needs Kartik's go-ahead before becoming a phase, per `AGENTS.md`'s rule against guessing on decisions only he can make.
+
+### 1. Test coverage for `escapeHtml()` in `productivity/dashboard.html`
+Status: done (2026-08-21). `productivity/escapeHtml.test.js` — 8 cases (each special char, combined-order regression guard, XSS payload, null/undefined/empty, non-string coercion, no double-escape-detection), using Node's built-in `node:test`/`node:assert` so no dependency was added. Extracts the real function from `dashboard.html` at run time rather than duplicating it, so the test can't silently drift out of sync. Run with `node --test productivity/escapeHtml.test.js`; all 8 pass. Verified the ordering test actually catches regressions (not just passing trivially) by confirming a reordered version of the function produces corrupted output (`&amp;lt;` instead of `&lt;`).
+
+### 2. Port a Claude Code equivalent of Cowork's `productivity:update`
+Status: done (2026-08-21). `.claude/skills/productivity-update/SKILL.md` written, matching the 9 Engineering skills' convention. Scoped honestly rather than claiming parity with Cowork's version: no Gmail/Calendar/Notion/Asana connector exists in this project (declined), so it works from the current conversation, `git log`, and on-disk evidence only — not a full email/chat/calendar scan. Confirmed live-invocable immediately, no restart needed (unlike the 9 Engineering skills, which needed one). Live-tested against the real `productivity/TASKS.md`: correctly reported nothing to sync (board's one Done item already evidenced, Active/Waiting On/Someday all empty, and this session's own repo-dev work correctly excluded as belonging to the root `TASKS.md` convention instead, not this kanban board).
+
+### 3. Scaffold a new project from `claude-agent-templates/`
+Named as open future work in `TASKS.md` since Phase 2. The templates are ready; nothing else is needed on the tooling side. This is purely gated on **which project** — a decision only Kartik can make, not something to guess at. **Question for Kartik:** is there a specific project you want scaffolded, or is this still hypothetical?
+
+### 4. Revisit declined connectors (GitHub, Notion, Asana)
+Declined 2026-08-21 (`vscode-integration-plan.md` Phase 3), explicitly gated on "revisit only if a real need comes up." No new need has surfaced this session. Not recommended to act on now — listed here only for completeness, matching `TASKS.md`'s existing note.
+
+### Not proposed, and why
+- **Splitting `dashboard.html` into modules**: it's a single 3,003-line file, which would normally flag as a structural smell, but `SPEC.md`'s own non-goals rule out build tooling for this project — splitting it would fight a deliberate design choice, not fix a real problem. Not recommended.
+- **`createCard`/`createListItem` merge**: still open from the prior session (see `handoff.md`), still Kartik's call, no new information this session changes that.
+- **Headroom Phase 7/9** (cross-agent memory, Docker): both explicitly deferred in `headroom-setup-plan.md` until Codex/Gemini are in daily use or a multi-instance need arises. No change.
+- **Kartik's own pending step**: reload the VS Code window to pick up Headroom's Phase 5 wrap (`headroom-setup-plan.md`) — not something this session can do, flagged here as a reminder since it's the one genuinely open loose end from prior work.
