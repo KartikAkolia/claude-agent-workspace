@@ -67,13 +67,13 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 ## Open items for Kartik
 
-1. **`createCard`/`createListItem` merge, Phase 3 manual QA**: Option B (extract shared "start editing" helpers) is implemented and all 48 automated tests pass. The one remaining step is the manual browser QA checklist in `docs/dashboard-card-listitem-merge-roadmap.md` — needs Kartik to open `productivity/dashboard.html` in a real browser, since no headless browser tool exists in this session.
+1. ~~`createCard`/`createListItem` merge (Option B).~~ Done, confirmed 2026-08-21 — all 4 phases complete: 48 automated tests passing (Phases 0–2), and Kartik ran the Phase 3 manual browser QA checklist with no issues found.
 2. ~~Post-restart check: confirm the 9 new skills and `pr-review-toolkit` actually trigger.~~ Done, confirmed 2026-08-21.
 3. ~~Post-restart check: confirm `get_symbols_overview` on `productivity/dashboard.html` now succeeds.~~ Done, confirmed 2026-08-21.
 4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
-7. No further roadmap work is queued beyond item 1 above — check with Kartik for next direction.
+7. No further roadmap work is queued — check with Kartik for next direction.
 
 ## Notes
 

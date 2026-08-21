@@ -61,14 +61,16 @@ Phases 0–2 (automated) are done and green — 48 tests total across `dashboard
 node --test productivity/dashboard-baseline.test.js productivity/dashboard-start-editing.test.js productivity/dashboard-interactions.test.js productivity/escapeHtml.test.js
 ```
 
-**Phase 3 (manual browser QA) is Kartik's step** — no headless browser tool is available in this session. Checklist, run by opening `productivity/dashboard.html` directly in a browser:
+**Phase 3 (manual browser QA): done (2026-08-21, Kartik).** Ran by opening `productivity/dashboard.html` directly in a browser — everything on the checklist worked as expected, no issues found.
 
-- [ ] Drag-and-drop reordering works in board view (dragging a card between columns/positions).
-- [ ] Drag-and-drop reordering works in list view (dragging a list item between sections/positions), including that `.list-drop-indicator`/`.drag-over` cleanup still fires on `dragend`.
-- [ ] Start editing a title/note/subtask, switch view (board ↔ list) mid-edit, confirm no stuck input or lost edit.
-- [ ] Empty-board state renders correctly in both views (no section/task data).
-- [ ] A long task title wraps correctly in both views' layouts (board card width vs. list row width) — this is the one place board and list intentionally use different `styleCss` (font-size 14px vs 15px, different padding), so it's worth confirming both still look right.
-- [ ] Dark/light theme toggle still styles the inline `<input>` correctly in both views (styleCss uses `var(--bg-card)`/`var(--text-primary)`/`var(--accent)`, so this should be automatic, but confirm visually).
+- [x] Drag-and-drop reordering works in board view (dragging a card between columns/positions).
+- [x] Drag-and-drop reordering works in list view (dragging a list item between sections/positions), including that `.list-drop-indicator`/`.drag-over` cleanup still fires on `dragend`.
+- [x] Start editing a title/note/subtask, switch view (board ↔ list) mid-edit, confirm no stuck input or lost edit.
+- [x] Empty-board state renders correctly in both views (no section/task data).
+- [x] A long task title wraps correctly in both views' layouts (board card width vs. list row width) — this is the one place board and list intentionally use different `styleCss` (font-size 14px vs 15px, different padding).
+- [x] Dark/light theme toggle still styles the inline `<input>` correctly in both views (styleCss uses `var(--bg-card)`/`var(--text-primary)`/`var(--accent)`).
+
+All four phases of the phased testing plan are now complete. The `createCard`/`createListItem` merge (Option B) is fully verified — automated (48 tests) and manual.
 
 ## Three options for Kartik
 
