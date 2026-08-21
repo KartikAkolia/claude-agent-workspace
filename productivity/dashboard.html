@@ -1532,14 +1532,14 @@
         } else if (action === 'toggle-sub') {
           toggleSubtaskChecked(task, parseInt(e.target.dataset.idx));
         } else if (action === 'edit-title') {
-          startEditingTitle(e.target, task);
+          startEditingItemTitle(e.target, task, 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 6px 10px; color: var(--text-primary); font-size: 14px; font-family: inherit; outline: none;');
         } else if (action === 'edit-note') {
-          startEditingNote(e.target, task);
+          startEditingItemNote(e.target, task, 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 4px 8px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
         } else if (action === 'edit-subtask') {
           const idx = parseInt(e.target.dataset.idx);
-          startEditingSubtask(e.target, task, idx);
+          startEditingItemSubtask(e.target, task, idx, 'width: calc(100% - 30px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
         } else if (action === 'add-subtask') {
-          startAddingSubtask(e.target, task);
+          startAddingItemSubtask(e.target, task, 'width: calc(100% - 10px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
         } else if (action === 'delete') {
           deleteTask(task);
         }
@@ -1548,22 +1548,26 @@
       return card;
     }
 
-    function startEditingTitle(titleEl, task) {
+    // Shared by both board and list views. Each was previously two near-identical
+    // wrapper functions differing only in styleCss (title also differed in
+    // font-size/padding between views); collapsed here with styleCss passed in
+    // by the caller. See docs/dashboard-card-listitem-merge-roadmap.md Option B.
+    function startEditingItemTitle(titleEl, task, styleCss) {
       startInlineEdit(titleEl, {
         value: task.title,
         select: true,
-        styleCss: 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 6px 10px; color: var(--text-primary); font-size: 14px; font-family: inherit; outline: none;'
+        styleCss
       }, (newTitle) => {
         if (newTitle && newTitle !== task.title) { task.title = newTitle; markChanged(); }
         renderTasks();
       });
     }
 
-    function startEditingNote(noteEl, task) {
+    function startEditingItemNote(noteEl, task, styleCss) {
       startInlineEdit(noteEl, {
         value: task.note || '',
         placeholder: 'Add a note...',
-        styleCss: 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 4px 8px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
+        styleCss
       }, (newNote) => {
         task.note = newNote;
         markChanged();
@@ -1571,11 +1575,11 @@
       });
     }
 
-    function startEditingSubtask(subtaskEl, task, idx) {
+    function startEditingItemSubtask(subtaskEl, task, idx, styleCss) {
       startInlineEdit(subtaskEl, {
         value: task.subtasks[idx].text,
         select: true,
-        styleCss: 'width: calc(100% - 30px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
+        styleCss
       }, (newText) => {
         if (newText) { task.subtasks[idx].text = newText; }
         else { task.subtasks.splice(idx, 1); }
@@ -1584,12 +1588,16 @@
       });
     }
 
-    function startAddingSubtask(el, task) {
+    function startAddingItemSubtask(el, task, styleCss) {
       startInlineEdit(el, {
         placeholder: 'New subtask...',
-        styleCss: 'width: calc(100% - 10px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
+        styleCss
       }, (text) => {
-        if (text) { task.subtasks.push({ text, checked: false }); markChanged(); }
+        if (text) {
+          if (!task.subtasks) task.subtasks = [];
+          task.subtasks.push({ text, checked: false });
+          markChanged();
+        }
         renderTasks();
       });
     }
@@ -1962,7 +1970,7 @@
         tasksContainer.dataset.sectionId = section.id;
 
         sectionTasks.forEach(task => {
-          tasksContainer.appendChild(createListItem(task, section));
+          tasksContainer.appendChild(createListItem(task));
         });
 
         sectionEl.appendChild(tasksContainer);
@@ -2066,7 +2074,7 @@
       });
     }
 
-    function createListItem(task, section) {
+    function createListItem(task) {
       const item = document.createElement('div');
       item.className = 'list-item';
       item.draggable = true;
@@ -2099,7 +2107,7 @@
       title.textContent = task.title;
       title.addEventListener('click', (e) => {
         e.stopPropagation();
-        startEditingListItem(title, task);
+        startEditingItemTitle(title, task, 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 8px 12px; color: var(--text-primary); font-size: 15px; font-family: inherit; outline: none;');
       });
       content.appendChild(title);
 
@@ -2109,7 +2117,7 @@
         note.textContent = task.note;
         note.addEventListener('click', (e) => {
           e.stopPropagation();
-          startEditingListNote(note, task);
+          startEditingItemNote(note, task, 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 4px 8px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
         });
         content.appendChild(note);
       } else {
@@ -2118,7 +2126,7 @@
         addNote.textContent = '+ Add note';
         addNote.addEventListener('click', (e) => {
           e.stopPropagation();
-          startEditingListNote(addNote, task);
+          startEditingItemNote(addNote, task, 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 4px 8px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
         });
         content.appendChild(addNote);
       }
@@ -2146,7 +2154,7 @@
           }
           stText.addEventListener('click', (e) => {
             e.stopPropagation();
-            startEditingListSubtask(stText, task, idx);
+            startEditingItemSubtask(stText, task, idx, 'width: calc(100% - 30px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
           });
 
           subtaskEl.appendChild(stCheckbox);
@@ -2162,7 +2170,7 @@
       addSubtask.textContent = '+ Add subtask';
       addSubtask.addEventListener('click', (e) => {
         e.stopPropagation();
-        startAddingListSubtask(addSubtask, task);
+        startAddingItemSubtask(addSubtask, task, 'width: calc(100% - 10px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;');
       });
       content.appendChild(addSubtask);
 
@@ -2179,56 +2187,6 @@
       item.appendChild(actions);
 
       return item;
-    }
-
-    function startEditingListNote(noteEl, task) {
-      startInlineEdit(noteEl, {
-        value: task.note || '',
-        placeholder: 'Add a note...',
-        styleCss: 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 4px 8px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
-      }, (newNote) => {
-        task.note = newNote;
-        markChanged();
-        renderTasks();
-      });
-    }
-
-    function startEditingListSubtask(subtaskEl, task, idx) {
-      startInlineEdit(subtaskEl, {
-        value: task.subtasks[idx].text,
-        select: true,
-        styleCss: 'width: calc(100% - 30px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
-      }, (newText) => {
-        if (newText) { task.subtasks[idx].text = newText; }
-        else { task.subtasks.splice(idx, 1); }
-        markChanged();
-        renderTasks();
-      });
-    }
-
-    function startAddingListSubtask(el, task) {
-      startInlineEdit(el, {
-        placeholder: 'New subtask...',
-        styleCss: 'width: calc(100% - 10px); background: var(--bg-card); border: 2px solid var(--accent); border-radius: 4px; padding: 2px 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; outline: none;'
-      }, (text) => {
-        if (text) {
-          if (!task.subtasks) task.subtasks = [];
-          task.subtasks.push({ text, checked: false });
-          markChanged();
-        }
-        renderTasks();
-      });
-    }
-
-    function startEditingListItem(titleEl, task) {
-      startInlineEdit(titleEl, {
-        value: task.title,
-        select: true,
-        styleCss: 'width: 100%; background: var(--bg-card); border: 2px solid var(--accent); border-radius: 6px; padding: 8px 12px; color: var(--text-primary); font-size: 15px; font-family: inherit; outline: none;'
-      }, (newTitle) => {
-        if (newTitle && newTitle !== task.title) { task.title = newTitle; markChanged(); }
-        renderTasks();
-      });
     }
 
     function showSectionPicker(anchorEl) {

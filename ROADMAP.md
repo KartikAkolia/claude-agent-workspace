@@ -114,8 +114,10 @@ Status: deferred (2026-08-21, Kartik's call). Named as open future work in `TASK
 ### 4. Revisit declined connectors (GitHub, Notion, Asana)
 Status: declined (2026-08-21, Kartik's call, reaffirmed this session). Originally declined 2026-08-21 (`docs/vscode-integration-plan.md` Phase 3), explicitly gated on "revisit only if a real need comes up." No new need has surfaced. Not recommended to act on.
 
+### 5. `createCard`/`createListItem` merge in `productivity/dashboard.html`
+Status: Option B implemented (2026-08-21, Kartik's call — see `docs/dashboard-card-listitem-merge-roadmap.md`). The four board/list "start editing" wrapper pairs were collapsed into four shared, `styleCss`-parameterized functions; `createListItem`'s dead `section` parameter was removed. `createCard`/`createListItem` themselves were left separate, as planned. Phases 0–2 (automated: baseline regression, unit tests for the extracted helpers, full click→edit→commit interaction tests) are done — 48 tests passing across `productivity/dashboard-baseline.test.js`, `dashboard-start-editing.test.js`, `dashboard-interactions.test.js`, and `escapeHtml.test.js`. **Phase 3 (manual browser QA) is still open** — no headless browser tool exists in this session, so the checklist in `docs/dashboard-card-listitem-merge-roadmap.md` needs Kartik to run it directly.
+
 ### Not proposed, and why
 - **Splitting `dashboard.html` into modules**: it's a single 3,003-line file, which would normally flag as a structural smell, but `SPEC.md`'s own non-goals rule out build tooling for this project — splitting it would fight a deliberate design choice, not fix a real problem. Not recommended.
-- **`createCard`/`createListItem` merge**: still open from the prior session (see `docs/handoff.md`), still Kartik's call, no new information this session changes that.
 - **Headroom Phase 7/9** (cross-agent memory, Docker): both explicitly deferred in `docs/headroom-setup-plan.md` until Codex/Gemini are in daily use or a multi-instance need arises. No change.
-- **Kartik's own pending step**: reload the VS Code window to pick up Headroom's Phase 5 wrap (`docs/headroom-setup-plan.md`) — not something this session can do, flagged here as a reminder since it's the one genuinely open loose end from prior work.
+- **Reloading VS Code to pick up Headroom's Phase 5 wrap** (`docs/headroom-setup-plan.md`): declined (2026-08-21, Kartik's call). No longer tracked as an open loose end.

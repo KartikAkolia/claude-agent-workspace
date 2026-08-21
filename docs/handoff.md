@@ -40,6 +40,22 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 2. **Root-level markdown restructured into `docs/`** — Kartik wanted the loose root-level markdown files given real structure. Invoked `engineering-documentation` and `engineering-architecture` skills to frame the options (no other skill/plugin/connector in the catalog applied — this was a local filesystem reorg, not a code/PR/external-service task). Key constraint: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md` are auto-discovered by CLI tools (Claude Code, Codex, Gemini CLI) specifically because they sit at repo root — moving them risks reintroducing the `/init`-prompt problem Phase 5 solved. Presented three options; Kartik picked **Option A**: create `docs/`, move only the four non-scaffold files (`handoff.md`, `headroom-setup-plan.md`, `vscode-integration-plan.md`, `cowork-skills-2026-08-21.md`) into it via `git mv`, leave the six scaffold files at root untouched. Used Serena's `replace_in_files` (dry-run first, then applied) to bulk-update every cross-reference across 9 files (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `.serena/memories/core.md`, `.serena/memories/conventions.md`, `.claude/skills/productivity-update/SKILL.md`, plus the two moved files referencing each other) to the new `docs/` paths. Verified with a follow-up grep that no stray root-level path references remained. Committed and pushed as `1eac197`.
 
+### This session's work (2026-08-21, cont'd): `createCard`/`createListItem` merge (Option B) implemented
+
+1. **VS Code reload note declined** — Kartik declined the last open loose end (reloading VS Code to pick up Headroom's Phase 5 wrap). Updated `ROADMAP.md` and `docs/headroom-setup-plan.md` from "still open" to "declined, no longer tracked."
+
+2. **Merge planning doc** — read `createCard`/`createListItem` and their supporting "start editing" helpers in full before proposing anything. Confirmed the two render functions are structurally different by design (innerHTML+delegation vs. createElement+per-element listeners), not accidental duplication — but found genuine duplication one level down: four near-identical "start editing" wrapper pairs, plus a dead `section` parameter on `createListItem`. Wrote `docs/dashboard-card-listitem-merge-roadmap.md` with three options (A: full unification, B: extract only the duplicated helpers, C: decline and document permanently), each with changes/benefits/disadvantages, plus a phased testing plan (Phase 0 baseline → Phase 1 unit tests → Phase 2 interaction tests → Phase 3 manual QA, gated). Recommended Option B; Kartik chose it and said "start on Option B."
+
+3. **Implemented Option B**, following the phased plan with a gate between phases (didn't start phase *N+1* until phase *N*'s tests passed):
+   - **Phase 0** (`productivity/dashboard-baseline.test.js`): wrote baseline characterization tests for `createCard`/`createListItem` against a hand-rolled, dependency-free DOM stub (`productivity/test-helpers/dom-stub.js` — no jsdom, per `SPEC.md`'s no-build-deps non-goal) and a generalized function-extraction helper (`productivity/test-helpers/extract-source.js`, extending the pattern already established by `escapeHtml.test.js`). Ran green against the pre-change code first.
+   - **Extraction**: collapsed the four wrapper pairs into four shared, `styleCss`-parameterized functions (`startEditingItemTitle`, `startEditingItemNote`, `startEditingItemSubtask`, `startAddingItemSubtask`), updated all 12 call sites (7 in `createCard`, 5 in `createListItem`), removed `createListItem`'s dead `section` parameter and its call site's extra argument. One real behavioral difference surfaced while merging: the list-view add-subtask wrapper had a defensive `if (!task.subtasks) task.subtasks = []` guard the board-view one lacked — kept for both in the unified function (harmless superset, documented in the roadmap doc).
+   - **Phase 1** (`productivity/dashboard-start-editing.test.js`): unit tests for the four unified helpers, each invoked with two different `styleCss` strings standing in for board/list call sites, confirming identical commit/cancel behavior.
+   - **Phase 2** (`productivity/dashboard-interactions.test.js`): full click → edit → commit chains through the actual edited call sites in both views (not just the helpers in isolation) — the deepest regression check, since it's what would catch a wiring mistake at a specific call site.
+   - All 48 tests pass: `node --test productivity/dashboard-baseline.test.js productivity/dashboard-start-editing.test.js productivity/dashboard-interactions.test.js productivity/escapeHtml.test.js`.
+   - Updated `docs/dashboard-card-listitem-merge-roadmap.md` and `ROADMAP.md` (candidate item 5) with the implementation summary and a Phase 3 manual QA checklist.
+
+4. **Phase 3 (manual browser QA) is Kartik's step** — no headless browser tool exists in this session. Checklist is in `docs/dashboard-card-listitem-merge-roadmap.md`: drag-and-drop reordering in both views, view-switch mid-edit, empty-board state, long title wrapping, dark/light theme toggle.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -51,13 +67,13 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 ## Open items for Kartik
 
-1. **dashboard.html refactor**: `createCard` (board view) and `createListItem` (list view) were deliberately not merged during the earlier Moderate refactor — structurally different, not true duplicate logic. Still open whether Kartik wants that merge attempted anyway.
+1. **`createCard`/`createListItem` merge, Phase 3 manual QA**: Option B (extract shared "start editing" helpers) is implemented and all 48 automated tests pass. The one remaining step is the manual browser QA checklist in `docs/dashboard-card-listitem-merge-roadmap.md` — needs Kartik to open `productivity/dashboard.html` in a real browser, since no headless browser tool exists in this session.
 2. ~~Post-restart check: confirm the 9 new skills and `pr-review-toolkit` actually trigger.~~ Done, confirmed 2026-08-21.
 3. ~~Post-restart check: confirm `get_symbols_overview` on `productivity/dashboard.html` now succeeds.~~ Done, confirmed 2026-08-21.
 4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
-7. No further roadmap work is queued — check with Kartik for next direction.
+7. No further roadmap work is queued beyond item 1 above — check with Kartik for next direction.
 
 ## Notes
 
