@@ -24,9 +24,15 @@ All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern resear
    - The remaining 7 custom skills were manually dry-run walked through using real grounding material (install.sh flags, CI workflows, config/*.json structure) since they weren't yet live-invocable in-session (new project skills need a restart to register). All 7 held up — grounded, non-generic output.
    - **Fix applied following the test**: `engineering-tech-debt`'s grep step now requires a comment-marker prefix (or excludes runs of >3 consecutive `X`s) for the `XXX` marker instead of matching it bare, removing the `mktemp` false-positive noise.
 
-### Restart required
+5. **Serena `html` language server fix** — `get_symbols_overview` on `productivity/dashboard.html` was failing with `Cannot extract symbols from file productivity/dashboard.html. Active language servers: ['bash']`. Root cause: `.serena/project.yml`'s `language_servers` list had only `bash`, so no server could parse non-bash files. Added `html` to that list. Confirmed on disk, but re-tested `get_symbols_overview` on the same file immediately after and it still failed with the identical error — Serena starts its language servers once at project activation, not per-call, so the fix won't take effect until the MCP connection restarts. Same restart dependency as item 3 below, not a separate outstanding bug.
 
-The 9 custom skills and the `pr-review-toolkit` plugin's components (e.g. `review-pr`) are written/installed but were confirmed NOT live-invocable via the `Skill` tool in the session that created them — Claude Code needs a restart to register new project-scope skills. Kartik is reloading a new session for this. After restart, worth a quick sanity check that `/engineering-*` skills and `pr-review-toolkit` actually trigger.
+### Restart required (resolved)
+
+The 9 custom skills and the `pr-review-toolkit` plugin's components (e.g. `review-pr`) were written/installed but confirmed NOT live-invocable via the `Skill` tool in the session that created them — Claude Code needed a restart to register new project-scope skills. Confirmed post-restart on 2026-08-21: all 9 `engineering-*` skills plus `pr-review-toolkit:review-pr` now appear in the session's skill list, and `get_symbols_overview` on `productivity/dashboard.html` now succeeds (returns real functions/variables/classes/fields) instead of erroring with `Active language servers: ['bash']`.
+
+### Restart required (resolved, cont'd)
+
+Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bash, html]`, now `[bash, html, powershell]`) so `get_symbols_overview` can parse `.ps1` files. Confirmed post-restart on 2026-08-21: Serena's project activation now reports `Active language servers: bash, html, powershell`, and `get_symbols_overview` on `winutil-main/Compile.ps1` (this repo itself has no `.ps1` files; tested read-only against a reference clone) returns real symbols instead of erroring.
 
 ## Files to read first
 
@@ -39,8 +45,10 @@ The 9 custom skills and the `pr-review-toolkit` plugin's components (e.g. `revie
 ## Open items for Kartik
 
 1. **dashboard.html refactor**: `createCard` (board view) and `createListItem` (list view) were deliberately not merged during the earlier Moderate refactor — structurally different, not true duplicate logic. Still open whether Kartik wants that merge attempted anyway.
-2. **Post-restart check**: confirm the 9 new skills and `pr-review-toolkit` actually trigger now that the session has reloaded.
-3. No further roadmap work is queued — check with Kartik for next direction once the skills are confirmed live.
+2. ~~Post-restart check: confirm the 9 new skills and `pr-review-toolkit` actually trigger.~~ Done, confirmed 2026-08-21.
+3. ~~Post-restart check: confirm `get_symbols_overview` on `productivity/dashboard.html` now succeeds.~~ Done, confirmed 2026-08-21.
+4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
+5. No further roadmap work is queued — check with Kartik for next direction.
 
 ## Notes
 
