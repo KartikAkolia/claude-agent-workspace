@@ -16,7 +16,7 @@ Engineering and Productivity plugins installed. Writing-voice skill offered, not
 Plugins active at account level.
 
 ### Completion Evidence
-Confirmed in `handoff.md` (2026-08-20) and this session's available skills list.
+Confirmed in `docs/handoff.md` (2026-08-20) and this session's available skills list.
 
 ## Phase 2: ChrisTitusTech pattern research and templates
 
@@ -52,7 +52,7 @@ Dashboard opens locally, reads and writes `TASKS.md` on disk, autosaves.
 
 ## Phase 4: VS Code integration
 
-Status: complete (2026-08-21). See `vscode-integration-plan.md` for the authoritative phase-by-phase status.
+Status: complete (2026-08-21). See `docs/vscode-integration-plan.md` for the authoritative phase-by-phase status.
 
 ### Objective
 Bring Cowork's setup into Claude Code CLI and its VS Code extension.
@@ -61,10 +61,10 @@ Bring Cowork's setup into Claude Code CLI and its VS Code extension.
 CLI and VS Code extension both installed and confirmed working (2026-08-20). GitHub/Notion/Asana connector wiring declined by choice (confirmed 2026-08-21). Repo-level AGENTS.md scaffolding satisfied by this repo's own Phase 5 scaffold — Kartik confirmed this `Github` root is the scaffolding target. Engineering-plugin skills ported (2026-08-21): `code-review` skipped (already covered by a native Claude Code skill), `code-simplifier`/`pr-review-toolkit` installed project-scope as a trial for `tech-debt` (insufficient alone), 9 custom `SKILL.md` files written under `.claude/skills/` for the rest (architecture, debug, deploy-checklist, documentation, incident-response, standup, system-design, testing-strategy, tech-debt).
 
 ### Exit Criteria
-See `vscode-integration-plan.md`'s verification checklist.
+See `docs/vscode-integration-plan.md`'s verification checklist.
 
 ### Completion Evidence
-Terminal screenshots confirming `claude` launches signed in inside VS Code (2026-08-20); Extensions panel confirming "Claude Code for VS Code" v2.1.238 installed and enabled. `claude plugin list` shows `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` installed at project scope; `Github\.claude\skills\` contains the 9 custom skill folders, each with a `SKILL.md`. All 9 confirmed live-invocable and producing grounded (non-generic) output in a dedicated test pass on 2026-08-21 — see `handoff.md`.
+Terminal screenshots confirming `claude` launches signed in inside VS Code (2026-08-20); Extensions panel confirming "Claude Code for VS Code" v2.1.238 installed and enabled. `claude plugin list` shows `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` installed at project scope; `Github\.claude\skills\` contains the 9 custom skill folders, each with a `SKILL.md`. All 9 confirmed live-invocable and producing grounded (non-generic) output in a dedicated test pass on 2026-08-21 — see `docs/handoff.md`.
 
 ## Phase 5: Root-level project scaffold
 
@@ -109,13 +109,13 @@ Status: done (2026-08-21). `productivity/escapeHtml.test.js` — 8 cases (each s
 Status: done (2026-08-21). `.claude/skills/productivity-update/SKILL.md` written, matching the 9 Engineering skills' convention. Scoped honestly rather than claiming parity with Cowork's version: no Gmail/Calendar/Notion/Asana connector exists in this project (declined), so it works from the current conversation, `git log`, and on-disk evidence only — not a full email/chat/calendar scan. Confirmed live-invocable immediately, no restart needed (unlike the 9 Engineering skills, which needed one). Live-tested against the real `productivity/TASKS.md`: correctly reported nothing to sync (board's one Done item already evidenced, Active/Waiting On/Someday all empty, and this session's own repo-dev work correctly excluded as belonging to the root `TASKS.md` convention instead, not this kanban board).
 
 ### 3. Scaffold a new project from `claude-agent-templates/`
-Named as open future work in `TASKS.md` since Phase 2. The templates are ready; nothing else is needed on the tooling side. This is purely gated on **which project** — a decision only Kartik can make, not something to guess at. **Question for Kartik:** is there a specific project you want scaffolded, or is this still hypothetical?
+Status: deferred (2026-08-21, Kartik's call). Named as open future work in `TASKS.md` since Phase 2. The templates are ready; nothing else is needed on the tooling side. This is purely gated on **which project** — a decision only Kartik can make, not something to guess at. No specific project named yet; revisit when one is.
 
 ### 4. Revisit declined connectors (GitHub, Notion, Asana)
-Declined 2026-08-21 (`vscode-integration-plan.md` Phase 3), explicitly gated on "revisit only if a real need comes up." No new need has surfaced this session. Not recommended to act on now — listed here only for completeness, matching `TASKS.md`'s existing note.
+Status: declined (2026-08-21, Kartik's call, reaffirmed this session). Originally declined 2026-08-21 (`docs/vscode-integration-plan.md` Phase 3), explicitly gated on "revisit only if a real need comes up." No new need has surfaced. Not recommended to act on.
 
 ### Not proposed, and why
 - **Splitting `dashboard.html` into modules**: it's a single 3,003-line file, which would normally flag as a structural smell, but `SPEC.md`'s own non-goals rule out build tooling for this project — splitting it would fight a deliberate design choice, not fix a real problem. Not recommended.
-- **`createCard`/`createListItem` merge**: still open from the prior session (see `handoff.md`), still Kartik's call, no new information this session changes that.
-- **Headroom Phase 7/9** (cross-agent memory, Docker): both explicitly deferred in `headroom-setup-plan.md` until Codex/Gemini are in daily use or a multi-instance need arises. No change.
-- **Kartik's own pending step**: reload the VS Code window to pick up Headroom's Phase 5 wrap (`headroom-setup-plan.md`) — not something this session can do, flagged here as a reminder since it's the one genuinely open loose end from prior work.
+- **`createCard`/`createListItem` merge**: still open from the prior session (see `docs/handoff.md`), still Kartik's call, no new information this session changes that.
+- **Headroom Phase 7/9** (cross-agent memory, Docker): both explicitly deferred in `docs/headroom-setup-plan.md` until Codex/Gemini are in daily use or a multi-instance need arises. No change.
+- **Kartik's own pending step**: reload the VS Code window to pick up Headroom's Phase 5 wrap (`docs/headroom-setup-plan.md`) — not something this session can do, flagged here as a reminder since it's the one genuinely open loose end from prior work.

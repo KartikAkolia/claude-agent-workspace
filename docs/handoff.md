@@ -4,15 +4,15 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 ## Where things stand (as of 2026-08-21)
 
-All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `vscode-integration-plan.md` for VS Code specifics.
+All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `docs/vscode-integration-plan.md` for VS Code specifics.
 
 ### This session's work: Serena fix + Engineering skill porting
 
 1. **Serena MCP server** — diagnosed a `node is not installed or isn't in PATH` error seen in pasted logs as transient (stale PATH in a long-running parent process), not a real missing dependency. Confirmed via fresh log output that later spawns succeeded and the bash LSP started cleanly. Ran Serena onboarding, writing 5 memories under `.serena/memories/` (`core`, `tech_stack`, `suggested_commands`, `conventions`, `task_completion`).
 
-2. **Doc reconciliation** — fixed contradictions across `ROADMAP.md`, `TASKS.md`, and `vscode-integration-plan.md` (Phase 4 status, the GitHub/Notion/Asana connector decision). Kartik confirmed: connectors declined for now (revisit only if a real need comes up), and this `Github` root itself is the AGENTS.md scaffolding target — no separate repo needed.
+2. **Doc reconciliation** — fixed contradictions across `ROADMAP.md`, `TASKS.md`, and `docs/vscode-integration-plan.md` (Phase 4 status, the GitHub/Notion/Asana connector decision). Kartik confirmed: connectors declined for now (revisit only if a real need comes up), and this `Github` root itself is the AGENTS.md scaffolding target — no separate repo needed.
 
-3. **Engineering skill porting** — Kartik wanted Cowork's 10 Engineering-plugin skills available in Claude Code CLI. Real skill instructions weren't accessible from this session (separate product/catalog), so Kartik supplied the real skill descriptions via `cowork-skills-2026-08-21.md`, then approved a hybrid approach:
+3. **Engineering skill porting** — Kartik wanted Cowork's 10 Engineering-plugin skills available in Claude Code CLI. Real skill instructions weren't accessible from this session (separate product/catalog), so Kartik supplied the real skill descriptions via `docs/cowork-skills-2026-08-21.md`, then approved a hybrid approach:
    - `engineering:code-review` — skipped porting; Claude Code already has an equivalent native `code-review` skill active in-session.
    - `engineering:tech-debt` — trialed the official `code-simplifier` and `pr-review-toolkit` plugins first (installed project-scope from `claude-plugins-official`), but neither does codebase-wide audit/prioritization (they act on code already pointed at, not a survey) — so this one was custom-built too.
    - The remaining 8, plus `tech-debt`, got custom `SKILL.md` files written under `Github\.claude\skills\`: `engineering-architecture`, `engineering-debug`, `engineering-deploy-checklist`, `engineering-documentation`, `engineering-incident-response`, `engineering-standup`, `engineering-system-design`, `engineering-testing-strategy`, `engineering-tech-debt`. These are recreations based on each skill's one-line trigger description, not literal copies of Cowork's actual instructions.
@@ -38,9 +38,9 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
 - `ROADMAP.md` / `TASKS.md` — phase status (all 6 phases complete, no active phase) and possible future work.
-- `vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
+- `docs/vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
 - `Github\.claude\skills\` — the 9 custom `SKILL.md` files from this session.
-- `cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
+- `docs/cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
 
 ## Open items for Kartik
 

@@ -13,14 +13,14 @@ Read this before every task. `SPEC.md` is the product contract; this file covers
 - `claude-agent-templates/`: blank AGENTS.md/SPEC.md/ROADMAP.md/TASKS.md/CLAUDE.md/GEMINI.md templates, plus the research notes they were distilled from (`agent-scaffold-guide.md`, `titus-ai-windows-setup.md`, `titus-ai-windows-packages-research.md`). Reusable scaffolding for Kartik's own future repos, kept blank on purpose. Copy these out to a real project before filling them in, don't fill them in here.
 - `productivity/`: Cowork's productivity-skill artifact. A kanban dashboard (`dashboard.html`), its own `TASKS.md` (Active/Waiting On/Someday/Done convention, unrelated to this file's `TASKS.md`), and Cowork's memory file (`CLAUDE.md`, unrelated to Claude Code's per-repo `CLAUDE.md` despite the shared name).
 - `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`: ChrisTitusTech's own repos, downloaded as research material for the AGENTS.md convention. Read-only reference. Do not edit.
-- `vscode-integration-plan.md`: the five-phase plan for bringing this setup into VS Code, with a running status log of what's actually done, declined, or on hold.
-- `handoff.md`: continuity note for Cowork sessions. Read this and the files it points to before resuming work after a session gap.
+- `docs/vscode-integration-plan.md`: the five-phase plan for bringing this setup into VS Code, with a running status log of what's actually done, declined, or on hold.
+- `docs/handoff.md`: continuity note for Cowork sessions. Read this and the files it points to before resuming work after a session gap.
 
 ## Sources of Truth
 
 - `SPEC.md`: what this project is and its acceptance criteria. Update only when the actual goal changes.
 - `ROADMAP.md`: ordered phases across both Cowork and Claude Code CLI work. `TASKS.md`: active-phase detail only.
-- `vscode-integration-plan.md`: the authoritative status of VS Code integration specifically, phase by phase.
+- `docs/vscode-integration-plan.md`: the authoritative status of VS Code integration specifically, phase by phase.
 
 If a doc and the actual on-disk or on-device state disagree, resolve it in the same session: verify against the real file or command output, then fix whichever doc is wrong.
 

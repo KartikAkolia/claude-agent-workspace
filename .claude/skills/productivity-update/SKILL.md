@@ -13,7 +13,7 @@ Always `productivity/TASKS.md` (the kanban board: Active / Waiting On / Someday 
 
 ## What this pulls from
 
-No Gmail/Calendar/Notion/Asana connector is wired up in this project (declined, see `vscode-integration-plan.md`) — so unlike Cowork's `--comprehensive` scan across email/chat/calendar, the only real sources here are:
+No Gmail/Calendar/Notion/Asana connector is wired up in this project (declined, see `docs/vscode-integration-plan.md`) — so unlike Cowork's `--comprehensive` scan across email/chat/calendar, the only real sources here are:
 - The current conversation: explicit asks, mentioned deliverables, things the user said they'd do.
 - `git log` in whichever repo is active, for completed work that isn't yet reflected as Done.
 - Cross-checking existing Active/Waiting On tasks against real evidence (a referenced file, PR, or deliverable actually existing on disk) to catch tasks that are done but not yet moved.

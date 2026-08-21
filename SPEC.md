@@ -13,11 +13,11 @@ Kartik's personal setup connecting two separate Claude surfaces, Cowork (this cl
 
 ## Architecture
 
-A single Windows folder (`C:\Users\Kartik\Downloads\Github`) connected to this Cowork session as its one accessible root. Five subfolders of read-only reference material, one `claude-agent-templates/` folder of reusable blank scaffolding, one `productivity/` folder running Cowork's dashboard skill, and this root-level scaffold describing the meta-project itself. Continuity across Cowork sessions runs through `handoff.md`. Continuity for the `claude` CLI runs through this `AGENTS.md`, reached via the `CLAUDE.md` pointer at the folder root.
+A single Windows folder (`C:\Users\Kartik\Downloads\Github`) connected to this Cowork session as its one accessible root. Five subfolders of read-only reference material, one `claude-agent-templates/` folder of reusable blank scaffolding, one `productivity/` folder running Cowork's dashboard skill, and this root-level scaffold describing the meta-project itself. Continuity across Cowork sessions runs through `docs/handoff.md`. Continuity for the `claude` CLI runs through this `AGENTS.md`, reached via the `CLAUDE.md` pointer at the folder root.
 
 ## Functional Requirements
 
-- A Cowork session picking up mid-project reads `handoff.md`, then this `AGENTS.md`/`SPEC.md`, and has enough context to continue without re-deriving decisions already made.
+- A Cowork session picking up mid-project reads `docs/handoff.md`, then this `AGENTS.md`/`SPEC.md`, and has enough context to continue without re-deriving decisions already made.
 - Running `claude` from anywhere under this folder tree finds this `CLAUDE.md`, follows it to `AGENTS.md`, and gets the same context instead of the generic `/init` prompt.
 - The reference clones stay untouched regardless of what work happens elsewhere in the tree.
 
@@ -33,4 +33,4 @@ None. Validation is manual: confirm on-disk state directly, never report somethi
 
 ## Acceptance Criteria / Definition of Done
 
-Opening `claude` anywhere in this folder tree surfaces real project context, not a generic `/init`-generated file. A new Cowork session reading `handoff.md` plus these files can state accurately what's done, what's declined, and what's still open, matching `vscode-integration-plan.md`'s status log.
+Opening `claude` anywhere in this folder tree surfaces real project context, not a generic `/init`-generated file. A new Cowork session reading `docs/handoff.md` plus these files can state accurately what's done, what's declined, and what's still open, matching `docs/vscode-integration-plan.md`'s status log.

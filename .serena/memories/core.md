@@ -11,7 +11,7 @@ Structure:
 - `claude-agent-templates/` — blank, reusable AGENTS/SPEC/ROADMAP/TASKS/CLAUDE/GEMINI templates + research notes. Copy out to a real project before filling in; keep blank here.
 - `productivity/` — Cowork's kanban dashboard (`dashboard.html`) plus its own `TASKS.md`/`CLAUDE.md` under an unrelated convention (see `mem:conventions`).
 - Five ChrisTitusTech reference clones — read-only research material.
-- `vscode-integration-plan.md` — authoritative status of VS Code integration specifically.
-- `handoff.md` — continuity note for Cowork sessions across gaps.
+- `docs/vscode-integration-plan.md` — authoritative status of VS Code integration specifically.
+- `docs/handoff.md` — continuity note for Cowork sessions across gaps.
 
 See `mem:tech_stack`, `mem:suggested_commands`, `mem:conventions`, `mem:task_completion`.
