@@ -1,22 +1,47 @@
 # Handoff
 
-Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work from a prior session that got compacted. Read the files below before doing anything else, they carry the context this note doesn't repeat.
+Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read the files below before doing anything else, they carry the context this note doesn't repeat.
 
-## Where things stand
+## Where things stand (as of 2026-08-21)
 
-Cowork setup is done: Engineering and Productivity plugins installed, writing voice skipped (offer still open whenever Kartik wants it). Windows package research, the AGENTS.md/SPEC.md/ROADMAP.md/TASKS.md templates, the productivity dashboard, and a phased VS Code integration plan have all been delivered and saved to Kartik's `Github` folder on his machine (Windows 11 Professional, winget preferred for installs).
+All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `vscode-integration-plan.md` for VS Code specifics.
+
+### This session's work: Serena fix + Engineering skill porting
+
+1. **Serena MCP server** — diagnosed a `node is not installed or isn't in PATH` error seen in pasted logs as transient (stale PATH in a long-running parent process), not a real missing dependency. Confirmed via fresh log output that later spawns succeeded and the bash LSP started cleanly. Ran Serena onboarding, writing 5 memories under `.serena/memories/` (`core`, `tech_stack`, `suggested_commands`, `conventions`, `task_completion`).
+
+2. **Doc reconciliation** — fixed contradictions across `ROADMAP.md`, `TASKS.md`, and `vscode-integration-plan.md` (Phase 4 status, the GitHub/Notion/Asana connector decision). Kartik confirmed: connectors declined for now (revisit only if a real need comes up), and this `Github` root itself is the AGENTS.md scaffolding target — no separate repo needed.
+
+3. **Engineering skill porting** — Kartik wanted Cowork's 10 Engineering-plugin skills available in Claude Code CLI. Real skill instructions weren't accessible from this session (separate product/catalog), so Kartik supplied the real skill descriptions via `cowork-skills-2026-08-21.md`, then approved a hybrid approach:
+   - `engineering:code-review` — skipped porting; Claude Code already has an equivalent native `code-review` skill active in-session.
+   - `engineering:tech-debt` — trialed the official `code-simplifier` and `pr-review-toolkit` plugins first (installed project-scope from `claude-plugins-official`), but neither does codebase-wide audit/prioritization (they act on code already pointed at, not a survey) — so this one was custom-built too.
+   - The remaining 8, plus `tech-debt`, got custom `SKILL.md` files written under `Github\.claude\skills\`: `engineering-architecture`, `engineering-debug`, `engineering-deploy-checklist`, `engineering-documentation`, `engineering-incident-response`, `engineering-standup`, `engineering-system-design`, `engineering-testing-strategy`, `engineering-tech-debt`. These are recreations based on each skill's one-line trigger description, not literal copies of Cowork's actual instructions.
+
+4. **Testing pass** — ran dummy/dry-run tests of all 10 skills against the real reference-clone repos (`linutil-main`, `winutil-main`, `dwm-titus-main`), read-only throughout per `AGENTS.md`'s non-negotiable rule against writing into those folders:
+   - `engineering-tech-debt`: real grep audit across all 3 repos, found one genuine `TODO` (`dwm-titus-main/dwm.c:1040`); also surfaced that its `XXX` pattern false-positived on `mktemp ...XXXXXX` template strings.
+   - `engineering-standup`: real `git log` against this repo's own history, correct output.
+   - `code-review` (native, not custom): live background run against `linutil-main/core/src/inner.rs` — correctly reported no diff in scope rather than doing an unscoped audit, and respected the read-only boundary.
+   - The remaining 7 custom skills were manually dry-run walked through using real grounding material (install.sh flags, CI workflows, config/*.json structure) since they weren't yet live-invocable in-session (new project skills need a restart to register). All 7 held up — grounded, non-generic output.
+   - **Fix applied following the test**: `engineering-tech-debt`'s grep step now requires a comment-marker prefix (or excludes runs of >3 consecutive `X`s) for the `XXX` marker instead of matching it bare, removing the `mktemp` false-positive noise.
+
+### Restart required
+
+The 9 custom skills and the `pr-review-toolkit` plugin's components (e.g. `review-pr`) are written/installed but were confirmed NOT live-invocable via the `Skill` tool in the session that created them — Claude Code needs a restart to register new project-scope skills. Kartik is reloading a new session for this. After restart, worth a quick sanity check that `/engineering-*` skills and `pr-review-toolkit` actually trigger.
 
 ## Files to read first
 
-- `Github\claude-agent-templates\` — the six ChrisTitusTech-pattern templates (AGENTS.md, SPEC.md, ROADMAP.md, TASKS.md, CLAUDE.md, GEMINI.md), plus `titus-ai-windows-setup.md` and `titus-ai-windows-packages-research.md` (sourced winget package list).
-- `Github\productivity\` — `dashboard.html` (kanban board, refactored and dark-mode enabled), `TASKS.md`, `CLAUDE.md` (Cowork's memory file: who Kartik is, his research standards), `dashboard-usage-guide.md`, and `backups\` (pre-refactor dashboard backup).
-- `Github\vscode-integration-plan.md` — five-phase plan for bringing this setup into VS Code (install Claude Code CLI + extension, carry AGENTS.md pattern into repos via `CLAUDE.md` → `@AGENTS.md`, reconnect connectors via `claude mcp add`, decide on porting Engineering skills, leave the dashboard as a browser tool). Not yet started.
+- `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
+- `ROADMAP.md` / `TASKS.md` — phase status (all 6 phases complete, no active phase) and possible future work.
+- `vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
+- `Github\.claude\skills\` — the 9 custom `SKILL.md` files from this session.
+- `cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
 
-## Two open decisions, unresolved
+## Open items for Kartik
 
-1. **dashboard.html refactor**: `createCard` (board view) and `createListItem` (list view) were deliberately NOT merged during the Moderate refactor, they're structurally different (innerHTML+delegated-click vs createElement+per-element-listeners), not true duplicate logic, and forcing a merge was judged to hurt clarity for less benefit than originally estimated. Kartik hasn't said whether he still wants that merge attempted anyway.
-2. **VS Code connector priority**: the plan lists GitHub, Notion, and Asana as the three connectors with documented one-line `claude mcp add` commands. Kartik hasn't confirmed those are actually the right three to wire up first versus something else in his stack (Slack, Jira, a database).
+1. **dashboard.html refactor**: `createCard` (board view) and `createListItem` (list view) were deliberately not merged during the earlier Moderate refactor — structurally different, not true duplicate logic. Still open whether Kartik wants that merge attempted anyway.
+2. **Post-restart check**: confirm the 9 new skills and `pr-review-toolkit` actually trigger now that the session has reloaded.
+3. No further roadmap work is queued — check with Kartik for next direction once the skills are confirmed live.
 
 ## Notes
 
-Plugins, connectors, and skills are account-level and already active, nothing needs reinstalling. `Github\productivity\CLAUDE.md` (Cowork's memory) and the per-repo `CLAUDE.md` files from Phase 2 of the VS Code plan share a name but are unrelated files, don't conflate them.
+Plugins, connectors, and skills from Cowork are account-level and separate from Claude Code CLI's own catalog — nothing transfers automatically between the two products. `Github\productivity\CLAUDE.md` (Cowork's memory) and the per-repo `CLAUDE.md` files are unrelated files that share a name, don't conflate them. Same applies to the two unrelated `TASKS.md` files (this repo's active-phase tracker vs. `productivity\TASKS.md`'s kanban board).

@@ -52,13 +52,19 @@ Dashboard opens locally, reads and writes `TASKS.md` on disk, autosaves.
 
 ## Phase 4: VS Code integration
 
-Status: in progress, see `vscode-integration-plan.md` for the authoritative phase-by-phase status
+Status: complete (2026-08-21). See `vscode-integration-plan.md` for the authoritative phase-by-phase status.
 
 ### Objective
 Bring Cowork's setup into Claude Code CLI and its VS Code extension.
 
-### Outcomes so far
-CLI and VS Code extension both installed and confirmed working (2026-08-20). GitHub/Notion/Asana connector wiring declined. Repo-level AGENTS.md scaffolding and Engineering-skill porting both on hold pending a real target repo.
+### Outcomes
+CLI and VS Code extension both installed and confirmed working (2026-08-20). GitHub/Notion/Asana connector wiring declined by choice (confirmed 2026-08-21). Repo-level AGENTS.md scaffolding satisfied by this repo's own Phase 5 scaffold — Kartik confirmed this `Github` root is the scaffolding target. Engineering-plugin skills ported (2026-08-21): `code-review` skipped (already covered by a native Claude Code skill), `code-simplifier`/`pr-review-toolkit` installed project-scope as a trial for `tech-debt` (insufficient alone), 9 custom `SKILL.md` files written under `.claude/skills/` for the rest (architecture, debug, deploy-checklist, documentation, incident-response, standup, system-design, testing-strategy, tech-debt).
+
+### Exit Criteria
+See `vscode-integration-plan.md`'s verification checklist.
+
+### Completion Evidence
+`claude plugin list` shows `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` installed at project scope; `Github\.claude\skills\` contains the 9 custom skill folders, each with a `SKILL.md`.
 
 ### Exit Criteria
 See `vscode-integration-plan.md`'s verification checklist.

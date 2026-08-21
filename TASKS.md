@@ -5,9 +5,9 @@ Replace this file's contents when the phase completes, don't accumulate history.
 
 ## Active Phase: none
 
-Phase 5 (root-level project scaffold) completed 2026-08-20, see `ROADMAP.md`. No phase is currently active.
+Phase 4 (VS Code integration) completed 2026-08-21, see `ROADMAP.md` and `vscode-integration-plan.md`. No phase is currently active.
 
-The next likely phase is applying this same AGENTS.md/SPEC.md/ROADMAP.md/TASKS.md pattern to a real project of Kartik's, once one exists, using the blank templates in `claude-agent-templates/` as the starting point rather than copying this filled-in root scaffold.
+Possible future work, none currently active: revisiting the declined GitHub/Notion/Asana connectors if a real need for one comes up, or scaffolding a genuinely separate project of Kartik's (not this root) using the blank templates in `claude-agent-templates/` as the starting point.
 
 ## Phase Completion
 

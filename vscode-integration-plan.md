@@ -77,18 +77,18 @@ Before considering this done: `claude --version` runs in VS Code's integrated te
 
 ## Open decisions for you
 
-Resolved (2026-08-20): GitHub, Notion, and Asana are confirmed as the right first three connectors to wire up in Claude Code, per Phase 3 above.
+Resolved (2026-08-21): Phase 3 connectors (GitHub, Notion, Asana) are declined for now, not wired up. Revisit only if a real need for one of them comes up; see Status below.
 
-Resolved (2026-08-20): Phase 2 (AGENTS.md scaffolding) has no target repo yet, skip until a real project needs it. Phase 4 (porting Engineering-plugin skills into `.claude/skills/`) is on hold too, port a skill only once you're repeating the same instructions to Claude Code by hand, not before.
+Resolved (2026-08-21): Phase 2's target repo is this `Github` root (already scaffolded via Phase 5). Phase 4 (porting Engineering-plugin skills into `.claude/skills/`) is done, see Status below for what was ported vs. skipped vs. covered by an installed plugin.
 
 ## Status
 
 Phase 1: done (2026-08-20). `winget install Anthropic.ClaudeCode` (CLI) and the "Claude Code for VS Code" extension (v2.1.238, Anthropic) are both installed and confirmed working, `claude` launches and is signed in inside VS Code's integrated terminal, and the extension's own welcome message fired. Note: the extension auto-installs its own bundled MCP servers (GitHub, Context7, Markitdown seen in Extensions panel), separate from and unrelated to the Phase 3 GitHub/Notion/Asana connectors, which stay declined.
 
-Phase 2: on hold, no target repo yet.
+Phase 2: satisfied (2026-08-21). Kartik confirmed the target repo for AGENTS.md scaffolding is this `Github` root itself, which already carries the pattern via ROADMAP.md's Phase 5 (completed 2026-08-20). No separate action taken under this plan.
 
-Phase 3: declined (2026-08-20). Kartik is skipping the GitHub/Notion/Asana `claude mcp add` connections. Revisit only if that changes.
+Phase 3: declined (2026-08-20, reconfirmed 2026-08-21). Kartik is skipping the GitHub/Notion/Asana `claude mcp add` connections. Revisit only if that changes.
 
-Phase 4: on hold, port a skill only once you're repeating the same instructions to Claude Code by hand.
+Phase 4: done (2026-08-21). Skipped porting `engineering:code-review` — Claude Code already has an equivalent native `code-review` skill active in-session, so porting it would be redundant. Trialed `code-simplifier@claude-plugins-official` and `pr-review-toolkit@claude-plugins-official` (installed, project scope) against `engineering:tech-debt`; neither actually produces a categorized/prioritized debt audit (they act on code already pointed at, not a codebase-wide survey), so `tech-debt` was custom-built too. Wrote 9 custom `SKILL.md` files under `Github\.claude\skills\`: `engineering-architecture`, `engineering-debug`, `engineering-deploy-checklist`, `engineering-documentation`, `engineering-incident-response`, `engineering-standup`, `engineering-system-design`, `engineering-testing-strategy`, `engineering-tech-debt`. These are recreations based on each skill's one-line Cowork trigger description (the actual Cowork skill instructions weren't accessible from this session), not literal copies.
 
 Phase 5: no action needed.
