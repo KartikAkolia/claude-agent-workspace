@@ -54,7 +54,7 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
    - All 48 tests pass: `node --test productivity/dashboard-baseline.test.js productivity/dashboard-start-editing.test.js productivity/dashboard-interactions.test.js productivity/escapeHtml.test.js`.
    - Updated `docs/dashboard-card-listitem-merge-roadmap.md` and `ROADMAP.md` (candidate item 5) with the implementation summary and a Phase 3 manual QA checklist.
 
-4. **Phase 3 (manual browser QA) is Kartik's step** — no headless browser tool exists in this session. Checklist is in `docs/dashboard-card-listitem-merge-roadmap.md`: drag-and-drop reordering in both views, view-switch mid-edit, empty-board state, long title wrapping, dark/light theme toggle.
+4. **Phase 3 (manual browser QA): done (2026-08-21, Kartik).** Ran directly in a browser — checklist (drag-and-drop reordering in both views, view-switch mid-edit, empty-board state, long title wrapping, dark/light theme toggle) all passed, no issues found. All 4 phases of the merge are now complete.
 
 ## Files to read first
 
