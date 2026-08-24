@@ -6,11 +6,15 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `docs/vscode-integration-plan.md` for VS Code specifics.
 
-Since then, the active work has shifted to Kartik's Debian homelab host (`dell-optiplex`, still at `192.168.0.222`, now a **static** address — see below): ChrisTitusTech's Fedora-only `dwm-titus` was ported and installed there, its theming script was patched to manage icon themes, and the NetworkManager/IPv6/sleep hardening plan was executed end-to-end. Nothing is currently pending on this host.
+Since then, the active work has shifted to Kartik's Debian homelab host (`dell-optiplex`, still at `192.168.0.222`, now a **static** address — see below): ChrisTitusTech's Fedora-only `dwm-titus` was ported and installed there, its theming script was patched to manage icon themes, the NetworkManager/IPv6/sleep hardening plan was executed end-to-end, `xrdp` was set up for remote access, and a Paper Minecraft server was installed, hardened, and put behind a real firewall (the host had none before).
 
 ### Next up
 
-`xrdp` was set up on `dell-optiplex` for remote access to the dwm-titus session (2026-08-24) but **not yet graphically verified** — this session only had shell access. Kartik needs to confirm from a real RDP client (e.g. Windows `mstsc` to `192.168.0.222:3389`, user `kartik`) that dwm actually renders correctly (statusbar, wallpaper, autostart effects) before treating it as fully done. See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section. Otherwise nothing outstanding — `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) if further homelab networking work comes up.
+Two things need Kartik's own action, both on `dell-optiplex`:
+1. **xrdp graphical verification** — set up 2026-08-24 but not yet confirmed from a real RDP client. RDP to `192.168.0.222:3389` (user `kartik`) and confirm dwm actually renders (statusbar, wallpaper, autostart effects). See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section.
+2. **Minecraft server port-forward** — the server itself is up, hardened, and firewalled (`192.168.0.222:25565`), but reaching it from the internet needs a router-side port-forward rule (external TCP 25565 → `192.168.0.222:25565`), which is Kartik's own task. See `docs/minecraft-server-setup.md` for full detail, including the RCON password location and the optional whitelist follow-up.
+
+Otherwise nothing outstanding — `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) if further homelab networking work comes up.
 
 ### This session's work: Serena fix + Engineering skill porting
 
@@ -85,6 +89,12 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 
 Installed `xrdp` + `xorgxrdp` on `dell-optiplex` and wired `~/.xsession` to launch the dwm-titus binary directly (mirroring `/usr/share/xsessions/dwm.desktop`'s `Exec=` line), since xrdp has no session-picker concept of its own. Found and fixed a real gap: the `xrdp` system user wasn't in the `ssl-cert` group so it couldn't read its own TLS key — Debian's package doesn't add this automatically. Service confirmed listening and loading its cert cleanly from the logs. Full detail in `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section. **Not graphically verified** — needs a real RDP client test from Kartik, see "Next up."
 
+### This session's work (2026-08-24, cont'd): Paper Minecraft server installed on the homelab host
+
+Kartik wanted a Minecraft server on `dell-optiplex`; scaffolded a plan first (Paper vs. vanilla, Java version, JVM tuning, systemd hardening, firewall, backups), then executed it after Kartik answered the open questions: Paper, no plugins, port-forward (not VPN), 3-5 expected players. Full detail, including the Java-21-to-25 pivot forced by package availability and the deliberate G1GC-over-ZGC call for this host's hardware, is in `docs/minecraft-server-setup.md`.
+
+Built: Java 25 headless JRE, a dedicated non-login `minecraft` system user, Paper 26.2 build 117 (checksum-verified), a hardened `minecraft.service` systemd unit (Aikar's-flags G1GC, 4GB heap, `ProtectSystem=full` etc.), and a nightly cron backup (RCON save-off/save-all/save-on wrapped around a `world/` tarball, 7-day retention). The one high-blast-radius step — the host's firewall (`nftables`) had **no active filtering at all** before this — was applied carefully: default-drop input/forward, explicit allows for loopback/established/SSH/25565 only (RCON's 25575 deliberately excluded), validated with a fresh out-of-band SSH connection plus a direct external reachability test before moving on. Not done: the router port-forward itself (Kartik's own task) and enabling the whitelist (left off by default, flagged as an easy follow-up once the server is actually public).
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -94,7 +104,8 @@ Installed `xrdp` + `xorgxrdp` on `dell-optiplex` and wired `~/.xsession` to laun
 - `Github\.claude\skills\` — the 9 custom `SKILL.md` files from the 2026-08-21 session, plus the titus-ai skills (`homelab-admin`, `linux-sysadmin`, etc.) ported later.
 - `docs/cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
 - `docs/homelab-networkmanager-plan.md` — the NetworkManager/IPv6/sleep plan for `dell-optiplex` and what actually happened when it was executed (including the DHCP-lease deviation that led to switching `enp3s0` to a static IP). Read this if resuming any further homelab networking work.
-- `docs/dwm-titus-debian-port.md` — full record of porting `dwm-titus` to Debian on the same host, plus the later icon-theme patch to its `theme-apply.sh`.
+- `docs/dwm-titus-debian-port.md` — full record of porting `dwm-titus` to Debian on the same host, plus the later icon-theme patch to its `theme-apply.sh` and the xrdp remote-access setup.
+- `docs/minecraft-server-setup.md` — the Paper Minecraft server on the same host: what was built, why Java 25/G1GC over the newer defaults, the firewall change, and what's still on Kartik (router port-forward, optional whitelist).
 
 ## Open items for Kartik
 
@@ -105,7 +116,8 @@ Installed `xrdp` + `xorgxrdp` on `dell-optiplex` and wired `~/.xsession` to laun
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
 7. ~~NetworkManager/IPv6/sleep setup on the homelab host.~~ Done, 2026-08-24 — all 3 steps executed and validated; `enp3s0` ended up static (`192.168.0.222/24`) rather than DHCP after a lease-matching issue surfaced mid-execution. Details in `docs/homelab-networkmanager-plan.md`.
-8. **New (2026-08-24):** xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus — service is up and listening, but **not yet graphically verified**. Kartik needs to RDP in himself (`mstsc` to `192.168.0.222:3389`, user `kartik`) and confirm dwm renders correctly before this is closed out.
+8. xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus — service is up and listening, but **not yet graphically verified**. Kartik needs to RDP in himself (`mstsc` to `192.168.0.222:3389`, user `kartik`) and confirm dwm renders correctly before this is closed out.
+9. **New (2026-08-24):** Paper Minecraft server installed, hardened, firewalled, and backed up on `dell-optiplex` — fully working locally (`192.168.0.222:25565`), but not reachable from the internet yet. Kartik needs to add a router port-forward rule (external TCP 25565 → `192.168.0.222:25565`) himself. Details and the RCON password location in `docs/minecraft-server-setup.md`.
 
 ## Notes
 
