@@ -56,6 +56,10 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 4. **Phase 3 (manual browser QA): done (2026-08-21, Kartik).** Ran directly in a browser — checklist (drag-and-drop reordering in both views, view-switch mid-edit, empty-board state, long title wrapping, dark/light theme toggle) all passed, no issues found. All 4 phases of the merge are now complete.
 
+### This session's work (2026-08-24): dwm-titus ported to Debian and installed on the homelab host
+
+Kartik wanted ChrisTitusTech's `dwm-titus` (Fedora-only upstream, `install.sh` hard-rejects other distros) running on his Debian homelab box at 192.168.0.222. Full package mapping (Fedora dnf → Debian apt, by profile), build/install steps, and the non-package assets (Meslo font, Nordic theme, Nord wallpapers, Herdr skipped) are documented in `docs/dwm-titus-debian-port.md` — read that file directly rather than this summary if picking this back up. Confirmed working by Kartik on 2026-08-24: dwm launches from the lightdm/slick-greeter session picker. Outstanding: `mangohud` blocked by a transient sid dependency gap, `deepin-gtk-theme`/`adw-gtk3` have no Debian package, Herdr wasn't installed because its pinned installer checksum in `dwm-titus`'s own `scripts/install-herdr` didn't match what herdr.dev currently serves (flagged, not bypassed, Kartik confirmed skipping it is fine).
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
