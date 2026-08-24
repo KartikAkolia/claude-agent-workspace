@@ -60,6 +60,10 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 Kartik wanted ChrisTitusTech's `dwm-titus` (Fedora-only upstream, `install.sh` hard-rejects other distros) running on his Debian homelab box at 192.168.0.222. Full package mapping (Fedora dnf → Debian apt, by profile), build/install steps, and the non-package assets (Meslo font, Nordic theme, Nord wallpapers, Herdr skipped) are documented in `docs/dwm-titus-debian-port.md` — read that file directly rather than this summary if picking this back up. Confirmed working by Kartik on 2026-08-24: dwm launches from the lightdm/slick-greeter session picker. Outstanding: `mangohud` blocked by a transient sid dependency gap, `deepin-gtk-theme`/`adw-gtk3` have no Debian package, Herdr wasn't installed because its pinned installer checksum in `dwm-titus`'s own `scripts/install-herdr` didn't match what herdr.dev currently serves (flagged, not bypassed, Kartik confirmed skipping it is fine).
 
+### This session's work (2026-08-24, cont'd): icon theme support added to `theme-apply.sh`
+
+Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scripts/theme-apply.sh` had zero icon-theme handling and destructively overwrites `~/.gtkrc-2.0` every run, so patched the script (following its existing `gtk_theme` pattern) rather than hand-editing config files. Full details in the "Follow-up (2026-08-24)" section of `docs/dwm-titus-debian-port.md`. Key point if resuming this: the script exists in three places on the host (source clone, data-dir copy, and the actually-invoked `/usr/local/bin/theme-apply.sh`) — all three had to be updated, the git clone alone has no runtime effect. Verified working; no `themes.toml` changes made (icon theme currently only has a dark/light default, no per-theme override set).
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.

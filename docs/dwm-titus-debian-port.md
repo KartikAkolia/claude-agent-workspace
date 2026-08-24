@@ -225,3 +225,19 @@ A standalone reference script, `dwm-titus-debian-install.sh` at this repo's root
 ## Outcome
 
 Confirmed working by Kartik on 2026-08-24: dwm launches successfully from the lightdm/slick-greeter session picker.
+
+## Follow-up (2026-08-24): icon theme support added to `theme-apply.sh`
+
+Kartik installed `papirus-icon-theme` on the host and wanted it applied. `scripts/theme-apply.sh` (the script dwm-titus runs on every theme reload) had no icon-theme handling at all, and its GTK2 block (`~/.gtkrc-2.0`) fully overwrites the file on every run — so a manual one-off fix would have been silently wiped on the next theme switch. Patched the script itself instead of hand-editing config files.
+
+The patch mirrors the script's existing `gtk_theme`/`default_gtk_theme`/`gtk_theme_available` pattern exactly:
+
+- Added `icon_theme_available()` (searches `~/.local/share/icons`, `~/.icons`, `/usr/local/share/icons`, `/usr/share/icons`, same as the GTK theme lookup) and `default_icon_theme()` (returns `Papirus-Dark` in dark mode, `Papirus-Light` in light mode — Papirus was the theme Kartik had installed and asked for).
+- `ICON_THEME_NAME` reads an optional `icon_theme` key from the active theme's `[theme.*]` section in `themes.toml` (none set yet, so it falls through to the default), with a fallback to `Adwaita` if the resolved name isn't actually installed — same safety net the GTK theme lookup already has.
+- GTK3 and GTK4 blocks each got a new `gtk_ini_set ... "gtk-icon-theme-name" "$ICON_THEME_NAME"` call, using the script's existing idempotent ini-key helper.
+- The GTK2 `printf` that rebuilds `~/.gtkrc-2.0` now includes `gtk-icon-theme-name` in the same overwrite, so it's no longer lost on the next run.
+- Also added to the live-update paths for consistency with how cursor/GTK theme are already propagated: `gsettings set org.gnome.desktop.interface icon-theme` and `xfconf-query ... /Net/IconThemeName`.
+
+Deployed to all three copies that exist on the host — the source at `/home/kartik/dwm-titus/scripts/theme-apply.sh`, the data-dir copy at `~/.local/share/dwm-titus/scripts/theme-apply.sh`, and the actually-invoked installed copy at `/usr/local/bin/theme-apply.sh` (root-owned; updated via `sudo cp` + `chown root:root`). The git clone alone is not what runs at theme-reload time — both deployed copies had to be updated too, or the change would have had no effect. Verified by running `theme-apply.sh` directly and confirming `gtk-icon-theme-name=Papirus-Dark` landed in `~/.config/gtk-3.0/settings.ini`, `~/.config/gtk-4.0/settings.ini`, and `~/.gtkrc-2.0`.
+
+No changes were made to `themes.toml` — an `icon_theme` key per theme section is supported by the script (mirroring `gtk_theme`) but none is set, so every theme currently gets the dark/light default. Set one explicitly per theme in `~/.config/dwm-titus/themes.toml` if a different icon theme is ever wanted for a specific theme.
