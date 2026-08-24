@@ -10,7 +10,7 @@ Since then, the active work has shifted to Kartik's Debian homelab host (`dell-o
 
 ### Next up
 
-Nothing outstanding. If new homelab work comes up, `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) to build on.
+`xrdp` was set up on `dell-optiplex` for remote access to the dwm-titus session (2026-08-24) but **not yet graphically verified** — this session only had shell access. Kartik needs to confirm from a real RDP client (e.g. Windows `mstsc` to `192.168.0.222:3389`, user `kartik`) that dwm actually renders correctly (statusbar, wallpaper, autostart effects) before treating it as fully done. See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section. Otherwise nothing outstanding — `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) if further homelab networking work comes up.
 
 ### This session's work: Serena fix + Engineering skill porting
 
@@ -81,6 +81,10 @@ Full blow-by-blow, including the exact commands and why each deviation happened,
 
 Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scripts/theme-apply.sh` had zero icon-theme handling and destructively overwrites `~/.gtkrc-2.0` every run, so patched the script (following its existing `gtk_theme` pattern) rather than hand-editing config files. Full details in the "Follow-up (2026-08-24)" section of `docs/dwm-titus-debian-port.md`. Key point if resuming this: the script exists in three places on the host (source clone, data-dir copy, and the actually-invoked `/usr/local/bin/theme-apply.sh`) — all three had to be updated, the git clone alone has no runtime effect. Verified working; no `themes.toml` changes made (icon theme currently only has a dark/light default, no per-theme override set).
 
+### This session's work (2026-08-24, cont'd): xrdp installed for remote access to dwm-titus
+
+Installed `xrdp` + `xorgxrdp` on `dell-optiplex` and wired `~/.xsession` to launch the dwm-titus binary directly (mirroring `/usr/share/xsessions/dwm.desktop`'s `Exec=` line), since xrdp has no session-picker concept of its own. Found and fixed a real gap: the `xrdp` system user wasn't in the `ssl-cert` group so it couldn't read its own TLS key — Debian's package doesn't add this automatically. Service confirmed listening and loading its cert cleanly from the logs. Full detail in `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section. **Not graphically verified** — needs a real RDP client test from Kartik, see "Next up."
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -101,6 +105,7 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
 7. ~~NetworkManager/IPv6/sleep setup on the homelab host.~~ Done, 2026-08-24 — all 3 steps executed and validated; `enp3s0` ended up static (`192.168.0.222/24`) rather than DHCP after a lease-matching issue surfaced mid-execution. Details in `docs/homelab-networkmanager-plan.md`.
+8. **New (2026-08-24):** xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus — service is up and listening, but **not yet graphically verified**. Kartik needs to RDP in himself (`mstsc` to `192.168.0.222:3389`, user `kartik`) and confirm dwm renders correctly before this is closed out.
 
 ## Notes
 

@@ -241,3 +241,19 @@ The patch mirrors the script's existing `gtk_theme`/`default_gtk_theme`/`gtk_the
 Deployed to all three copies that exist on the host — the source at `/home/kartik/dwm-titus/scripts/theme-apply.sh`, the data-dir copy at `~/.local/share/dwm-titus/scripts/theme-apply.sh`, and the actually-invoked installed copy at `/usr/local/bin/theme-apply.sh` (root-owned; updated via `sudo cp` + `chown root:root`). The git clone alone is not what runs at theme-reload time — both deployed copies had to be updated too, or the change would have had no effect. Verified by running `theme-apply.sh` directly and confirming `gtk-icon-theme-name=Papirus-Dark` landed in `~/.config/gtk-3.0/settings.ini`, `~/.config/gtk-4.0/settings.ini`, and `~/.gtkrc-2.0`.
 
 No changes were made to `themes.toml` — an `icon_theme` key per theme section is supported by the script (mirroring `gtk_theme`) but none is set, so every theme currently gets the dark/light default. Set one explicitly per theme in `~/.config/dwm-titus/themes.toml` if a different icon theme is ever wanted for a specific theme.
+
+## Follow-up (2026-08-24): xrdp remote access to the dwm-titus session
+
+Kartik wanted to reach the dwm-titus session remotely over RDP. Lower blast radius than the earlier NetworkManager work — installing a new service and opening a new port, not modifying live network config the SSH session depends on — so no console-access gate was needed here.
+
+- Installed `xrdp` (0.10.6.1-2) and `xorgxrdp` (1:0.10.5-2) from the Debian repo — the modern Xorg-backend RDP stack, not the legacy Xvnc one. Each RDP login gets its own virtual X server via `xorgxrdp`'s driver; it doesn't touch the physical GPU/display, so it runs independently of the existing lightdm/console dwm session with no conflict.
+- xrdp has no session picker equivalent to lightdm's `/usr/share/xsessions`. To pin the RDP session to dwm-titus specifically (rather than whatever `/etc/X11/Xsession`'s default fallback would pick), created `/home/kartik/.xsession`:
+  ```
+  exec /usr/local/bin/dwm
+  ```
+  This mirrors `/usr/share/xsessions/dwm.desktop`'s own `Exec=/usr/local/bin/dwm` line exactly — same binary, same autostart (`dwm.c`'s `runautostart()` calls `scripts/autostart.sh` internally, so the raw binary is the complete session; no wrapper script needed).
+- **Real gap found and fixed**: the `xrdp` system user wasn't in the `ssl-cert` group, so it couldn't read `/etc/xrdp/key.pem` (symlinked to `/etc/ssl/private/ssl-cert-snakeoil.key`, `root:ssl-cert 640`) — the package's postinst doesn't add this automatically on Debian. Fixed with `sudo adduser xrdp ssl-cert` + `systemctl restart xrdp xrdp-sesman`. Confirmed via `/var/log/xrdp.log`: `Using default X.509 certificate: /etc/xrdp/cert.pem` / `Using default X.509 key file: /etc/xrdp/key.pem` logged cleanly on the next connection attempt, no permission error.
+- No firewall changes needed — `nft list ruleset` on this host is empty (no active rules), so port 3389 was never blocked.
+- Verified: `xrdp`/`xrdp-sesman` both `enabled` and `active`, `ss -tulpn` shows `*:3389` listening.
+
+**Not verified from this session**: an actual graphical RDP login, since access here is shell-only (no RDP client available to drive one end-to-end). Kartik still needs to confirm from a real RDP client (e.g. Windows' `mstsc` to `192.168.0.222:3389`, user `kartik`) that dwm renders correctly — statusbar, wallpaper, and the rest of `autostart.sh`'s effects — before treating this as fully done.
