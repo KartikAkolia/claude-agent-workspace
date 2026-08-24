@@ -60,6 +60,10 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 Kartik wanted ChrisTitusTech's `dwm-titus` (Fedora-only upstream, `install.sh` hard-rejects other distros) running on his Debian homelab box at 192.168.0.222. Full package mapping (Fedora dnf → Debian apt, by profile), build/install steps, and the non-package assets (Meslo font, Nordic theme, Nord wallpapers, Herdr skipped) are documented in `docs/dwm-titus-debian-port.md` — read that file directly rather than this summary if picking this back up. Confirmed working by Kartik on 2026-08-24: dwm launches from the lightdm/slick-greeter session picker. Outstanding: `mangohud` blocked by a transient sid dependency gap, `deepin-gtk-theme`/`adw-gtk3` have no Debian package, Herdr wasn't installed because its pinned installer checksum in `dwm-titus`'s own `scripts/install-herdr` didn't match what herdr.dev currently serves (flagged, not bypassed, Kartik confirmed skipping it is fine).
 
+### This session's work (2026-08-24, cont'd): NetworkManager/IPv6/sleep plan drafted, execution deferred
+
+Kartik wants NetworkManager actually managing networking on the homelab host (currently installed but `enp3s0` is unmanaged — deferred to ifupdown per Debian's default `managed=false`), IPv6 disabled, and sleep-related settings disabled so the box never drops off the network. Investigated current state and cross-checked the fix against the Debian wiki, NetworkManager's own docs, and Red Hat's guidance; full plan (exact commands, why each choice was made, sources) is in `docs/homelab-networkmanager-plan.md`. **Not executed** — the NetworkManager handover step briefly cycles the only NIC this SSH session depends on, which conflicts with `homelab-admin`'s safety rule against changing networking without rollback/out-of-band access, so Kartik asked to save it for a future session instead. Resume by reading that doc, confirming local/console access to `dell-optiplex` first, then running the three steps in order.
+
 ### This session's work (2026-08-24, cont'd): icon theme support added to `theme-apply.sh`
 
 Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scripts/theme-apply.sh` had zero icon-theme handling and destructively overwrites `~/.gtkrc-2.0` every run, so patched the script (following its existing `gtk_theme` pattern) rather than hand-editing config files. Full details in the "Follow-up (2026-08-24)" section of `docs/dwm-titus-debian-port.md`. Key point if resuming this: the script exists in three places on the host (source clone, data-dir copy, and the actually-invoked `/usr/local/bin/theme-apply.sh`) — all three had to be updated, the git clone alone has no runtime effect. Verified working; no `themes.toml` changes made (icon theme currently only has a dark/light default, no per-theme override set).
@@ -81,7 +85,7 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
-7. No further roadmap work is queued — check with Kartik for next direction.
+7. **New (2026-08-24):** NetworkManager/IPv6/sleep setup on the homelab host — planned in `docs/homelab-networkmanager-plan.md`, deferred pending confirmation of local/console access to `dell-optiplex` before the risky step (handing `enp3s0` from ifupdown to NetworkManager).
 
 ## Notes
 
