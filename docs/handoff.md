@@ -2,9 +2,15 @@
 
 Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read the files below before doing anything else, they carry the context this note doesn't repeat.
 
-## Where things stand (as of 2026-08-21)
+## Where things stand (as of 2026-08-24)
 
 All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `docs/vscode-integration-plan.md` for VS Code specifics.
+
+Since then, the active work has shifted to Kartik's Debian homelab host (`dell-optiplex`, 192.168.0.222): ChrisTitusTech's Fedora-only `dwm-titus` was ported and installed there, its theming script was patched to manage icon themes, and a NetworkManager/IPv6/sleep hardening plan was written but deliberately **not yet executed**. That last item is the one thing actually pending — see "Next up" immediately below.
+
+### Next up
+
+Resume the deferred NetworkManager/IPv6/sleep plan for `dell-optiplex`: read `docs/homelab-networkmanager-plan.md` in full first (it has the exact commands, the reasoning, and doc sources — don't re-derive it), confirm Kartik has local/console access to the box as a fallback (the plan's one risky step briefly cycles the only NIC this host is reachable through over SSH), then execute the three steps in order, validating after each one before moving to the next.
 
 ### This session's work: Serena fix + Engineering skill porting
 
@@ -74,8 +80,10 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 - `ROADMAP.md` / `TASKS.md` — phase status (all 6 phases complete, no active phase) and possible future work. Stays at root; not moved into `docs/`.
 - `docs/` — new as of 2026-08-21: holds the four non-scaffold markdown files (this one, `headroom-setup-plan.md`, `vscode-integration-plan.md`, `cowork-skills-2026-08-21.md`). `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` remain at root by design, for CLI tool auto-discovery.
 - `docs/vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
-- `Github\.claude\skills\` — the 9 custom `SKILL.md` files from this session.
+- `Github\.claude\skills\` — the 9 custom `SKILL.md` files from the 2026-08-21 session, plus the titus-ai skills (`homelab-admin`, `linux-sysadmin`, etc.) ported later.
 - `docs/cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
+- `docs/homelab-networkmanager-plan.md` — **read this first if resuming homelab work.** The deferred NetworkManager/IPv6/sleep plan for `dell-optiplex`, not yet executed.
+- `docs/dwm-titus-debian-port.md` — full record of porting `dwm-titus` to Debian on the same host, plus the later icon-theme patch to its `theme-apply.sh`.
 
 ## Open items for Kartik
 
