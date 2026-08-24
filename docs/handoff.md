@@ -6,11 +6,11 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete: Cowork setup, ChrisTitusTech pattern research/templates, the productivity dashboard, VS Code integration (CLI + extension + Engineering skills), the root-level `AGENTS.md` scaffold on this repo, and version control (pushed to `github.com/KartikAkolia/claude-agent-workspace`, private). See `ROADMAP.md` for the authoritative phase-by-phase record and `docs/vscode-integration-plan.md` for VS Code specifics.
 
-Since then, the active work has shifted to Kartik's Debian homelab host (`dell-optiplex`, 192.168.0.222): ChrisTitusTech's Fedora-only `dwm-titus` was ported and installed there, its theming script was patched to manage icon themes, and a NetworkManager/IPv6/sleep hardening plan was written but deliberately **not yet executed**. That last item is the one thing actually pending — see "Next up" immediately below.
+Since then, the active work has shifted to Kartik's Debian homelab host (`dell-optiplex`, still at `192.168.0.222`, now a **static** address — see below): ChrisTitusTech's Fedora-only `dwm-titus` was ported and installed there, its theming script was patched to manage icon themes, and the NetworkManager/IPv6/sleep hardening plan was executed end-to-end. Nothing is currently pending on this host.
 
 ### Next up
 
-Resume the deferred NetworkManager/IPv6/sleep plan for `dell-optiplex`: read `docs/homelab-networkmanager-plan.md` in full first (it has the exact commands, the reasoning, and doc sources — don't re-derive it), confirm Kartik has local/console access to the box as a fallback (the plan's one risky step briefly cycles the only NIC this host is reachable through over SSH), then execute the three steps in order, validating after each one before moving to the next.
+Nothing outstanding. If new homelab work comes up, `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) to build on.
 
 ### This session's work: Serena fix + Engineering skill porting
 
@@ -66,9 +66,16 @@ Added `powershell` to `.serena/project.yml`'s `language_servers` list (was `[bas
 
 Kartik wanted ChrisTitusTech's `dwm-titus` (Fedora-only upstream, `install.sh` hard-rejects other distros) running on his Debian homelab box at 192.168.0.222. Full package mapping (Fedora dnf → Debian apt, by profile), build/install steps, and the non-package assets (Meslo font, Nordic theme, Nord wallpapers, Herdr skipped) are documented in `docs/dwm-titus-debian-port.md` — read that file directly rather than this summary if picking this back up. Confirmed working by Kartik on 2026-08-24: dwm launches from the lightdm/slick-greeter session picker. Outstanding: `mangohud` blocked by a transient sid dependency gap, `deepin-gtk-theme`/`adw-gtk3` have no Debian package, Herdr wasn't installed because its pinned installer checksum in `dwm-titus`'s own `scripts/install-herdr` didn't match what herdr.dev currently serves (flagged, not bypassed, Kartik confirmed skipping it is fine).
 
-### This session's work (2026-08-24, cont'd): NetworkManager/IPv6/sleep plan drafted, execution deferred
+### This session's work (2026-08-24, cont'd): NetworkManager/IPv6/sleep plan drafted, then executed
 
-Kartik wants NetworkManager actually managing networking on the homelab host (currently installed but `enp3s0` is unmanaged — deferred to ifupdown per Debian's default `managed=false`), IPv6 disabled, and sleep-related settings disabled so the box never drops off the network. Investigated current state and cross-checked the fix against the Debian wiki, NetworkManager's own docs, and Red Hat's guidance; full plan (exact commands, why each choice was made, sources) is in `docs/homelab-networkmanager-plan.md`. **Not executed** — the NetworkManager handover step briefly cycles the only NIC this SSH session depends on, which conflicts with `homelab-admin`'s safety rule against changing networking without rollback/out-of-band access, so Kartik asked to save it for a future session instead. Resume by reading that doc, confirming local/console access to `dell-optiplex` first, then running the three steps in order.
+Kartik wants NetworkManager actually managing networking on the homelab host (currently installed but `enp3s0` is unmanaged — deferred to ifupdown per Debian's default `managed=false`), IPv6 disabled, and sleep-related settings disabled so the box never drops off the network. Investigated current state and cross-checked the fix against the Debian wiki, NetworkManager's own docs, and Red Hat's guidance; full plan (exact commands, why each choice was made, sources) is in `docs/homelab-networkmanager-plan.md`. Initially **not executed** in the same session it was planned — the NetworkManager handover step briefly cycles the only NIC this SSH session depends on, which conflicts with `homelab-admin`'s safety rule against changing networking without rollback/out-of-band access, so Kartik asked to save it for later.
+
+**Executed later the same day (2026-08-24)** once Kartik confirmed console access as a fallback. All 3 steps ran successfully with the SSH session surviving every reconnect:
+1. Handed `enp3s0` to NetworkManager — clean handover, NM "assumed" the already-configured interface rather than tearing it down.
+2. Disabled IPv6 on the `enp3s0` connection — worked, but the required full reconnect triggered a fresh DHCP negotiation that landed a *different* address (`.223` instead of `.222`) because NM's DHCP client-id didn't match the old `ifupdown` one. Setting `ipv4.dhcp-client-id mac` didn't get `.222` back either (router still handed out `.223`), so per Kartik's decision, `enp3s0` was switched to a **static IP** (`192.168.0.222/24`, gateway `192.168.0.1`) instead of chasing DHCP lease-matching — more robust for a homelab server anyone reaches by fixed IP. Cleaned up a stale leftover DHCP route from `networking.service`'s original boot-time config along the way.
+3. Masked all 5 sleep-related systemd targets — confirmed, straightforward.
+
+Full blow-by-blow, including the exact commands and why each deviation happened, is in `docs/homelab-networkmanager-plan.md`'s "What actually happened" section. **Key fact for future sessions: `.222` is now a static assignment on this host, not a DHCP lease** — worth knowing if this address ever seems to "not renew" or similar, since DHCP is no longer in the picture for `enp3s0` at all.
 
 ### This session's work (2026-08-24, cont'd): icon theme support added to `theme-apply.sh`
 
@@ -82,7 +89,7 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 - `docs/vscode-integration-plan.md` — authoritative, phase-by-phase status of the VS Code integration specifically, including exactly what was ported/skipped/covered-by-plugin for the Engineering skills.
 - `Github\.claude\skills\` — the 9 custom `SKILL.md` files from the 2026-08-21 session, plus the titus-ai skills (`homelab-admin`, `linux-sysadmin`, etc.) ported later.
 - `docs/cowork-skills-2026-08-21.md` — Kartik's own record of Cowork's actual skill catalog/descriptions; do not overwrite, only read.
-- `docs/homelab-networkmanager-plan.md` — **read this first if resuming homelab work.** The deferred NetworkManager/IPv6/sleep plan for `dell-optiplex`, not yet executed.
+- `docs/homelab-networkmanager-plan.md` — the NetworkManager/IPv6/sleep plan for `dell-optiplex` and what actually happened when it was executed (including the DHCP-lease deviation that led to switching `enp3s0` to a static IP). Read this if resuming any further homelab networking work.
 - `docs/dwm-titus-debian-port.md` — full record of porting `dwm-titus` to Debian on the same host, plus the later icon-theme patch to its `theme-apply.sh`.
 
 ## Open items for Kartik
@@ -93,7 +100,7 @@ Kartik installed `papirus-icon-theme` and asked to switch to it; discovered `scr
 4. ~~Post-restart check: confirm `get_symbols_overview` on a `.ps1` file now succeeds now that `powershell` is in `.serena/project.yml`'s `language_servers` list.~~ Done, confirmed 2026-08-21.
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
-7. **New (2026-08-24):** NetworkManager/IPv6/sleep setup on the homelab host — planned in `docs/homelab-networkmanager-plan.md`, deferred pending confirmation of local/console access to `dell-optiplex` before the risky step (handing `enp3s0` from ifupdown to NetworkManager).
+7. ~~NetworkManager/IPv6/sleep setup on the homelab host.~~ Done, 2026-08-24 — all 3 steps executed and validated; `enp3s0` ended up static (`192.168.0.222/24`) rather than DHCP after a lease-matching issue surfaced mid-execution. Details in `docs/homelab-networkmanager-plan.md`.
 
 ## Notes
 

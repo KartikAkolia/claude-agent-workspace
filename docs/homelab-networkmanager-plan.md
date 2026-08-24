@@ -1,6 +1,6 @@
-# NetworkManager Setup Plan (Homelab Host, Not Yet Executed)
+# NetworkManager Setup Plan (Homelab Host) — Executed 2026-08-24
 
-Kartik asked to get NetworkManager actually managing the network on his Debian homelab box (`dell-optiplex`, 192.168.0.222), disable IPv6 and everything related to it, and disable anything that could put the box to sleep and drop networking. Investigated and planned on 2026-08-24; execution deferred to a future session — **nothing in this document has been applied to the host yet.**
+Kartik asked to get NetworkManager actually managing the network on his Debian homelab box (`dell-optiplex`, 192.168.0.222), disable IPv6 and everything related to it, and disable anything that could put the box to sleep and drop networking. Planned on 2026-08-24; **executed the same day** once Kartik confirmed local/console access to the box as a fallback. All three steps succeeded, validated after each one, SSH session never dropped. See "What actually happened" below for one deviation from the original plan (step 2 needed a follow-up fix).
 
 ## Current state (as of 2026-08-24)
 
@@ -26,13 +26,24 @@ Kartik asked to get NetworkManager actually managing the network on his Debian h
    - This is the Debian wiki's own documented method ([wiki.debian.org/Suspend](https://wiki.debian.org/Suspend)) for guaranteeing a system never sleeps, regardless of whether the trigger is a power/suspend key, a D-Bus call, or a script — and it's fully reversible with `systemctl unmask` on the same unit list.
    - No `logind.conf` edits needed: masking the targets blocks any attempt to enter them, so `HandleSuspendKey`/idle-action defaults become moot.
 
-## Why this was deferred instead of executed
+## Why this was deferred, then executed
 
-Step 1 briefly brings `enp3s0` down and back up under NM's control. It should reacquire the same DHCP lease within a couple of seconds, but this SSH session (via `plink` from the Windows machine) is the only access path to the host — if the handover doesn't come back cleanly, there's no rollback without physical/console access to the OptiPlex. Per the `homelab-admin` skill's own safety rule ("never change networking without rollback out-of-band access"), execution was paused pending confirmation that Kartik has local/console access as a fallback before step 1 runs. Steps 2 and 3 carry much lower risk (per-connection IPv6 change and a reversible systemd mask) and could reasonably run right after step 1 succeeds, in the same session.
+Step 1 briefly brings `enp3s0` down and back up under NM's control. Per the `homelab-admin` skill's own safety rule ("never change networking without rollback out-of-band access"), execution was paused in the earlier session pending confirmation that Kartik has local/console access as a fallback before step 1 runs. On 2026-08-24 Kartik confirmed console access was available, so all three steps were run in order in the same session.
 
-## To resume this later
+## What actually happened (2026-08-24)
 
-Confirm local/console access to `dell-optiplex` is available, then run steps 1–3 above in order, verifying after each step (per `homelab-admin`'s validation checklist: service still running, `ip addr`/`nmcli device status` shows `enp3s0` as managed with the expected IP, `ip -6 addr` shows nothing on `enp3s0`, `systemctl status sleep.target` reports masked) before moving to the next.
+- **Step 1** ran exactly as planned. NetworkManager's log showed it "assumed" the already-DHCP-configured interface (`reason 'connection-assumed', managed-type: 'external'`) rather than tearing it down first — no interface flap, SSH session never dropped, `enp3s0` came back `nmcli device status: connected (externally)` holding the same `192.168.0.222` address.
+- **Step 2 needed a follow-up fix.** Running `nmcli connection modify enp3s0 ipv6.method disabled` + `nmcli connection up enp3s0` did strip IPv6 correctly (`ip -6 addr show enp3s0` empty), but this was a *full* reconnect (not an "assumed" one), so NM's internal DHCP client made a fresh DORA request. The router (`192.168.0.1`) handed back a **different address, `192.168.0.223`**, instead of `.222` (the old `.222` lingered only as a secondary address with a draining lease). Root cause: NM's internal DHCP client sends a different `dhcp_client_identifier` than the old `ifupdown`/`dhclient` setup did, so the router's lease table treated it as a new client.
+  - First fix attempt: `nmcli connection modify enp3s0 ipv4.dhcp-client-id mac` (matches the classic type-01-hardware-address client-id) + a full `connection down`/`up` to force a fresh DORA. Confirmed the client-id changed (`dhcp_client_identifier = 01:a4:1f:72:4d:d9:4e`) but the router *still* handed back `.223`, not `.222` — its lease table apparently keys on something else, or the old `.222` lease entry hadn't aged out.
+  - Kartik's decision: stop chasing the router's DHCP behavior and switch `enp3s0` to a **static IP** instead — `ipv4.method manual`, `ipv4.addresses 192.168.0.222/24`, `ipv4.gateway 192.168.0.1`, `ipv4.dns 194.168.4.100,194.168.8.100` (the same DNS servers DHCP had been handing out). This is more robust for a homelab server that other things reach by fixed IP, independent of router lease-table quirks going forward.
+  - After the static config, a stray leftover: the address briefly still showed the `dynamic` kernel flag and there was a duplicate stale `proto dhcp` default route at metric 1002 (traced to `networking.service`/ifupdown, which ran once at boot before this session's edits and was never torn down — no live `dhclient` process, just orphaned kernel routes). Fixed with a second full `systemctl restart NetworkManager` (address flag corrected to `valid_lft forever`) plus manually deleting the two leftover metric-1002 routes (`ip route del default ... metric 1002`, `ip route del 192.168.0.0/24 ... metric 1002`). Final state: single static default route at metric 100, `192.168.0.222/24` with `valid_lft forever`, confirmed with a live ping to `8.8.8.8`.
+- **Step 3** ran exactly as planned — `systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target`, confirmed all five report `Loaded: masked`.
+
+**`.222` is now a static assignment, not a DHCP lease** — this repo's docs/memory referring to `.222` as the host's DHCP address should be read as "its address, now fixed" rather than implying a lease that could still drift.
+
+## If revisiting this host's networking again
+
+Current state: `enp3s0` static at `192.168.0.222/24` via NetworkManager, IPv6 disabled on the connection (not kernel-wide), sleep targets masked. `networking.service` (ifupdown) is still enabled but only manages `lo` now — it's not actively conflicting, but wasn't explicitly disabled either since it's harmless as-is.
 
 ## Sources
 
