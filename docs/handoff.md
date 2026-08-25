@@ -10,11 +10,7 @@ Since then, the active work has shifted to Kartik's Debian homelab host (`dell-o
 
 ### Next up
 
-Two things need Kartik's own action, both on `dell-optiplex`:
-1. **xrdp graphical verification** — set up 2026-08-24 but not yet confirmed from a real RDP client. RDP to `192.168.0.222:3389` (user `kartik`) and confirm dwm actually renders (statusbar, wallpaper, autostart effects). See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-24): xrdp remote access" section.
-2. **Minecraft server port-forward** — the server itself is up, hardened, and firewalled (`192.168.0.222:25565`), but reaching it from the internet needs a router-side port-forward rule (external TCP 25565 → `192.168.0.222:25565`), which is Kartik's own task. See `docs/minecraft-server-setup.md` for full detail, including the RCON password location and the optional whitelist follow-up.
-
-Otherwise nothing outstanding — `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) if further homelab networking work comes up.
+Nothing outstanding as of 2026-08-25 — xrdp graphical access, the Minecraft port-forward, and the LightDM session-churn question (items 8-10 below) are all confirmed done. `docs/homelab-networkmanager-plan.md` has the current network state (static IP, IPv6 off, sleep masked) if further homelab networking work comes up.
 
 ### This session's work: Serena fix + Engineering skill porting
 
@@ -131,9 +127,9 @@ Built: Java 25 headless JRE, a dedicated non-login `minecraft` system user, Pape
 5. ~~ROADMAP.md candidate items 3 and 4: decide deferred vs. declined.~~ Done, confirmed 2026-08-21 — item 3 deferred, item 4 declined.
 6. ~~Restructure root-level markdown into a folder.~~ Done, confirmed 2026-08-21 — `docs/` created, 4 non-scaffold files moved, all cross-references updated.
 7. ~~NetworkManager/IPv6/sleep setup on the homelab host.~~ Done, 2026-08-24 — all 3 steps executed and validated; `enp3s0` ended up static (`192.168.0.222/24`) rather than DHCP after a lease-matching issue surfaced mid-execution. Details in `docs/homelab-networkmanager-plan.md`.
-8. xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus — service is up and listening, but **not yet graphically verified**. Kartik needs to RDP in himself (`mstsc` to `192.168.0.222:3389`, user `kartik`) and confirm dwm renders correctly before this is closed out.
-9. **New (2026-08-24):** Paper Minecraft server installed, hardened, firewalled, and backed up on `dell-optiplex` — fully working locally (`192.168.0.222:25565`), but not reachable from the internet yet. Kartik needs to add a router port-forward rule (external TCP 25565 → `192.168.0.222:25565`) himself. Details and the RCON password location in `docs/minecraft-server-setup.md`.
-10. **New (2026-08-25):** LightDM/dwm session-churn diagnosis was resolved as a non-issue from the logs, but never independently confirmed against what Kartik was actually seeing at the physical console. Only worth revisiting if the pattern recurs alongside a real observed symptom. See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-25)" sections.
+8. ~~xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus.~~ Done, confirmed 2026-08-25 — Kartik RDP'd in (`mstsc` to `192.168.0.222:3389`) and confirmed dwm renders correctly.
+9. ~~Paper Minecraft server installed, hardened, firewalled, and backed up on `dell-optiplex`.~~ Done, confirmed 2026-08-25 — router port-forward (external TCP 25565 → `192.168.0.222:25565`) added, server reachable from the internet. Details and the RCON password location in `docs/minecraft-server-setup.md`.
+10. ~~LightDM/dwm session-churn diagnosis.~~ Done, confirmed 2026-08-25 — Kartik confirmed the behavior at the physical console matches the log-based non-issue diagnosis. See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-25)" sections.
 
 ## Notes
 
