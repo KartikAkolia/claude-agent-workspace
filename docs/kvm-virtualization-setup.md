@@ -118,6 +118,16 @@ The first draft had a real bug, caught during testing before being handed off: i
 
 `shellcheck` (0.11.0), `checkbashisms` (from the `devscripts` package, 2.26.11), and `dash` (as a real POSIX-sh test target) were installed via `apt-get install shellcheck devscripts dash`, specifically to check `vm-set-virtio-input.sh` for logic errors and unintended bashisms before trusting it for repeated use. Both `vm-set-virtio-input.sh` and `/opt/minecraft/backup.sh` (see `docs/minecraft-server-setup.md`) were linted with these tools; the backup script's one finding (an unquoted `$TS` in `SC2086`) was fixed. These tools are now available on the host for linting any future shell script — no need to reinstall.
 
+### `rtk` and `shfmt` (2026-08-25)
+
+Two more additions to the same linting toolchain:
+
+- **`rtk` 0.45.0** ([rtk-ai/rtk](https://github.com/rtk-ai/rtk)) — a single-binary Rust CLI that compresses/filters the output of common dev commands (git, test runners, linters, `ls`/`cat`/`grep`, etc.) to cut token volume for AI coding agents, conceptually similar to the `headroom` MCP server already in use. It has a genuine built-in `shellcheck` output filter (`rtk shellcheck <file>` — strips blank lines, keeps caret indicators), which is why it was installed here. Installed via the project's official install script (`curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh`, downloaded and reviewed first — it does real SHA-256 checksum verification against `checksums.txt` and rejects archives with absolute or `..`-traversal paths before extracting) into `~/.local/bin`, which is already on `$PATH` via the `path_add_first` block in `.bashrc`. Verified with `rtk --version` and a real `rtk shellcheck` run against `vm-set-virtio-input.sh` (clean, no findings, matching the earlier plain-`shellcheck` result).
+
+  **Naming note**: a separate, unrelated crates.io package is also called `rtk`. If ever reinstalling via `cargo`, it must be `cargo install --git https://github.com/rtk-ai/rtk`, not a plain `cargo install rtk`, or the wrong package gets installed.
+
+- **`shfmt` 3.13.1** — a shell script formatter/diff tool, available directly from Debian's own repo (`apt-get install shfmt`, no Go toolchain needed). Verified with `shfmt --version` and `shfmt -d vm-set-virtio-input.sh` (clean diff — the script is already shfmt-formatted).
+
 ## Sources
 
 - [ChrisTitusTech — VM Setup in Linux](https://christitus.com/vm-setup-in-linux/)
