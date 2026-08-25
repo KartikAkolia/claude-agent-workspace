@@ -105,6 +105,16 @@ Built: Java 25 headless JRE, a dedicated non-login `minecraft` system user, Pape
 
 6. **`~/bin` added to `$PATH`, and `rtk`/`shfmt` added to the shell linting toolchain.** Checked `.bashrc`'s existing `path_add_first` block first (it had `~/.local/bin` but not `~/bin`), then added it via an exact-match Python edit rather than `sed`, since a naive `sed` pattern would have matched a second, unrelated Darwin-only `path_add_first` block in the same file too. Separately, installed `rtk` 0.45.0 ([rtk-ai/rtk](https://github.com/rtk-ai/rtk), into `~/.local/bin` via its official checksum-verified install script, reviewed before running) for its real built-in `shellcheck` output filter, and `shfmt` 3.13.1 via apt (Debian ships it directly, no Go toolchain needed). Both verified working against `vm-set-virtio-input.sh` (`rtk shellcheck` and `shfmt -d` both came back clean, matching the earlier plain-`shellcheck` result). Detail in `docs/kvm-virtualization-setup.md`'s "Shell linting tools" section.
 
+### This session's work (2026-08-25, cont'd): `Debian-titus` `install.sh` fixed end-to-end via fresh-VM testing
+
+Kartik ran `sudo ./install.sh` from `KartikAkolia/Debian-titus` (the packaged installer repo, separate from `docs/dwm-titus-debian-port.md`'s manual port directly on `dell-optiplex`) on a freshly, manually-installed Debian VM, to validate the installer actually works starting from nothing. Three real bugs surfaced in sequence, each fixed in the canonical repo (cloned at `/home/kartik/Debian-titus` on `dell-optiplex`), verified with `bash -n`/`shellcheck`/`shfmt`/`checkbashisms`, diffed against the canonical copy to confirm isolation, committed, and pushed to `origin/main`, then re-tested by Kartik on the VM before moving to the next:
+
+1. **Disk exhaustion** (`b1a82c4`) — `/tmp`'s default 2G tmpfs cap was too small for this script's own downloads plus `mybash`'s own `mktemp`-based downloads (Starship, the JetBrainsMono Nerd Font) landing there too; fixed by pointing `TMPDIR` at `/var/tmp` (the real root filesystem) before any `mktemp` calls.
+2. **`dwm-packages.sh returned no debian build packages`** (`17a08ce`) — upstream `ChrisTitusTech/dwm-titus` dropped Debian package-map support entirely a week before this repo's pinned commit; fixed by hardcoding the build-dependency list in `install.sh` instead of depending on a package map upstream won't maintain for Debian again (Kartik's explicit call: "go with option 2", over rolling the pin back and reworking the local patch).
+3. **`cp: ... config.h: Permission denied`** (`e57ccb2`) — dwm-titus's Makefile builds/installs user-level files via `runuser -u "$SUDO_USER"`, but `install.sh`'s clone lived in a root-only (mode `0700`) `mktemp -d`, which that non-root re-exec couldn't traverse into; fixed by opening traversal on the workdir and `chown`-ing the cloned tree to the target user.
+
+Full root-cause writeups live in `CHANGELOG.md` (new, `00210a4`) in the `Debian-titus` repo itself, not duplicated here. Confirmed end-to-end: Kartik's final re-run completed with `[+] Installation complete` and no errors. **Not yet independently verified**: that the installed `dwm` session actually renders and logs in via `lightdm` on that VM after a reboot — `install.sh` itself can't confirm that part. Also noted but out of scope for this session: the repo's own `README.md` pinned-component table is stale (still lists dwm-titus at commit `8c0fa53`; `install.sh` actually pins `afebb4ae`) — pre-existing drift, not touched.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -130,6 +140,7 @@ Built: Java 25 headless JRE, a dedicated non-login `minecraft` system user, Pape
 8. ~~xrdp installed and configured on `dell-optiplex` for remote access to dwm-titus.~~ Done, confirmed 2026-08-25 — Kartik RDP'd in (`mstsc` to `192.168.0.222:3389`) and confirmed dwm renders correctly.
 9. ~~Paper Minecraft server installed, hardened, firewalled, and backed up on `dell-optiplex`.~~ Done, confirmed 2026-08-25 — router port-forward (external TCP 25565 → `192.168.0.222:25565`) added, server reachable from the internet. Details and the RCON password location in `docs/minecraft-server-setup.md`.
 10. ~~LightDM/dwm session-churn diagnosis.~~ Done, confirmed 2026-08-25 — Kartik confirmed the behavior at the physical console matches the log-based non-issue diagnosis. See `docs/dwm-titus-debian-port.md`'s "Follow-up (2026-08-25)" sections.
+11. **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented above and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 
 ## Notes
 
