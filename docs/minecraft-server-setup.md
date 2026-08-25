@@ -27,6 +27,14 @@ Kartik asked to run a Minecraft server on the homelab host (`dell-optiplex`, 192
 - **Whitelist**: currently off. If griefing/unwanted joins become a problem after the port-forward goes live, set `white-list=true` in `server.properties` and add usernames to `whitelist.json` — deliberately left as an opt-in follow-up rather than a default, since an empty whitelist would lock out everyone including Kartik.
 - **RCON password**: generated at setup time and stored only in `/opt/minecraft/server.properties` on the host — not recorded in this repo or in any persistent memory, ask Kartik directly if it's needed again.
 
+## Follow-up (2026-08-25): `backup.sh` linted and one finding fixed
+
+`shellcheck`, `checkbashisms`, and `dash` were installed on the host (see `docs/kvm-virtualization-setup.md`'s "Shell linting tools" section for the full install detail) and run against `/opt/minecraft/backup.sh` to check for logic errors, bashisms, and POSIX-compliance gaps.
+
+Result: one finding, `SC2086` (info-level) on the `tar` line — `$TS` (from `TS=$(date +%Y%m%d-%H%M%S)`) was unquoted in the backup filename, `minecraft-$TS.tar.gz`. ShellCheck didn't flag the neighboring `$MC_DIR`/`$BACKUP_DIR` expansions on the same line, because it can statically prove those are safe fixed-literal assignments with no spaces or glob characters — `$TS` comes from a command substitution, which it can't prove safe, hence the flag. Realistically harmless given the fixed `date` format used, but fixed anyway since quoting costs nothing: `minecraft-"$TS".tar.gz`.
+
+Applied with a timestamped backup kept alongside (`backup.sh.bak-20260825-130343`, owned `minecraft:minecraft`, matching the original file's hardened ownership). Re-verified clean afterward: `shellcheck` reports zero warnings, `bash -n` confirms valid syntax. `checkbashisms` reported no bashisms either before or after the fix (the script is intentionally `#!/usr/bin/env bash`, not POSIX `sh`, so `set -o pipefail` is expected and not something to change).
+
 ## Sources
 
 - [PaperMC — Getting Started / Java requirements](https://docs.papermc.io/paper/getting-started) (Java-version-per-Minecraft-version table)

@@ -257,3 +257,29 @@ Kartik wanted to reach the dwm-titus session remotely over RDP. Lower blast radi
 - Verified: `xrdp`/`xrdp-sesman` both `enabled` and `active`, `ss -tulpn` shows `*:3389` listening.
 
 **Not verified from this session**: an actual graphical RDP login, since access here is shell-only (no RDP client available to drive one end-to-end). Kartik still needs to confirm from a real RDP client (e.g. Windows' `mstsc` to `192.168.0.222:3389`, user `kartik`) that dwm renders correctly — statusbar, wallpaper, and the rest of `autostart.sh`'s effects — before treating this as fully done.
+
+## Follow-up (2026-08-25): LightDM autologin to dwm-titus
+
+Kartik wanted the box to boot straight into the dwm-titus desktop with no manual login — consistent with wanting this as a low-touch homelab/remote-access box (see the xrdp setup above).
+
+`lightdm --show-config` confirmed `/etc/lightdm/lightdm.conf`'s `[Seat:*]` section is the sole authoritative config on this host — no `/etc/lightdm/lightdm.conf.d/` drop-in directory exists or is scanned — so the settings were added there directly (original backed up alongside as `lightdm.conf.bak-20260825`):
+
+```
+[Seat:*]
+autologin-user=kartik
+autologin-user-timeout=0
+autologin-session=dwm
+user-session=dwm
+```
+
+The xsession id is `dwm` (the filename of `/usr/share/xsessions/dwm.desktop`), even though its `Name=` field displays as "dwm-titus" in the greeter — using the display name instead of the filename here would silently fail to autologin. No PAM or group changes were needed: Debian's `lightdm-autologin` PAM service already permits any non-root user passwordlessly by default.
+
+Confirmed working by Kartik after a manual reboot. Restarting/reconfiguring lightdm live would kill any active graphical session on seat0, so a reboot — not a live `systemctl restart lightdm` — is the safe way to apply a change like this.
+
+## Follow-up (2026-08-25): LightDM/dwm session-churn diagnosis — resolved as a non-issue
+
+Kartik asked to diagnose a pattern in `systemctl status lightdm` output: a burst of `greeter-session-opened` → `kartik-session-opened` → `greeter-session-opened` again within about 14 seconds, which looked like the autologin session might be crash-looping back to the greeter.
+
+Full `journalctl`/`~/.xsession-errors` analysis (using `mcp__headroom__headroom_retrieve` to recover content the tool output had compressed) showed two completely normal, deliberate logout sequences — one about 7 minutes long, the other about 8.5 seconds — with no crashes, segfaults, or errors anywhere in either. `dwm-titus`'s own `scripts/autostop.sh` (the cleanup hook `dwm.c`'s `runautostop()` calls on normal exit — confirmed by grepping `dwm.c` for `autostop`) is exactly what produces this pattern on an ordinary logout: it calls `loginctl terminate-session` for an X11 display-manager session, which is what makes LightDM cycle back to a fresh greeter session immediately afterward. That's expected behavior for *any* logout under this setup, not a symptom of a crash.
+
+This was **not independently confirmed by Kartik against what he was actually seeing at the physical console** — the diagnosis is based entirely on log evidence showing no error condition, and Kartik moved on to other work before responding to that question. Revisit if the same pattern is reported again alongside an actual observed symptom (frozen screen, unexpected logout, etc.) rather than just the systemd status output.
