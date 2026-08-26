@@ -7,11 +7,13 @@ Astro site and deployed with Cloudflare Pages.
 
 - Node.js 24
 - npm
+- Python 3.12
 
 Install the exact dependency tree and run the complete local gate:
 
 ```bash
 npm ci
+python -m pip install --disable-pip-version-check --require-hashes --requirement scripts/requirements-automation.txt
 npm run validate
 ```
 
@@ -49,27 +51,25 @@ npm run new:post -- "My new article" \
 ```
 
 The command renders `templates/post.md.tmpl` into
-`content/posts/<year>/<slug>.md`, defaults the post to `draft: true`, and
+`src/content/posts/<year>/<slug>.md`, defaults the post to `draft: true`, and
 refuses file, URL, redirect, static-asset, taxonomy, feed, or pagination
 collisions. The available categories are Android, ChromeOS, Development,
 FreeBSD, Hardware, Linux, MacOS, Misc, Networking, Software Dev, Titus,
 Virtualization, Windows, Windows Server, and YouTube.
 
-Set the featured image at `static/images/<year>-thumbs/<slug>.webp`, edit the
+Set the featured image at `public/images/<year>-thumbs/<slug>.webp`, edit the
 generated front matter and body, then preview drafts with `npm run dev:content`.
 
 ## Repository layout
 
 - `src/` contains Astro pages, layouts, components, styles, and browser code.
-- `content/` contains articles and standalone page Markdown.
-- `static/` is copied directly into the published site.
-- `data/livestreams.json` and `static/chats/` are maintained by Python
-  automation and a managed pull-request workflow.
+- `src/content/` contains articles and standalone page Markdown.
+- `public/` is copied directly into the published site.
+- `data/livestreams.json` and `public/chats/` are maintained by Python
+  automation that validates the generated site before publishing directly to
+  `master`.
 - `scripts/` contains content preparation, validation, the post scaffolder, and
   data automation.
 - `tests/` contains unit, route-contract, and browser coverage.
-- `SPEC.md` and `ROADMAP.md` record the migration contract and cutover gates.
-
-Cloudflare production cutover, repository-rule activation, and the first live
-managed-data PR are separate guarded operations documented in Phase 5 of
-`ROADMAP.md`.
+- `SPEC.md` records the product and compatibility contract retained from the
+  Astro migration.
