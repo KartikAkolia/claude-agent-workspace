@@ -202,11 +202,13 @@ The supported installation flow must:
     configuration through an isolated managed fragment and backups. When no
     X11 session is available, print the deferred setup command instead.
 
-The existing-system installer may enable only RPM Fusion nonfree and the
-`christitustech/copr-fedora` COPR, and only for the explicitly requested gaming
+The existing-system installer may enable RPM Fusion nonfree and the
+`christitustech/copr-fedora` COPR only for the explicitly requested gaming
 profile. Interactive runs require a direct confirmation; non-interactive runs
-require the explicit `--enable-fedora-gaming-repos` approval flag. It must not
-enable any other third-party repository.
+require the explicit `--enable-fedora-gaming-repos` approval flag. Recommended
+and full profiles may also add the official Flathub remote for the target user
+and install Gear Lever (`it.mijorus.gearlever`) as the default AppImage manager.
+It must not enable any other third-party repository.
 
 The Fedora Kickstart image profiles separately predeclare the four image
 repository groups required by that product: RPM Fusion, Brave Browser, MWT
@@ -368,11 +370,13 @@ Runtime dependencies are classified as:
   emulator, and the tools required by configured core keybindings. Alacritty
   is the preferred emulator, with the existing supported-terminal fallback
   chain retained when Alacritty is unavailable.
-- Recommended desktop: the Herdr terminal workspace layered over Alacritty,
-  Quickshell, Picom, Feh, Dex, a polkit agent, notification tools, audio
-  controls, screenshot tooling, and Nerd/emoji fonts.
-- Optional: file manager, network tray, theme utilities, display-manager
-  greeter customization, wallpapers, and hardware-specific helpers.
+- Recommended desktop: Alacritty, Quickshell, Picom, Feh, Dex, a polkit agent,
+  notification tools, audio controls, screenshot tooling, Nerd/emoji fonts,
+  Flatpak with its GTK portal, and Gear Lever from a user-scoped Flathub
+  remote.
+- Optional: the Herdr terminal workspace, file manager, network tray, theme
+  utilities, display-manager greeter customization, wallpapers, and
+  hardware-specific helpers.
 
 ### 5.9 System Health Dashboard
 
@@ -536,11 +540,12 @@ configuration and unrelated application configuration by default.
   guidance rather than relying on silent background commands.
 - Error messages must identify the missing command, library, package
   capability, or file and provide the next action.
-- A plain `dwm-terminal` launch must open Herdr inside the selected terminal
-  emulator when Herdr is installed, and otherwise open the emulator directly.
+- The default terminal binding must launch Alacritty directly.
+- A plain `dwm-terminal` launch must open the selected emulator directly unless
+  the user explicitly enables the optional Herdr layer with `DWM_HERDR=1`.
   Explicit terminal arguments such as `dwm-terminal -e command` must bypass
   Herdr so delegated commands retain their existing execution contract.
-- The terminal command must prefer Alacritty, select another installed
+- The `dwm-terminal` helper must prefer Alacritty, select another installed
   supported emulator when needed, and provide a clear configuration path.
 - Font aliases must accommodate common Meslo Nerd Font naming differences.
 - Multi-monitor setup must expose EWMH tags correctly to Quickshell and EWMH
@@ -608,9 +613,9 @@ On the supported Fedora release:
 In a real or nested X11 session:
 
 - dwm starts and can launch a terminal.
-- With Herdr installed, the default terminal binding opens Herdr inside
-  Alacritty. Without Herdr, the same binding opens the selected emulator
-  directly, and explicit `dwm-terminal -e` commands bypass Herdr in both cases.
+- The default terminal binding opens Alacritty directly even when Herdr is
+  installed. With `DWM_HERDR=1`, a plain `dwm-terminal` command opens Herdr
+  inside Alacritty; explicit `dwm-terminal -e` commands still bypass Herdr.
 - Tiling, floating, tags, focus, and close-window actions work.
 - Runtime TOML configuration loads and reloads.
 - A display-manager session and `startx` path both launch.
@@ -630,6 +635,8 @@ In a real or nested X11 session:
   its completed capture is advertised as `image/png` by an `xclip` clipboard
   owner. Active-monitor and saved-region captures produce non-empty JPEG files
   through `maim`.
+- Recommended and full installs expose Gear Lever in the application launcher,
+  and it opens a visible window in the supported X11 session.
 
 ### 9.4 Fedora Image Validation
 
@@ -650,11 +657,12 @@ In a real or nested X11 session:
 The existing desktop provides dwm, a managed Quickshell panel and launcher,
 notifications, quick controls, power actions, network and Bluetooth surfaces,
 display helpers, a system-health dashboard, and the unified Settings platform.
-Settings now includes the completed Phase 2 display and input mutation surface
-with preview, rollback, persistence, and capability reporting. It does not yet
-provide the remaining settings mutation surface in Section 5.10; those
-outcomes are sequenced in `ROADMAP.md`, and Phase 3 connectivity and audio work
-is defined in `TASKS.md`.
+Settings includes the completed Phase 2 display and input mutation surface,
+Phase 3 NetworkManager, BlueZ, PipeWire, and media workflows, and Phase 4 power,
+session-action, default-application, MIME, and XDG autostart workflows. The
+remaining Settings mutation surface in Section 5.10 begins with Phase 5 themes,
+wallpaper, fonts, cursors, toolkit integration, notifications, and practical X11
+accessibility controls, sequenced in `ROADMAP.md` and defined in `TASKS.md`.
 
 The installer contains a Fedora-only package map and rejects other systems.
 The build uses `pkg-config`, supports staged installation with `DESTDIR`, and

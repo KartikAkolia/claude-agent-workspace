@@ -78,13 +78,13 @@
 /* enums */
 enum { CurResizeBR, CurResizeBL, CurResizeTR, CurResizeTL, CurNormal, CurResize, CurMove, CurLast }; /* cursor */
 enum { SchemeNorm, SchemeSel }; /* color schemes */
-enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
+enum { NetSupported, NetWMName, NetWMPid, NetWMState, NetWMCheck,
        NetWMFullscreen, NetWMAbove, NetWMStaysOnTop, NetActiveWindow, NetWMWindowType, NetWMIcon,
        NetWMWindowTypeDialog, NetWMWindowTypeDock, NetWMWindowTypeTooltip, NetWMWindowTypeNotification,
        NetWMWindowTypeMenu, NetWMWindowTypePopupMenu, NetWMWindowTypeDropdownMenu,
        NetWMWindowTypeCombo, NetWMWindowTypeDnd,
        NetClientList, NetDesktopNames, NetDesktopViewport, NetNumberOfDesktops, NetCurrentDesktop,
-       NetWMDesktop, NetDwmMonitorDesktops, NetLast }; /* EWMH atoms */
+       NetWMDesktop, NetDwmMonitorDesktops, NetDwmSelectedMonitor, NetLast }; /* EWMH atoms */
 enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms */
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
@@ -316,6 +316,7 @@ static void runautostart(void);
 static void runautostop(void);
 static void scan(void);
 static void sigchld(int unused);
+static void sigusr2_handler(int sig);
 static void sigstatusbar(const Arg *arg);
 static void setup(void);
 static void unmapnotify(XEvent *e);
@@ -336,6 +337,7 @@ static void setdesktopnames(void);
 static void setnumdesktops(void);
 static void setviewport(void);
 static void updatecurrentdesktop(void);
+static void updateselectedmonitor(void);
 
 /* External dock and systray declarations */
 static void managealtbar(Window win, XWindowAttributes *wa);
@@ -360,6 +362,7 @@ static void reload_config(void);
 static int runtime_config_fd(void);
 static void runtime_config_mark_reload_pending(void);
 static void runtime_config_poll_inotify(void);
+static void runtime_config_ensure_user_watch(void);
 static void runtime_config_reload(void);
 static void runtime_config_reload_if_pending(void);
 static void runtime_config_setup(void);
@@ -400,7 +403,7 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[UnmapNotify] = unmapnotify
 };
 static Atom kdewindowtypeoverride, wmatom[WMLast], netatom[NetLast];
-static int running = 1;
+static volatile sig_atomic_t running = 1;
 static Cur *cursor[CurLast];
 static Clr **scheme;
 static Display *dpy;
@@ -412,6 +415,8 @@ static xcb_connection_t *xcon;
 static Window *clientlistcache;
 static unsigned long clientlistcachelen;
 static int clientlistcachevalid;
+static int selectedmonitorcache;
+static int selectedmonitorcachevalid;
 static Atom dwmfullscreenmonitorsatom, dwmtagupdateatom;
 static unsigned long tagupdatesequence;
 
@@ -449,6 +454,9 @@ static volatile sig_atomic_t sig_reload_pending = 0;
 static char   toml_arena_buf[TOML_ARENA_CAP];
 static size_t toml_arena_pos = 0;
 /* Default (fallback) config paths: ~/.local/share/dwm-titus/config/ */
+static char          dwm_config_home_dir[PATH_MAX];
+static char          dwm_data_home_dir[PATH_MAX];
+static char          dwm_data_dir[PATH_MAX];
 static char          toml_default_dir[PATH_MAX];
 static char          toml_hotkeys_default_path[PATH_MAX];
 static char          toml_themes_default_path[PATH_MAX];
@@ -1043,6 +1051,7 @@ configurenotify(XEvent *e)
 		sw = ev->width;
 		sh = ev->height;
 		if (updategeom() || dirty) {
+			selectedmonitorcachevalid = 0;
 			reconcilemonitortags();
 			drw_resize(drw, sw, bh);
 			updatebars();
@@ -1373,6 +1382,7 @@ focus(Client *c)
 		ewmh_clear_active_window();
 	}
 	selmon->sel = c;
+	updateselectedmonitor();
 	drawbars();
 }
 
@@ -3351,6 +3361,13 @@ sigusr1_handler(int sig)
 	runtime_config_mark_reload_pending();
 }
 
+static void
+sigusr2_handler(int sig)
+{
+	(void)sig;
+	running = 0;
+}
+
 static void *
 toml_alloc(size_t sz)
 {
@@ -3884,16 +3901,13 @@ reload_config(void)
 	{
 		pid_t pid = fork();
 		if (pid == 0) {
-			/* child: find and run the theme-apply script */
-			const char *home = getenv("HOME");
-			char script_dir[PATH_MAX];
+			/* child: run the theme helper from the resolved data directory */
 			char script[PATH_MAX];
-			if (home &&
-			    pathjoin(script_dir, sizeof(script_dir),
-			            home, ".local/share/dwm-titus/scripts") &&
-			    pathjoin(script, sizeof(script),
-			            script_dir, "theme-apply.sh")) {
-				execl("/bin/sh", "sh", script, (char *)NULL);
+			if (dwm_data_dir[0] != '\0' &&
+			    pathjoin(script, sizeof(script), dwm_data_dir,
+			             "scripts/theme-apply.sh") &&
+			    setenv("DWM_THEME_APPLY_AUTOMATIC", "1", 1) == 0) {
+				execl(script, script, (char *)NULL);
 			}
 			_exit(0);
 		}
@@ -3944,7 +3958,23 @@ runtime_config_poll_inotify(void)
 static void
 runtime_config_reload(void)
 {
+	runtime_config_ensure_user_watch();
 	reload_config();
+}
+
+static void
+runtime_config_ensure_user_watch(void)
+{
+	if (inotify_wd >= 0 || toml_config_dir[0] == '\0')
+		return;
+	if (inotify_fd < 0) {
+		setup_inotify();
+		return;
+	}
+	inotify_wd = inotify_add_watch(inotify_fd, toml_config_dir,
+	                               IN_CLOSE_WRITE | IN_MOVED_TO);
+	if (inotify_wd < 0)
+		inotify_wd = -1;
 }
 
 static void
@@ -3966,11 +3996,44 @@ static void
 setup_inotify(void)
 {
 	const char *home = getenv("HOME");
-	if (!home) return;
+	const char *config_home = getenv("XDG_CONFIG_HOME");
+	const char *data_home = getenv("XDG_DATA_HOME");
+	char config_home_fallback[PATH_MAX];
+	char data_home_fallback[PATH_MAX];
+	if (((!config_home || config_home[0] != '/')
+	     || (!data_home || data_home[0] != '/'))
+	    && (!home || home[0] == '\0')) {
+		fprintf(stderr, "dwm: HOME is required for XDG fallback paths\n");
+		return;
+	}
 
-	/* User-editable config: ~/.config/dwm-titus/ */
+	if (!config_home || config_home[0] != '/') {
+		if (!pathjoin(config_home_fallback, sizeof(config_home_fallback),
+		              home, ".config")) {
+			fprintf(stderr, "dwm: config home path exceeds PATH_MAX\n");
+			return;
+		}
+		config_home = config_home_fallback;
+	}
+	if (!data_home || data_home[0] != '/') {
+		if (!pathjoin(data_home_fallback, sizeof(data_home_fallback),
+		              home, ".local/share")) {
+			fprintf(stderr, "dwm: data home path exceeds PATH_MAX\n");
+			return;
+		}
+		data_home = data_home_fallback;
+	}
+	copystr(dwm_config_home_dir, sizeof(dwm_config_home_dir), config_home);
+	copystr(dwm_data_home_dir, sizeof(dwm_data_home_dir), data_home);
+	if (setenv("XDG_CONFIG_HOME", dwm_config_home_dir, 1) < 0 ||
+	    setenv("XDG_DATA_HOME", dwm_data_home_dir, 1) < 0) {
+		perror("dwm: cannot normalize XDG environment");
+		return;
+	}
+
+	/* User-editable config: ${XDG_CONFIG_HOME:-$HOME/.config}/dwm-titus/ */
 	if (!pathjoin(toml_config_dir, sizeof(toml_config_dir),
-	              home, ".config/dwm-titus")
+	              config_home, "dwm-titus")
 	    || !pathjoin(toml_hotkeys_path, sizeof(toml_hotkeys_path),
 	                 toml_config_dir, "hotkeys.toml")
 	    || !pathjoin(toml_themes_path, sizeof(toml_themes_path),
@@ -3981,9 +4044,11 @@ setup_inotify(void)
 		return;
 	}
 
-	/* Default (fallback) config: ~/.local/share/dwm-titus/config/ */
-	if (!pathjoin(toml_default_dir, sizeof(toml_default_dir),
-	              home, ".local/share/dwm-titus/config")
+	/* Default config: ${XDG_DATA_HOME:-$HOME/.local/share}/dwm-titus/config/ */
+	if (!pathjoin(dwm_data_dir, sizeof(dwm_data_dir),
+	              data_home, "dwm-titus")
+	    || !pathjoin(toml_default_dir, sizeof(toml_default_dir),
+	                 dwm_data_dir, "config")
 	    || !pathjoin(toml_hotkeys_default_path,
 	                 sizeof(toml_hotkeys_default_path),
 	                 toml_default_dir, "hotkeys.toml")
@@ -4028,6 +4093,8 @@ setup(void)
 	Atom utf8string;
 	/* clean up any zombies immediately */
 	sigchld(0);
+	/* The session helper uses SIGUSR2 for a normal, cleanup-aware exit. */
+	signal(SIGUSR2, sigusr2_handler);
 	dyn_borderpx = 1; /* initial value; overridden by themes.toml on load */
 
 	/* the one line of bloat that would have saved a lot of time for a lot of people */
@@ -4055,6 +4122,7 @@ setup(void)
 	netatom[NetActiveWindow] = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
 	netatom[NetSupported] = XInternAtom(dpy, "_NET_SUPPORTED", False);
 	netatom[NetWMName] = XInternAtom(dpy, "_NET_WM_NAME", False);
+	netatom[NetWMPid] = XInternAtom(dpy, "_NET_WM_PID", False);
 	#if SHOWWINICON
 	netatom[NetWMIcon] = XInternAtom(dpy, "_NET_WM_ICON", False);
 	#endif
@@ -4081,6 +4149,7 @@ setup(void)
 	netatom[NetDesktopNames] = XInternAtom(dpy, "_NET_DESKTOP_NAMES", False);
 	netatom[NetWMDesktop] = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
 	netatom[NetDwmMonitorDesktops] = XInternAtom(dpy, "_DWM_MONITOR_DESKTOPS", False);
+	netatom[NetDwmSelectedMonitor] = XInternAtom(dpy, "_DWM_SELECTED_MONITOR", False);
 	dwmfullscreenmonitorsatom = XInternAtom(dpy, "_DWM_FULLSCREEN_MONITORS", False);
 	dwmtagupdateatom = XInternAtom(dpy, "DWM_TAG_UPDATE", False);
 	/* init cursors */
@@ -4106,6 +4175,12 @@ setup(void)
 	updatestatus();
 	/* supporting window for NetWMCheck */
 	wmcheckwin = XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
+	{
+		unsigned long wm_pid = (unsigned long)getpid();
+
+		XChangeProperty(dpy, wmcheckwin, netatom[NetWMPid], XA_CARDINAL, 32,
+			PropModeReplace, (unsigned char *)&wm_pid, 1);
+	}
 	XChangeProperty(dpy, wmcheckwin, netatom[NetWMCheck], XA_WINDOW, 32,
 		PropModeReplace, (unsigned char *) &wmcheckwin, 1);
 	XChangeProperty(dpy, wmcheckwin, netatom[NetWMName], utf8string, 8,
@@ -4897,7 +4972,26 @@ updatecurrentdesktop(void)
 	XChangeProperty(dpy, root, netatom[NetDwmMonitorDesktops], XA_INTEGER, 32,
 		PropModeReplace, (unsigned char *)monitor_desktops, count * 5);
 	free(monitor_desktops);
+	updateselectedmonitor();
 	updatefullscreenmonitors();
+}
+
+void
+updateselectedmonitor(void)
+{
+	long data[] = { 0 };
+	int logicalindex;
+
+	if (!selmon)
+		return;
+	logicalindex = getmonlogicalindex(selmon);
+	if (logicalindex < 0
+	|| (selectedmonitorcachevalid && logicalindex == selectedmonitorcache))
+		return;
+	data[0] = logicalindex;
+	ewmh_replace_root_cardinal(netatom[NetDwmSelectedMonitor], data, 1);
+	selectedmonitorcache = logicalindex;
+	selectedmonitorcachevalid = 1;
 }
 
 #if SHOWWINICON

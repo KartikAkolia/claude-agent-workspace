@@ -4,8 +4,10 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.SystemTray
+import qs.appearance
 import qs.controlcenter
 import qs.controls
+import qs.defaults
 import qs.health
 import qs.launcher
 import qs.network
@@ -34,12 +36,69 @@ ShellRoot {
             return;
         }
 
+        commandMenuModel.close();
         if (popupId !== "bluetooth") bluetoothModel.close();
         if (popupId !== "controlcenter") controlCenterModel.close();
         if (popupId !== "controls") controlsModel.close();
         if (popupId !== "network") networkModel.close();
-        if (popupId !== "power") powerMenuModel.close();
+        if (popupId !== "power") powerMenuModel.close("panel");
         root.selectedPanelWindow = panel;
+    }
+
+    function openCommandMenu(screen) {
+        networkModel.close();
+        bluetoothModel.close();
+        controlCenterModel.close();
+        controlsModel.close();
+        powerMenuModel.close("panel");
+        launcherModel.close();
+        if (screen) commandMenuModel.openOnScreen(screen); else commandMenuModel.open();
+    }
+
+    function toggleCommandMenu(screen) {
+        if (commandMenuModel.visible) {
+            commandMenuModel.close();
+        } else {
+            root.openCommandMenu(screen);
+        }
+    }
+
+    function panelForScreen(screen) {
+        if (screen) {
+            for (const panel of panelVariants.instances) {
+                if (panel.screen === screen || (panel.screen && panel.screen.name === screen.name)) {
+                    return panel;
+                }
+            }
+        }
+
+        return root.activePanelWindow;
+    }
+
+    function runCommandMenuAction(target, action, argument, requestedScreen) {
+        const panel = root.panelForScreen(requestedScreen);
+        const screen = requestedScreen || (panel ? panel.screen : root.activePanelScreen);
+
+        if (target === "settings" && (action === "open" || action === "select")) {
+            settingsModel.openOnScreen(screen);
+            if (action === "select") settingsModel.selectSection(argument);
+        } else if (target === "network" && action === "open") {
+            if (panel) root.selectPanelPopup(panel, "network");
+            networkModel.open();
+        } else if (target === "bluetooth" && action === "open") {
+            if (panel) root.selectPanelPopup(panel, "bluetooth");
+            bluetoothModel.open();
+        } else if (target === "controls" && action === "open") {
+            if (panel) root.selectPanelPopup(panel, "controls");
+            controlsModel.open();
+        } else if (target === "systemhealth" && action === "open") {
+            systemHealthModel.openOnScreen(screen);
+        } else if (target === "controlcenter" && action === "keybindings") {
+            controlCenterModel.openKeybindsOnScreen(screen);
+        } else if (target === "power" && action === "open") {
+            if (panel) root.selectPanelPopup(panel, "power");
+            powerMenuModel.open("panel");
+        }
     }
 
     DwmState {
@@ -54,10 +113,65 @@ ShellRoot {
 
     LauncherModel {
         id: launcherModel
+
+        onVisibleChanged: {
+            if (visible) commandMenuModel.close();
+        }
+    }
+
+    CommandMenuModel {
+        id: commandMenuModel
+        launcherModel: launcherModel
+        currentEntryIds: {
+            const ids = [];
+
+            if (settingsModel.visible) {
+                ids.push("settings");
+                if (settingsModel.selectedSectionId === "displays" || settingsModel.selectedSectionId === "input") {
+                    ids.push(settingsModel.selectedSectionId);
+                    ids.push("display-input");
+                } else if (settingsModel.selectedSectionId === "power") {
+                    ids.push("system");
+                    ids.push("power-settings");
+                } else if (settingsModel.selectedSectionId === "system") {
+                    ids.push("system");
+                    ids.push("system-settings");
+                }
+            }
+            if (networkModel.visible) ids.push("network");
+            if (bluetoothModel.visible) ids.push("bluetooth");
+            if (controlsModel.visible) ids.push("audio");
+            if (systemHealthModel.visible) ids.push("health");
+            if (controlCenterModel.utilityVisible && controlCenterModel.utilityPage === "keybinds") ids.push("keybindings");
+            if (powerMenuModel.visible) {
+                ids.push("system");
+                ids.push("power-menu");
+            }
+
+            return ids;
+        }
+        onIpcActionRequested: (target, action, argument, screen) => root.runCommandMenuAction(target, action, argument, screen)
     }
 
     PowerMenuModel {
         id: powerMenuModel
+        powerModel: powerModel
+    }
+
+    PowerModel {
+        id: powerModel
+    }
+
+    DefaultAppsModel {
+        id: defaultsModel
+    }
+
+    AutostartModel {
+        id: autostartModel
+    }
+
+    AppearanceModel {
+        id: appearanceModel
     }
 
     NetworkModel {
@@ -74,6 +188,7 @@ ShellRoot {
 
     ControlCenterModel {
         id: controlCenterModel
+        powerModel: powerModel
     }
 
     SystemHealthModel {
@@ -82,6 +197,14 @@ ShellRoot {
 
     SettingsModel {
         id: settingsModel
+        networkModel: networkModel
+        bluetoothModel: bluetoothModel
+        controlsModel: controlsModel
+        powerModel: powerModel
+        powerMenuModel: powerMenuModel
+        defaultsModel: defaultsModel
+        autostartModel: autostartModel
+        appearanceModel: appearanceModel
     }
 
     LazyLoader {
@@ -90,6 +213,7 @@ ShellRoot {
         component: Item {
             Component.onCompleted: {
                 networkModel.refresh();
+                bluetoothModel.refresh();
                 controlsModel.refresh();
             }
         }
@@ -102,8 +226,16 @@ ShellRoot {
     IpcHandler {
         target: "launcher"
 
+        function applicationConsumers(): int {
+            return launcherModel.applicationConsumers;
+        }
+
         function close(): void {
             launcherModel.close();
+        }
+
+        function indexCount(): int {
+            return launcherModel.apps.length;
         }
 
         function open(): void {
@@ -116,10 +248,42 @@ ShellRoot {
     }
 
     IpcHandler {
+        target: "menu"
+
+        function activeMenu(): string {
+            return commandMenuModel.activeMenu;
+        }
+
+        function close(): void {
+            commandMenuModel.close();
+        }
+
+        function open(): void {
+            root.openCommandMenu(null);
+        }
+
+        function resultCount(): int {
+            return commandMenuModel.rows.length;
+        }
+
+        function selectedLabel(): string {
+            return commandMenuModel.selectedLabel;
+        }
+
+        function summon(): void {
+            root.openCommandMenu(dwmState.focusedScreen());
+        }
+
+        function toggle(): void {
+            root.toggleCommandMenu(null);
+        }
+    }
+
+    IpcHandler {
         target: "power"
 
         function close(): void {
-            powerMenuModel.close();
+            powerMenuModel.close("panel");
         }
 
         function open(): void {
@@ -330,6 +494,284 @@ ShellRoot {
             return settingsModel.inputState;
         }
 
+        function networkProviderStatus(): string {
+            return networkModel.providerState;
+        }
+
+        function networkDeviceCount(): int {
+            return networkModel.devices.length;
+        }
+
+        function bluetoothProviderStatus(): string {
+            return bluetoothModel.providerState;
+        }
+
+        function bluetoothDeviceCount(): int {
+            return bluetoothModel.devices.length;
+        }
+
+        function audioProviderStatus(): string {
+            return controlsModel.audioProviderState;
+        }
+
+        function audioSourceKind(): string {
+            return controlsModel.audioSourceKind;
+        }
+
+        function audioOutputCount(): int {
+            return controlsModel.outputDevices.length;
+        }
+
+        function audioInputCount(): int {
+            return controlsModel.inputDevices.length;
+        }
+
+        function audioStreamCount(): int {
+            return controlsModel.audioStreams.length;
+        }
+
+        function powerProviderStatus(): string {
+            return powerModel.providerState;
+        }
+
+        function powerBatteryAvailable(): bool {
+            return powerModel.batteryAvailable;
+        }
+
+        function powerBatteryPercent(): int {
+            return powerModel.batteryPercent;
+        }
+
+        function powerActiveProfile(): string {
+            return powerModel.activeProfile;
+        }
+
+        function powerDpmsStatus(): string {
+            return powerModel.dpmsState;
+        }
+
+        function powerDpmsEnabled(): bool {
+            return powerModel.dpmsEnabled;
+        }
+
+        function powerDpmsTimeout(): int {
+            return powerModel.dpmsTimeout;
+        }
+
+        function powerLockStatus(): string {
+            return powerModel.lockState;
+        }
+
+        function powerLockEnabled(): bool {
+            return powerModel.lockEnabled;
+        }
+
+        function powerLockTimeout(): int {
+            return powerModel.lockTimeout;
+        }
+
+        function powerBusy(): bool {
+            return powerModel.busy;
+        }
+
+        function powerMessage(): string {
+            return powerModel.messageFor("settings");
+        }
+
+        function powerSetDpms(enabled: bool): void {
+            powerModel.setDpms(enabled, "settings");
+        }
+
+        function defaultsProviderStatus(): string {
+            return defaultsModel.providerState;
+        }
+
+        function defaultsRoleCount(): int {
+            return defaultsModel.roles.length;
+        }
+
+        function defaultsMessage(): string {
+            return defaultsModel.messageFor("settings");
+        }
+
+        function defaultsBusy(): bool {
+            return defaultsModel.busy;
+        }
+
+        function defaultsRoleDesktopId(role: string): string {
+            const match = defaultsModel.roles.find(function(item) { return item.id === role; });
+            return match ? match.desktopId : "";
+        }
+
+        function defaultsSetRole(role: string, desktopId: string): void {
+            defaultsModel.setRole(role, desktopId, "settings");
+        }
+
+        function defaultsResetRole(role: string): void {
+            defaultsModel.resetRole(role, "settings");
+        }
+
+        function autostartProviderStatus(): string {
+            return autostartModel.providerState;
+        }
+
+        function autostartEntryCount(): int {
+            return autostartModel.entries.length;
+        }
+
+        function autostartMessage(): string {
+            return autostartModel.messageFor("settings");
+        }
+
+        function autostartBusy(): bool {
+            return autostartModel.busy;
+        }
+
+        function autostartEntryState(desktopId: string): string {
+            const entry = autostartModel.entries.find(function(item) { return item.id === desktopId; });
+            return entry ? entry.state : "";
+        }
+
+        function autostartEntryName(desktopId: string): string {
+            const entry = autostartModel.entries.find(function(item) { return item.id === desktopId; });
+            return entry ? entry.name : "";
+        }
+
+        function autostartEntryOrigin(desktopId: string): string {
+            const entry = autostartModel.entries.find(function(item) { return item.id === desktopId; });
+            return entry ? entry.origin : "";
+        }
+
+        function appearanceProviderStatus(): string {
+            return appearanceModel.providerState;
+        }
+
+        function appearanceProviderDetail(): string {
+            return appearanceModel.providerDetail;
+        }
+
+        function appearanceApplicationState(): string {
+            return appearanceModel.applicationState;
+        }
+
+        function appearanceIntegrationState(integrationId: string): string {
+            const match = appearanceModel.integrations.find(function(item) { return item.id === integrationId; });
+            return match ? match.state : "";
+        }
+
+        function appearanceActiveTheme(): string {
+            return appearanceModel.activeTheme;
+        }
+
+        function appearanceThemeCount(): int {
+            return appearanceModel.themes.length;
+        }
+
+        function appearanceMutationReady(): bool {
+            return appearanceModel.mutationReady;
+        }
+
+        function appearancePreviewState(): string {
+            return appearanceModel.previewState;
+        }
+
+        function appearancePreviewRemaining(): int {
+            return appearanceModel.previewRemaining;
+        }
+
+        function appearanceWallpaperState(): string {
+            return appearanceModel.wallpaperState;
+        }
+
+        function appearanceWallpaperPath(): string {
+            return appearanceModel.wallpaperPath;
+        }
+
+        function appearanceWallpaperFit(): string {
+            return appearanceModel.wallpaperFit;
+        }
+
+        function appearanceWallpaperMutationDetail(): string {
+            return appearanceModel.wallpaperMutationDetail;
+        }
+
+        function appearanceWallpaperResetReady(): bool {
+            return appearanceModel.wallpaperResetReady;
+        }
+
+        function appearanceWallpaperPreviewState(): string {
+            return appearanceModel.wallpaperPreviewState;
+        }
+
+        function appearanceWallpaperPreviewRemaining(): int {
+            return appearanceModel.wallpaperPreviewRemaining;
+        }
+
+        function appearanceWallpaperStatusBusy(): bool {
+            return appearanceModel.wallpaperStatusBusy;
+        }
+
+        function appearanceWallpaperReconcile(): void {
+            appearanceModel.reconcileWallpaperPreview();
+        }
+
+        function appearanceFontState(): string {
+            return appearanceModel.fontState;
+        }
+
+        function appearanceFontFamily(): string {
+            return appearanceModel.fontFamily;
+        }
+
+        function appearanceFontScale(): string {
+            return appearanceModel.fontScale.toFixed(2);
+        }
+
+        function appearanceFontMutationReady(): bool {
+            return appearanceModel.fontMutationReady;
+        }
+
+        function appearanceFontPreviewState(): string {
+            return appearanceModel.fontPreviewState;
+        }
+
+        function appearanceFontPreviewRemaining(): int {
+            return appearanceModel.fontPreviewRemaining;
+        }
+
+        function appearanceMessage(): string {
+            return appearanceModel.message;
+        }
+
+        function appearanceRecoveryState(): string {
+            return appearanceModel.recoveryState;
+        }
+
+        function autostartConfirming(): bool {
+            return autostartModel.confirming;
+        }
+
+        function autostartConfirm(): void {
+            autostartModel.confirmAction("settings");
+        }
+
+        function autostartCancel(): void {
+            autostartModel.cancelConfirmation("settings");
+        }
+
+        function autostartSetSearch(query: string): void {
+            autostartModel.setSearch(query);
+        }
+
+        function autostartFilteredCount(): int {
+            return autostartModel.filteredEntries.length;
+        }
+
+        function autostartSet(desktopId: string, enabled: bool): void {
+            const entry = autostartModel.entries.find(function(item) { return item.id === desktopId; });
+            if (entry) autostartModel.requestSet(entry, enabled ? "enabled" : "disabled", "settings");
+        }
+
         function open(): void {
             settingsModel.open();
         }
@@ -392,6 +834,10 @@ ShellRoot {
         launcherModel: launcherModel
     }
 
+    CommandMenuWindow {
+        commandMenuModel: commandMenuModel
+    }
+
     PowerMenuWindow {
         powerMenuModel: powerMenuModel
         panelWindow: root.activePanelWindow
@@ -412,6 +858,7 @@ ShellRoot {
             controlsModel: controlsModel
             bluetoothModel: bluetoothModel
             controlCenterModel: controlCenterModel
+            powerModel: powerModel
             powerMenuModel: powerMenuModel
             primaryPanel: modelData === Quickshell.screens[0]
             onPopupRequested: (panel, popupId) => root.selectPanelPopup(panel, popupId)
@@ -447,6 +894,7 @@ ShellRoot {
         launcherModel: launcherModel
         panelWindow: root.activePanelWindow
         powerMenuModel: powerMenuModel
+        powerModel: powerModel
         healthModel: systemHealthModel
         settingsModel: settingsModel
     }
@@ -462,5 +910,13 @@ ShellRoot {
 
     SettingsWindow {
         settingsModel: settingsModel
+        networkModel: networkModel
+        bluetoothModel: bluetoothModel
+        controlsModel: controlsModel
+        powerModel: powerModel
+        powerMenuModel: powerMenuModel
+        defaultsModel: defaultsModel
+        autostartModel: autostartModel
+        appearanceModel: appearanceModel
     }
 }

@@ -7,12 +7,23 @@ Rectangle {
 
     required property var profile
     property bool active: false
+    property bool actionsEnabled: true
     signal connectRequested(var profile)
     signal disconnectRequested(string device)
 
     height: Theme.confirmButtonHeight
-    color: Theme.surface
+    color: rowMouse.containsMouse ? Theme.controlHoverFill : Theme.controlNormalFill
+    border.color: rowMouse.containsMouse ? Theme.controlHoverBorder : Theme.controlNormalBorder
+    border.width: Theme.controlBorderWidth
     radius: Theme.radius
+
+    MouseArea {
+        id: rowMouse
+
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.NoButton
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -43,38 +54,11 @@ Rectangle {
             }
         }
 
-        Rectangle {
-            Layout.preferredWidth: actionText.implicitWidth + 18
+        ShellButton {
             Layout.preferredHeight: Theme.chipHeight
-            color: Theme.border
-            radius: Theme.radius
-
-            Text {
-                id: actionText
-
-                anchors.centerIn: parent
-                text: root.active ? "Disconnect" : "Connect"
-                color: Theme.textStrong
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.smallFontSize
-            }
-
-            MouseArea {
-                id: actionMouse
-
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.active ? root.disconnectRequested(root.profile.device) : root.connectRequested(root.profile)
-            }
+            label: root.active ? "Disconnect" : "Connect"
+            enabled: root.actionsEnabled
+            onActivated: root.active ? root.disconnectRequested(root.profile.device) : root.connectRequested(root.profile)
         }
-    }
-
-    MouseArea {
-        id: rowMouse
-
-        anchors.fill: parent
-        hoverEnabled: true
-        acceptedButtons: Qt.NoButton
     }
 }

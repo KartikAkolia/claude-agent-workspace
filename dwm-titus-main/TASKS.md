@@ -1,152 +1,156 @@
 # Active Project Tasks
 
 `SPEC.md` is the product contract and `ROADMAP.md` defines phase order. This
-file contains implementation work only for the active roadmap phase. Phase 2
-completion evidence is recorded in `ROADMAP.md`, `CHANGELOG.md`, and
-`docs/SETTINGS-PLATFORM.md`.
+file contains implementation work only for the active roadmap phase. Phase 4
+completion evidence is recorded in `ROADMAP.md`, `CHANGELOG.md`,
+`docs/P4-EVIDENCE.md`, and the four detailed Phase 4 evidence records.
 
-## Active Phase: Connectivity and Audio
+## Active Phase: Personalization and Accessibility
 
-### CONN-001: Connectivity Provider Contract
+Phase 5 begins from the merged Settings platform and semantic theme adapter.
+Keep DWM, X11, Fedora providers, runtime TOML files, existing keybindings, panel
+geometry, and user-owned configuration compatible while adding the workflows
+below. Do not begin Phase 6 system-management work in Phase 5 changes.
 
-- [ ] Define versioned machine-readable records for network, VPN, Bluetooth,
-  and provider availability without parsing human-oriented status output.
-- [ ] Define required fields for a protocol-version header and each record;
-  consumers reject a missing or incompatible major version, reject records
-  missing required fields, and ignore documented trailing fields and unknown
-  record types for append-only compatibility.
-- [ ] Reuse the existing NetworkManager and BlueZ helpers where their output,
-  lifecycle, and failure contracts are already suitable.
-- [ ] Separate read-only state, user-session actions, delegated authorization,
-  and unsupported capabilities in provider and QML state.
+Keep Phase 5 reviewable through these ordered pull-request boundaries. Finish,
+validate, and merge each boundary before starting the next one:
 
-Acceptance:
+1. Read-only appearance inventory and validation protocol.
+2. Transactional theme preview, apply, reset, and recovery helper.
+3. Shared root appearance model and Settings theme pane.
+4. Wallpaper, toolkit, font, cursor, icon, and panel-widget persistence slices,
+   split further when one slice cannot remain independently reviewable.
+5. Accessibility and notification policy, with UI-5 candidates kept in their
+   own later review boundaries.
 
-- Opening and closing Network or Bluetooth starts and stops only section-owned
-  watches, scans, and helper processes.
-- Missing services, adapters, or commands fail only the owning section and do
-  not break the Settings shell or core desktop session.
-- Provider fixtures cover available, unavailable, restricted, malformed, and
-  action-failure records.
+### THEME-001: Shared Appearance Provider and Safe Theme Changes
 
-### NET-001: Network and VPN Workflows
-
-- [ ] Add Ethernet, Wi-Fi, saved connection, active connection, and VPN status
-  to Settings using NetworkManager-owned interfaces.
-- [ ] Add scan, saved-profile activation, Wi-Fi connection, disconnect, and
-  forget actions with explicit progress and failure states. Bound scans to 10
-  seconds, activation and connection to 90 seconds, and disconnect or forget
-  to 15 seconds; cancellation terminates the owning helper, cleans temporary
-  state, and performs no automatic retry.
-- [ ] Delegate advanced, hidden, enterprise, and VPN editing to a trusted
-  NetworkManager tool when the workflow is not safely owned by Settings.
+- [x] Define a versioned machine-readable provider for the active theme,
+  available themes, semantic colors, toolkit state, and per-capability errors.
+- [x] Add a user-session transaction helper for bounded preview, confirm,
+  automatic or explicit rollback, apply, reset, and interrupted-operation
+  recovery without replacing unrelated theme configuration.
+- [x] Add one root-scoped appearance model shared by Settings and existing shell
+  surfaces without duplicating the `Theme.qml` or `themes.toml` ownership path.
+- [x] Add a Settings Appearance pane with theme preview, apply, reset, and
+  recovery behavior. Preserve comments, custom themes, file mode, and unrelated
+  user configuration.
+- [x] Make partial GTK, Qt, terminal, cursor, or compositor application failures
+  visible without reporting the selected theme as fully applied.
 
 Acceptance:
 
-- Secrets reach the fixed NetworkManager helper only over its stdin and a
-  caller-owned mode-0600 temporary `nmcli --passwd-file`. The helper authorizes
-  only the invoking user, redacts diagnostics, and removes the file on success,
-  failure, cancellation, timeout, or signal. Secrets never appear in argv,
-  logs, provider records, or persistent QML state.
-- Authentication cancellation and service loss leave readable state available
-  and do not report the requested action as successful.
-- Existing panel network state and Settings converge after each change without
-  overlapping polling or duplicate long-lived monitors.
+- Invalid, missing, duplicate, or incomplete theme records cannot prevent DWM,
+  Quickshell, Settings, or an existing theme from loading.
+- Preview is bounded and rolls back automatically unless confirmed. Apply and
+  reset are transactional, attributed, and converge through hot reload.
+- Existing Control Center theme selection remains compatible with the shared
+  provider until its presentation can be migrated without behavior drift.
 
-### BT-001: Bluetooth Workflows
+### APPEARANCE-001: Wallpaper, Fonts, Cursors, Icons, and Toolkit Integration
 
-- [ ] Add adapter power, bounded discovery, known-device, paired, trusted, and
-  connected state using BlueZ-owned interfaces.
-- [ ] Add pair, trust, connect, disconnect, and remove actions with per-device
-  progress and attributed failures.
-- [ ] Carry one validated canonical device address or stable BlueZ object path
-  through every request, progress record, completion callback, and error.
-- [ ] Report adapter, daemon, hardware, and operation support separately.
-
-Acceptance:
-
-- Discovery stops on section close, timeout, or shell exit and cannot leave a
-  background scan running indefinitely.
-- A failed, cancelled, or late operation re-resolves and mutates only its stable
-  identity; it cannot target a name, enumeration position, or another device.
-- Real adapter/device tests cover pairing recovery and service unavailability;
-  absent hardware is recorded rather than described as verified.
-
-### AUDIO-001: PipeWire and WirePlumber Provider
-
-- [ ] Define event-driven output, input, stream, volume, mute, default-device,
-  and microphone-visibility records using PipeWire/WirePlumber-compatible
-  interfaces.
-- [ ] Reuse native Quickshell PipeWire signals where stable and provide one
-  documented bounded fallback when native state is unavailable.
-- [ ] Start one fallback subscription only after native initialization fails or
-  disconnects within three seconds. Increment a source generation on every
-  transition, ignore events from older generations, terminate the fallback on
-  section close or native recovery, and hand new snapshots back to native state
-  without overlapping subscriptions.
-- [ ] Keep audio and media provider failures independent.
+- [x] Define event-driven inventory and state contracts for wallpaper, supported
+  fonts, cursors, icons, GTK, Qt, and compositor integration using stable Fedora
+  or X11 interfaces.
+- [x] Add wallpaper selection, fit mode, preview, reset, and missing-file
+  recovery without scanning while the Appearance pane is closed.
+- [ ] Add bounded user-session controls for supported font, text-size, cursor,
+  icon, GTK, and Qt choices. Delegate advanced toolkit editing to a trusted
+  Fedora tool where a narrow project contract would be incomplete.
+  - [x] Persist managed-shell font family and bounded text scale with preview,
+    automatic rollback, reset, external-change protection, and event-driven
+    root-model updates.
+  - [ ] Add cursor, icon, GTK, and Qt mutation controls without overwriting
+    unrelated toolkit configuration.
+- [ ] Move the existing in-memory panel-widget visibility controls onto shared,
+  versioned user state with Settings integration, safe defaults, and migration
+  that preserves the current Control Center behavior.
+- [ ] Preserve optional-component behavior: missing Picom, Feh, toolkit themes,
+  wallpaper directories, or delegated tools must fail only their capability.
 
 Acceptance:
 
-- Settings adds no audio polling timer and starts no overlapping subscription
-  process while a native or shared event source is active.
-- Device removal, default changes, service restart, and malformed fallback
-  output degrade cleanly without stale success state.
-- Provider fixtures cover multiple sinks, sources, applications, and no-audio
-  environments.
+- Selected appearance state persists through a fresh session and follows the
+  shared theme where appropriate without overwriting unrelated toolkit files.
+- Panel-widget visibility persists through a fresh session, stays consistent on
+  every active monitor, and does not duplicate panel models or providers.
+- Preview, apply, interruption, rollback, reset, missing-asset, and external-
+  change paths converge with explicit status and no orphaned watcher.
+- Visible shell surfaces remain opaque, X11-native, correctly stacked, and
+  usable at the existing panel and popup geometry contracts.
 
-### AUDIO-002: Audio Controls and Panel Synchronization
+### ACCESSIBILITY-001: Practical X11 Accessibility and Notification Policy
 
-- [ ] Add output and input selection, volume, mute, per-application stream, and
-  microphone controls only when reported by the provider.
-- [ ] Make one root-scoped audio service model authoritative for the panel and
-  Settings. Tag mutations with an origin and monotonic generation, reject stale
-  generations, and suppress echoed events at their originating surface so both
-  consumers converge without feedback loops.
-- [ ] Add bounded value validation, partial-failure reporting, and reset or
-  recovery behavior for disappearing devices and streams.
-
-Acceptance:
-
-- Common output, input, mute, volume, and application-stream workflows no
-  longer require a terminal on the qualified Fedora session.
-- A Settings action updates the panel and an external PipeWire change updates
-  Settings without reopening either surface.
-- Service unavailability and authorization cancellation do not hide readable
-  state or affect unrelated sections.
-
-### CA-VALIDATE: Phase 3 Validation
-
-- [ ] Run focused shell, QML, provider, helper, and nested-X11 tests for all
-  connectivity and audio interactions.
-- [ ] Exercise NetworkManager workflows with a real Fedora Ethernet or Wi-Fi
-  connection, including cancellation and service-unavailable recovery.
-- [ ] Exercise BlueZ workflows with a real adapter and device, or record the
-  exact hardware path that remains unqualified.
-- [ ] Exercise PipeWire/WirePlumber outputs, inputs, application streams, and
-  microphone state in a real Fedora session.
-- [ ] Verify closed Settings sections leave no scans, duplicate subscriptions,
-  or overlapping commands. Compare a 30-second closed baseline with a
-  30-second sample after opening and closing each section; the mean Quickshell
-  CPU delta must be no more than 0.5 percentage points of one CPU.
-- [ ] Run the full Fedora repository validation and record untested hardware
-  paths.
+- [ ] Define capability records for text scaling, contrast, reduced motion,
+  notification policy, and practical keyboard or pointer accessibility features
+  available through supported Fedora/X11 interfaces.
+- [ ] Add accessible Settings controls with keyboard navigation, visible focus,
+  usable common display sizes, explanatory unavailable states, and reset.
+- [ ] Apply reduced-motion and contrast choices consistently to managed
+  Quickshell surfaces without introducing a Wayland, compositor, or polling
+  dependency.
+- [ ] Add notification behavior controls that preserve the existing D-Bus owner,
+  history lifecycle, urgency semantics, and safe failure isolation.
 
 Acceptance:
 
-- Every Phase 3 exit criterion maps to passing automated evidence or a named
-  manual check with release, hardware, session, and limitation details.
-- Common network, Bluetooth, and audio workflows work without a terminal on the
-  qualified Fedora session, fail safely, and remain synchronized with panel
-  controls.
-- No phase is described as hardware- or platform-verified when its required
-  environment was not tested.
+- Accessibility state persists and is observable through the owning platform or
+  managed interface after a fresh session.
+- Missing X11 extensions or optional tools degrade per capability and never make
+  Settings, notifications, or the shell unavailable.
+- Keyboard-only navigation, text scaling, contrast, reduced motion, notification
+  delivery/history, and reset behavior pass nested-X11 and real-session checks.
+
+### P5-UI5: Optional X11-Native Experience Integration
+
+- [ ] Inventory UI-5 candidates, beginning with event-driven clipboard history,
+  and record an adopt, defer, or reject decision for each candidate.
+- [ ] Evaluate every adopted UI-5 experience as an independent review boundary
+  with an event-driven provider, explicit data ownership, bounded lifecycle,
+  privacy model, and Fedora package impact before implementation.
+- [ ] Integrate only approved X11-native experiences into the existing semantic
+  design system and command surfaces; do not copy Wayland, Hyprland, layer-shell,
+  UWSM, or Omarchy service/plugin backends.
+- [ ] Preserve current IPC names, X11 focus/click-away/stacking behavior, monitor
+  selection, and closed-surface near-idle behavior.
+
+Acceptance:
+
+- Every inventoried candidate has a recorded adopt, defer, or reject decision.
+- Every adopted experience has focused source, helper, lifecycle, nested-X11,
+  package/install, and privacy tests.
+- Closing a surface leaves no resident scan, duplicate subscription, helper,
+  sensitive history owner, or overlapping process.
+
+### P5-VALIDATE: Phase 5 Validation
+
+- [ ] Run focused parser, helper, QML, lifecycle, rollback, and nested-X11 tests
+  for every Phase 5 workflow.
+- [ ] Exercise reversible appearance and accessibility changes on Fedora 44,
+  restore exact original state, and record unavailable toolkit or X11 paths.
+- [ ] Compare a 30-second closed baseline with a 30-second sample after opening
+  and closing every Phase 5 Settings workflow; the mean Quickshell CPU delta
+  must be no more than 0.5 percentage points of one CPU.
+- [ ] Run the clean build, full managed repository suite, Quickshell lint,
+  ShellCheck, shfmt, staged install, repeated install, and installed-runtime
+  parity checks.
+- [ ] Qualify a fresh LightDM login, fixture or real `startx`, multi-monitor and
+  common display-size rendering, optional-component loss, and recovery after an
+  invalid theme or missing asset.
+
+Acceptance:
+
+- Every Phase 5 exit criterion maps to automated evidence or a named manual
+  check with Fedora release, session, restoration, and limitations.
+- Invalid themes or missing assets cannot prevent login or shell startup.
+- Accessibility choices persist, remain keyboard-usable, and do not add idle
+  polling, duplicate providers, or orphaned work.
 
 ## Phase Completion
 
-When all Phase 3 acceptance criteria pass:
+When all Phase 5 acceptance criteria pass:
 
 1. Record delivered behavior and validation in `CHANGELOG.md`.
-2. Update the Phase 3 status and limitations in `ROADMAP.md`.
-3. Replace this file's active task set with Phase 4 tasks.
+2. Update the Phase 5 status and limitations in `ROADMAP.md`.
+3. Replace this file's active task set with Phase 6 tasks.
 4. Preserve incomplete or deferred work as explicit roadmap limitations.

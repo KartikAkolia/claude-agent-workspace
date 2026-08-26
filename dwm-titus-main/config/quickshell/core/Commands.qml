@@ -23,12 +23,28 @@ Singleton {
         return command.concat(argv);
     }
 
+    function checkedCommand(command) {
+        // Hold helper stdout until it exits successfully, so a result record
+        // followed by a nonzero exit can never be accepted by a QML parser.
+        const script = 'output=$("$@"); status=$?; [ "$status" -eq 0 ] || exit "$status"; printf "%s\\n" "$output"';
+        return ["sh", "-c", script, "dwm-checked-command"].concat(command);
+    }
+
+    function booleanStatusCommand(command) {
+        const script = 'if "$@" >/dev/null 2>&1; then printf "available\\n"; else printf "restricted\\n"; fi';
+        return ["sh", "-c", script, "dwm-boolean-status"].concat(command);
+    }
+
     function launcherHelperCommand(action, args) {
         return helperCommand("dwm-quickshell-launcher", action, args, true);
     }
 
     function networkHelperCommand(action, args) {
         return helperCommand("dwm-quickshell-network", action, args, false);
+    }
+
+    function pointerHelperCommand(action) {
+        return helperCommand("dwm-quickshell-pointer", action, [], true);
     }
 
     function controlsHelperCommand(action, args) {
@@ -39,8 +55,28 @@ Singleton {
         return helperCommand("dwm-quickshell-controlcenter", action, args, true);
     }
 
+    function powerHelperCommand(action, args) {
+        return helperCommand("dwm-quickshell-controlcenter", action, args, true);
+    }
+
+    function sessionActionCommand(action) {
+        return powerHelperCommand("session-action", [action]);
+    }
+
+    function defaultsHelperCommand(action, args) {
+        return helperCommand("dwm-default-apps", action, args, true);
+    }
+
+    function autostartHelperCommand(action, args) {
+        return helperCommand("dwm-xdg-autostart", action, args, true);
+    }
+
     function lockHelperCommand() {
         return helperCommand("dwm-lock", undefined, [], true);
+    }
+
+    function screenshotHelperCommand(action) {
+        return helperCommand("dwm-screenshot", action, [], true);
     }
 
     function systemHealthHelperCommand(action, args) {
@@ -57,5 +93,21 @@ Singleton {
 
     function settingsInputCommand(action, args) {
         return helperCommand("dwm-settings-input", action, args, true);
+    }
+
+    function settingsAppearanceCommand(action, args) {
+        return helperCommand("dwm-settings-appearance", action, args, true);
+    }
+
+    function settingsWallpaperCommand(action, args) {
+        return helperCommand("dwm-settings-wallpaper", action, args, true);
+    }
+
+    function settingsFontCommand(action, args) {
+        return helperCommand("dwm-settings-font", action, args, true);
+    }
+
+    function settingsThemeCommand(action, args) {
+        return helperCommand("dwm-settings-theme", action, args, true);
     }
 }

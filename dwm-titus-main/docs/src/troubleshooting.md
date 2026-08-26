@@ -1,5 +1,24 @@
 # Troubleshooting
 
+## Gear Lever does not open
+
+Gear Lever requires Flatpak's document portal. If launching it prints a
+`bwrap: Can't find source path /run/user/.../doc/by-app/...` error, the portal
+process has outlived its FUSE mount. Repair the current user session with:
+
+```sh
+systemctl --user restart xdg-document-portal.service
+flatpak run it.mijorus.gearlever
+```
+
+The recommended and full installers include Flatpak, the GTK portal, and a
+user-scoped Gear Lever installation from Flathub by default. To repair only the
+application setup from an installed dwm-titus checkout, run:
+
+```sh
+install-gearlever
+```
+
 Run the dependency checker first — it covers most common issues:
 
 ```bash
@@ -35,28 +54,39 @@ Or use the [Control Center](./control-center.md) → **System Health**.
 
 ## Terminal Won't Open (`Super`+`X`)
 
-- Run `dwm-terminal` from an existing shell to see the exact fallback message
-- Run `install-herdr --force` if Alacritty opens but Herdr does not
-- Set `DWM_HERDR=0` to confirm the outer terminal works without Herdr
-- Install a supported terminal: `alacritty`, `kitty`, `st`,
-  `warp-terminal`, or `xterm`
-- Or set a fixed terminal in `config/hotkeys.toml`:
+- Run `alacritty` from an existing shell to inspect its error directly
+- Install Alacritty with `sudo dnf install alacritty`
+- Confirm the fixed terminal in `config/hotkeys.toml`:
   ```toml
   [vars]
   terminal = "alacritty"
   ```
 
-Herdr is a terminal workspace, not a graphical terminal emulator. The default
-stack is Herdr running inside Alacritty. X11 therefore reports the window class
-as `Alacritty`, which is already covered by the terminal swallowing rules.
+Herdr is an optional terminal workspace, not a graphical terminal emulator.
+Install it explicitly and use `DWM_HERDR=1 dwm-terminal` to run it inside
+Alacritty. The default `Super`+`X` binding remains plain Alacritty.
 
 ## Browser Won't Open (`Super`+`B`)
 
 - Run `dwm-default-apps status` to inspect the current default browser
 - Run `dwm-default-apps browsers` to list installed browser desktop files
 - Set one with `dwm-default-apps set-browser firefox.desktop`
+- Open Settings -> Defaults to inspect provider details, candidates, and the
+  Restore Previous action
 - Ensure `xdg-utils` is installed so `xdg-settings`, `xdg-mime`, and `xdg-open`
   are available
+
+## Startup Application Change Failed
+
+- Open Settings -> Defaults and inspect the entry origin, effective state, and
+  detail. Malformed or conditional vendor entries are intentionally not
+  rewritten.
+- Changes apply at the next login; Settings does not start or stop the
+  application in the current session.
+- A stale-revision error means the entry changed after it was displayed. Use
+  Refresh and retry.
+- Reset to vendor removes only the managed user override. Existing vendor
+  desktop files are never edited.
 
 ---
 

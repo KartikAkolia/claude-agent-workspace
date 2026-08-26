@@ -31,6 +31,43 @@ make_failing_stub() {
 	chmod +x "$path"
 }
 
+make_appearance_stub() {
+	path=$1
+	mkdir -p "${path%/*}"
+	printf '%s\n' '#!/bin/sh' \
+		'printf "appearance-protocol\t1\t0\nprovider\tappearance\tavailable\tread-only\tfixture\nsource\tuser\t/fixture/themes.toml\nactive\tnone\tnone\tselected\ntheme\tnone\tselected\tvalid\ttrue\tautomatic\tfixture\n"' >"$path"
+	chmod +x "$path"
+}
+
+make_header_only_appearance_stub() {
+	path=$1
+	mkdir -p "${path%/*}"
+	printf '%s\n' '#!/bin/sh' 'printf "appearance-protocol\t1\t0\n"' >"$path"
+	chmod +x "$path"
+}
+
+make_empty_active_appearance_stub() {
+	path=$1
+	mkdir -p "${path%/*}"
+	printf '%s\n' '#!/bin/sh' \
+		'printf "appearance-protocol\t1\t0\nprovider\tappearance\tavailable\tread-only\tfixture\nsource\tuser\t/fixture/themes.toml\nactive\t\t\tselected\ntheme\tnord\tselected\tvalid\ttrue\tautomatic\tfixture\n"' >"$path"
+	chmod +x "$path"
+}
+
+make_malformed_appearance_stub() {
+	path=$1
+	mkdir -p "${path%/*}"
+	printf '%s\n' '#!/bin/sh' 'printf "not-an-appearance-snapshot\n"' >"$path"
+	chmod +x "$path"
+}
+
+make_preamble_appearance_stub() {
+	path=$1
+	mkdir -p "${path%/*}"
+	printf '%s\n' '#!/bin/sh' 'printf "preamble\nappearance-protocol\t1\t0\n"' >"$path"
+	chmod +x "$path"
+}
+
 base_bin=$work/base-bin
 fedora_bin=$work/fedora-bin
 make_tools "$base_bin" dirname awk tr stat find grep timeout readlink
@@ -40,6 +77,10 @@ for command_name in xrandr nmcli bluetoothctl pactl xset gsettings light-locker 
 	xdg-settings xdg-mime xinput; do
 	make_stub "$fedora_bin/$command_name"
 done
+make_stub "$fedora_bin/dwm-xdg-autostart"
+make_appearance_stub "$fedora_bin/dwm-settings-appearance"
+make_stub "$fedora_bin/dwm-settings-theme"
+make_stub "$fedora_bin/inotifywait"
 make_failing_stub "$fedora_bin/pkexec"
 make_failing_stub "$fedora_bin/sudo"
 
@@ -70,6 +111,49 @@ printf '%s\n' "$fedora_output" | grep -Fqx \
 	'capability	network	networkmanager	NetworkManager	available	delegated	nmcli	NetworkManager state is available'
 printf '%s\n' "$fedora_output" | grep -Fqx \
 	'capability	audio	pipewire-audio	Audio	available	user-session	pactl	PipeWire Pulse-compatible session controls are available'
+printf '%s\n' "$fedora_output" | grep -Fqx \
+	'capability	defaults	xdg-autostart	Startup applications	available	user-session	xdg-autostart	Per-user XDG autostart overrides and live updates are available'
+printf '%s\n' "$fedora_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	available	user-session	dwm-settings-theme	Theme inventory, bounded preview, apply, reset, and recovery are available'
+available_theme_record='capability	appearance	themes	Themes	available	user-session	dwm-settings-theme	Theme inventory, bounded preview, apply, reset, and recovery are available'
+
+unsafe_theme_bin=$work/unsafe-theme-bin
+cp -a "$fedora_bin" "$unsafe_theme_bin"
+make_failing_stub "$unsafe_theme_bin/dwm-settings-theme"
+unsafe_theme_output=$(PATH="$unsafe_theme_bin" XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$unsafe_theme_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	partial	read-only	dwm-settings-appearance	Theme inventory is available; the theme source is not safely mutable'
+if printf '%s\n' "$unsafe_theme_output" | grep -Fqx "$available_theme_record"; then
+	printf 'unsafe theme source was also advertised as mutable\n' >&2
+	exit 1
+fi
+
+repo_source_home=$work/repo-source-home
+repo_source_config=$work/repo-source-config
+mkdir -p "$repo_source_home" "$repo_source_config/dwm-titus"
+cp "$repo/config/themes.toml" "$repo_source_config/dwm-titus/themes.toml"
+repo_source_output=$(PATH="$repo/scripts:/usr/bin" HOME="$repo_source_home" \
+	XDG_CONFIG_HOME="$repo_source_config" XDG_DATA_HOME="$work/missing-repo-source-data" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$repo_source_output" | grep -Fqx \
+	"$available_theme_record"
+
+read_only_appearance_bin=$work/read-only-appearance-bin
+cp -a "$fedora_bin" "$read_only_appearance_bin"
+rm -f "$read_only_appearance_bin/dwm-settings-theme"
+read_only_provider_dir=$work/read-only-provider
+mkdir "$read_only_provider_dir"
+cp "$provider" "$read_only_provider_dir/dwm-settings-provider"
+read_only_appearance_output=$(PATH="$read_only_appearance_bin" XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" \
+	"$read_only_provider_dir/dwm-settings-provider" discover)
+printf '%s\n' "$read_only_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	partial	read-only	dwm-settings-appearance	Theme inventory is available; install the managed mutation helper for changes'
+if printf '%s\n' "$read_only_appearance_output" | grep -Fqx "$available_theme_record"; then
+	printf 'read-only appearance provider was also advertised as mutable\n' >&2
+	exit 1
+fi
 printf '%s\n' "$fedora_output" | grep -Eq \
 	'^capability	system	authorization	Administrative authorization	(available|restricted)	privileged	polkit	'
 
@@ -78,6 +162,7 @@ cp -a "$fedora_bin" "$runtime_down_bin"
 for command_name in xrandr nmcli bluetoothctl pactl xset; do
 	make_failing_stub "$runtime_down_bin/$command_name"
 done
+make_failing_stub "$runtime_down_bin/dwm-settings-appearance"
 runtime_down_output=$(PATH="$runtime_down_bin" XDG_CONFIG_HOME="$work/fedora-config" \
 	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
 printf '%s\n' "$runtime_down_output" | grep -Fqx \
@@ -88,6 +173,54 @@ printf '%s\n' "$runtime_down_output" | grep -Fqx \
 	'capability	bluetooth	bluez	Bluetooth	unavailable	delegated	bluetoothctl	BlueZ tools are installed, but no daemon or adapter is responding'
 printf '%s\n' "$runtime_down_output" | grep -Fqx \
 	'capability	audio	pipewire-audio	Audio	unavailable	user-session	pipewire	Audio tools are installed, but no PipeWire or Pulse session is responding'
+printf '%s\n' "$runtime_down_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Restore a valid themes.toml configuration or inspect the appearance snapshot errors'
+
+malformed_appearance_bin=$work/malformed-appearance-bin
+cp -a "$fedora_bin" "$malformed_appearance_bin"
+make_malformed_appearance_stub "$malformed_appearance_bin/dwm-settings-appearance"
+malformed_appearance_output=$(PATH="$malformed_appearance_bin" XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$malformed_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Restore a valid themes.toml configuration or inspect the appearance snapshot errors'
+
+preamble_appearance_bin=$work/preamble-appearance-bin
+cp -a "$fedora_bin" "$preamble_appearance_bin"
+make_preamble_appearance_stub "$preamble_appearance_bin/dwm-settings-appearance"
+preamble_appearance_output=$(PATH="$preamble_appearance_bin" XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$preamble_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Restore a valid themes.toml configuration or inspect the appearance snapshot errors'
+
+header_only_appearance_bin=$work/header-only-appearance-bin
+cp -a "$fedora_bin" "$header_only_appearance_bin"
+make_header_only_appearance_stub "$header_only_appearance_bin/dwm-settings-appearance"
+header_only_appearance_output=$(PATH="$header_only_appearance_bin" \
+	XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$header_only_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Restore a valid themes.toml configuration or inspect the appearance snapshot errors'
+
+empty_active_appearance_bin=$work/empty-active-appearance-bin
+cp -a "$fedora_bin" "$empty_active_appearance_bin"
+make_empty_active_appearance_stub "$empty_active_appearance_bin/dwm-settings-appearance"
+empty_active_appearance_output=$(PATH="$empty_active_appearance_bin" \
+	XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" "$provider" discover)
+printf '%s\n' "$empty_active_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Restore a valid themes.toml configuration or inspect the appearance snapshot errors'
+
+missing_appearance_bin=$work/missing-appearance-bin
+cp -a "$fedora_bin" "$missing_appearance_bin"
+rm -f "$missing_appearance_bin/dwm-settings-appearance"
+isolated_provider_dir=$work/isolated-provider
+mkdir "$isolated_provider_dir"
+cp "$provider" "$isolated_provider_dir/dwm-settings-provider"
+missing_appearance_output=$(PATH="$missing_appearance_bin" XDG_CONFIG_HOME="$work/fedora-config" \
+	DWM_SETTINGS_OS_RELEASE="$work/fedora-os-release" \
+	"$isolated_provider_dir/dwm-settings-provider" discover)
+printf '%s\n' "$missing_appearance_output" | grep -Fqx \
+	'capability	appearance	themes	Themes	unavailable	read-only	dwm-settings-appearance	Install the managed appearance provider'
 
 if "$provider" unknown 2>"$work/provider.err"; then
 	exit 1
@@ -131,6 +264,12 @@ grep -Fq 'providerProcess.running = false' "$repo/config/quickshell/settings/Set
 grep -Fq 'Commands.settingsProviderCommand("discover")' "$repo/config/quickshell/settings/SettingsModel.qml"
 grep -Fq 'Commands.settingsDisplayCommand("discover")' "$repo/config/quickshell/settings/SettingsModel.qml"
 grep -Fq 'Commands.settingsInputCommand("discover")' "$repo/config/quickshell/settings/SettingsModel.qml"
+grep -Fq 'Commands.settingsDisplayCommand("watch", root.watchOwnerArguments())' \
+	"$repo/config/quickshell/settings/SettingsModel.qml"
+grep -Fq 'Commands.settingsInputCommand("watch", root.watchOwnerArguments())' \
+	"$repo/config/quickshell/settings/SettingsModel.qml"
+grep -Fq 'path: "/proc/" + Quickshell.processId.toString() + "/stat"' \
+	"$repo/config/quickshell/settings/SettingsModel.qml"
 grep -Fq 'root.runInput("preview-status", [])' "$repo/config/quickshell/settings/SettingsModel.qml"
 grep -Fq 'root.runDisplay("preview-status", [])' "$repo/config/quickshell/settings/SettingsModel.qml"
 grep -Fq 'if (!root.visible) root.closeRollbackPending = true;' \
@@ -181,6 +320,8 @@ if grep -Eq '^[[:space:]]*(sudo|pkexec)([[:space:]]|$)' "$provider"; then
 	printf 'Settings discovery must not execute an elevation tool.\n' >&2
 	exit 1
 fi
+grep -Fq "trusted_installed_file \"\$candidate\"" "$provider"
+grep -Fq 'provider_available sudo && run_bounded_probe sudo -n -v' "$provider"
 
 if "$repo/scripts/dwm-settings-display-root" rollback 2>"$work/root-helper.err"; then
 	printf 'Privileged display helper ran without root authorization.\n' >&2

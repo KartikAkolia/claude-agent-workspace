@@ -28,6 +28,7 @@ required_repos=(
 )
 
 required_packages=(
+	flatpak
 	maim
 	steam
 	gamescope
@@ -73,6 +74,10 @@ dwm_packages fedora screenshot-optional | grep -Fx maim >/dev/null
 dwm_packages fedora x11 | grep -Fx setxkbmap >/dev/null
 dwm_packages fedora recommended | grep -Fx playerctl >/dev/null
 dwm_packages fedora desktop | grep -Fx quickshell >/dev/null
+dwm_packages fedora desktop | grep -Fx flatpak >/dev/null
+dwm_packages fedora desktop | grep -Fx xdg-desktop-portal-gtk >/dev/null
+dwm_packages fedora desktop | grep -Fx dbus-tools >/dev/null
+dwm_packages fedora desktop | grep -Fx inotify-tools >/dev/null
 if ARCH=x86_64 dwm_packages fedora full | grep -Fx nwg-look >/dev/null; then
 	printf 'Unavailable Fedora package leaked into the image package set: nwg-look\n' >&2
 	exit 1
@@ -94,6 +99,8 @@ for ks in "$standard_ks" "$nvidia_ks"; do
 	for package in "${mapped_fedora_packages[@]}"; do
 		grep -Fxq "$package" "$ks"
 	done
+	grep -Fxq power-profiles-daemon "$ks"
+	grep -Eq '^[[:space:]]*systemctl[[:space:]]+enable[[:space:]]+power-profiles-daemon[.]service([[:space:]]|$)' "$ks"
 	if grep -Eq 'updates-testing|rpmfusion-.*-updates-testing' "$ks"; then
 		printf 'Testing repo found in %s\n' "$ks" >&2
 		exit 1
@@ -101,7 +108,12 @@ for ks in "$standard_ks" "$nvidia_ks"; do
 	grep -Fq "url --metalink=\"https://mirrors.fedoraproject.org/metalink?repo=fedora-\$releasever&arch=\$basearch\"" "$ks"
 	grep -Fq 'firstboot --disable' "$ks"
 	grep -Fq 'selinux --disabled' "$ks"
-	grep -Fq './install.sh --non-interactive --profile core --install-herdr' "$ks"
+	grep -Fq './install.sh --non-interactive --profile core' "$ks"
+	if grep -Fq -- '--install-herdr' "$ks"; then
+		printf 'Herdr must not be installed by default in %s\n' "$ks" >&2
+		exit 1
+	fi
+	grep -Fq 'scripts/install-gearlever' "$ks"
 	grep -Fq '%include /tmp/dwm-titus-gaming-repo' "$ks"
 	grep -Fq '%include /tmp/dwm-titus-gaming-packages' "$ks"
 	# shellcheck disable=SC2016

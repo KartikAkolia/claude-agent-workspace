@@ -14,7 +14,7 @@ Bindings are defined in `config/hotkeys.toml` and reload instantly on save — n
 | Keys | Action |
 |------|--------|
 | `Super` + `R` | App launcher (Quickshell) |
-| `Super` + `X` | Terminal workspace (Herdr when available) |
+| `Super` + `X` | Alacritty terminal |
 | `Super` + `E` | File manager |
 | `Super` + `B` | Browser |
 | `Super` + `/` | Keybind viewer |
@@ -127,7 +127,7 @@ Edit `config/hotkeys.toml` — changes take effect on save, no recompile require
 
 ```toml
 [vars]
-terminal = "dwm-terminal"
+terminal = "alacritty"
 
 keys = [
   { mod="SUPER SHIFT", key="f", desc="Firefox", func="spawn", exec=["firefox"] },
@@ -137,7 +137,10 @@ keys = [
 See the comments in `hotkeys.toml` for a full list of `func` values and modifier syntax.
 
 The browser binding uses `dwm-default-apps open`. Configure it with
-`dwm-default-apps browsers` and `dwm-default-apps set-browser <desktop-id>`.
+Settings -> Defaults or with `dwm-default-apps browsers` and
+`dwm-default-apps set-browser <desktop-id>`.
 
-The default `dwm-terminal` wrapper opens Herdr inside Alacritty when Herdr is
-installed. Set `DWM_HERDR=0` to keep the same binding as a plain terminal.
+The terminal variable defaults to Alacritty. Settings -> Defaults can select a
+validated installed terminal without changing the `Super`+`X` key record. To
+use the optional Herdr workspace, install it explicitly, change the binding to
+`dwm-terminal`, and set `DWM_HERDR=1` in the session environment.

@@ -8,6 +8,30 @@ to update dwm, Quickshell, terminal, GTK, and Qt styling. No restart needed.
 theme = "nord"   # ← change this line to switch themes
 ```
 
+The managed transaction helper is the safe command-line interface for theme
+changes:
+
+```sh
+dwm-settings-theme preview preview-1 15 dracula
+dwm-settings-theme keep preview-1       # confirm before the timeout
+dwm-settings-theme revert preview-1     # or restore immediately
+dwm-settings-theme abandon preview-1    # accept a conflicting external edit
+dwm-settings-theme apply gruvbox
+dwm-settings-theme reset                # restore the managed default selection
+```
+
+An unconfirmed preview restores the exact previous `themes.toml` bytes and
+mode automatically. Apply and reset preserve comments, custom theme sections,
+and unrelated appearance settings. If an operation is interrupted after its
+atomic write, inspect and restore it with:
+
+```sh
+dwm-settings-theme recovery-status
+dwm-settings-theme recover
+```
+
+Recovery refuses to overwrite an externally changed theme file.
+
 ---
 
 ## Available Themes
@@ -99,8 +123,51 @@ Open the Control Center with <kbd>Super</kbd> + <kbd>F1</kbd>, navigate to **App
 ---
 ## Wallpapers
 
-Place images in `~/Pictures/backgrounds/`. Use `Super` + `Shift` + `W` to randomize, or set a specific one:
+Place images in `~/Pictures/backgrounds/`. Open **Settings → Appearance** to
+select an image, choose its fit, preview it for 30 seconds, apply it, or reset
+to the random session default. Use `Super` + `Shift` + `W` or
+`dwm-settings-wallpaper randomize` for a one-off random wallpaper in the
+current session, or persist a specific image and fit from a terminal:
 
 ```bash
-feh --bg-fill ~/Pictures/backgrounds/mywall.jpg
+dwm-settings-wallpaper apply "$HOME/Pictures/backgrounds/mywall.jpg" fill
 ```
+
+Supported fit modes are `center`, `fill`, `max`, `scale`, and `tile`. Preview a
+choice for 30 seconds before keeping it:
+
+```bash
+token="wallpaper-$$"
+dwm-settings-wallpaper preview "$token" 30 \
+  "$HOME/Pictures/backgrounds/mywall.jpg" max
+dwm-settings-wallpaper keep "$token"
+```
+
+Use `dwm-settings-wallpaper reset` to return to the session's random-fill
+default. If a saved image is removed, login remains usable and falls back to
+that default until another image is selected or the setting is reset.
+
+---
+## Fonts and Text Size
+
+Open **Settings -> Appearance** to select an installed Fontconfig family and a
+managed shell text scale from 80, 90, 100, 110, 125, or 150 percent. The icon
+font remains the shipped Meslo Nerd Font even when ordinary interface text uses
+another family, so changing fonts cannot remove panel or menu glyphs.
+
+Preview changes for 30 seconds before keeping them, or apply and reset from a
+terminal:
+
+```bash
+token="font-$$"
+dwm-settings-font preview "$token" 30 "Noto Sans" 1.25
+dwm-settings-font keep "$token"
+
+dwm-settings-font apply "Noto Sans" 1.10
+dwm-settings-font reset
+```
+
+The setting owns only `font.conf` under the dwm-titus XDG configuration
+directory. A malformed file falls back to the existing Meslo family at 100
+percent without preventing shell startup. GTK and Qt application font policy
+is intentionally deferred to the separate toolkit-control slice.

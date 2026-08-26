@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Widgets
 import qs.core
 
 pragma ComponentBehavior: Bound
@@ -35,6 +34,7 @@ PanelWindow {
     required property var controlsModel
     required property var bluetoothModel
     required property var controlCenterModel
+    required property var powerModel
     required property var powerMenuModel
     required property bool primaryPanel
 
@@ -121,6 +121,7 @@ PanelWindow {
                     PanelPill {
                         Layout.preferredWidth: Math.min(activeTitle.implicitWidth + Theme.pillHorizontalPadding * 2, 260)
                         Layout.preferredHeight: Theme.pillHeight
+                        outlined: true
 
                         UiText {
                             id: activeTitle
@@ -140,6 +141,7 @@ PanelWindow {
             PanelPill {
                 Layout.preferredWidth: clockLabel.implicitWidth + Theme.pillHorizontalPadding * 2
                 Layout.preferredHeight: Theme.pillHeight
+                outlined: true
 
                 UiText {
                     id: clockLabel
@@ -169,6 +171,7 @@ PanelWindow {
                             required property string modelData
                             Layout.preferredWidth: statusLabel.implicitWidth + Theme.pillHorizontalPadding * 2
                             Layout.preferredHeight: Theme.pillHeight
+                            outlined: true
 
                             UiText {
                                 id: statusLabel
@@ -188,9 +191,10 @@ PanelWindow {
 
                     PanelPill {
                         id: batteryPill
-                        visible: root.state.batteryAvailable
+                        visible: root.powerModel.batteryAvailable
                         Layout.preferredWidth: batteryRow.implicitWidth + Theme.compactWidgetHorizontalPadding * 2
                         Layout.preferredHeight: Theme.compactWidgetSize
+                        hovered: batteryMouse.containsMouse
 
                         RowLayout {
                             id: batteryRow
@@ -198,13 +202,13 @@ PanelWindow {
                             spacing: Theme.compactSpacing
 
                             IconText {
-                                text: root.batteryIcon(root.state.batteryPercent, root.state.batteryStatus)
+                                text: root.batteryIcon(root.powerModel.batteryPercent, root.powerModel.batteryStatus)
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelFontSize + 1) * 1.1)
+                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.1)
                             }
 
                             UiText {
-                                text: root.state.batteryPercent.toString() + "%"
+                                text: root.powerModel.batteryPercent.toString() + "%"
                                 color: Theme.textStrong
                                 font.pixelSize: Theme.panelFontSize
                             }
@@ -232,7 +236,7 @@ PanelWindow {
                             IconText {
                                 text: "󰂯"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelFontSize + 1) * 0.9)
+                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 0.9)
                             }
                         }
 
@@ -264,7 +268,7 @@ PanelWindow {
                                 text: root.networkModel.statusText.indexOf("offline") >= 0
                                     || root.networkModel.statusText.indexOf("unavailable") >= 0 ? "󰤭" : "󰤨"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelFontSize + 1) * 1.2)
+                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.2)
                             }
                         }
 
@@ -295,7 +299,7 @@ PanelWindow {
                             IconText {
                                 text: root.controlsModel.volumeMuted ? "󰝟" : "󰕾"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelFontSize + 1) * 1.5)
+                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.5)
                             }
 
                             UiText {
@@ -337,7 +341,7 @@ PanelWindow {
                             anchors.centerIn: parent
                             text: "󰐥"
                             color: Theme.textStrong
-                            font.pixelSize: Math.round((Theme.panelFontSize + 1) * 1.08)
+                            font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.08)
                         }
 
                         MouseArea {
@@ -365,10 +369,10 @@ PanelWindow {
     }
 
     PanelTooltip {
-        visible: root.state.batteryAvailable && batteryMouse.containsMouse
+        visible: root.powerModel.batteryAvailable && batteryMouse.containsMouse
         anchorWindow: root
         anchorItem: batteryPill
-        label: root.state.batteryPercent.toString() + "% - " + root.state.batteryStatus
+        label: root.powerModel.batteryPercent.toString() + "% - " + root.powerModel.batteryStatus
         anchorY: Theme.panelHeight
         rightAligned: true
     }

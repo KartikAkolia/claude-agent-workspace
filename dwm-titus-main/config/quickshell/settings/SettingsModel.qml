@@ -16,6 +16,14 @@ Scope {
     property string platformFamily: "unknown"
     property string platformName: "Unknown Linux"
     property var targetScreen: null
+    property var networkModel: null
+    property var bluetoothModel: null
+    property var controlsModel: null
+    property var powerModel: null
+    property var powerMenuModel: null
+    property var defaultsModel: null
+    property var autostartModel: null
+    property var appearanceModel: null
     property var capabilities: []
     property int selectedIndex: 0
     property var displayOutputs: []
@@ -87,10 +95,56 @@ Scope {
         });
     }
 
+    function watchOwnerArguments() {
+        const stat = watchOwnerStat.text().trim();
+        const commandEnd = stat.lastIndexOf(") ");
+        if (commandEnd < 0) return [Quickshell.processId.toString(), ""];
+        const fields = stat.substring(commandEnd + 2).trim().split(/\s+/);
+        const starttime = fields.length >= 20 ? fields[19] : "";
+        return [Quickshell.processId.toString(), /^[1-9][0-9]*$/.test(starttime) ? starttime : ""];
+    }
+
     function activateSection(id) {
         displayWatchProcess.running = id === "displays" && root.visible;
         inputWatchProcess.running = id === "input" && root.visible;
 			if (id !== "input") inputSettleTimer.stop();
+        if (root.networkModel) {
+            const wantNetwork = id === "network" && root.visible;
+            if (wantNetwork && !root.networkModel.settingsVisible) root.networkModel.openSettings();
+            else if (!wantNetwork && root.networkModel.settingsVisible) root.networkModel.closeSettings();
+        }
+        if (root.bluetoothModel) {
+            const wantBluetooth = id === "bluetooth" && root.visible;
+            if (wantBluetooth && !root.bluetoothModel.settingsVisible) root.bluetoothModel.openSettings();
+            else if (!wantBluetooth && root.bluetoothModel.settingsVisible) root.bluetoothModel.closeSettings();
+        }
+        if (root.controlsModel) {
+            const wantAudio = id === "audio" && root.visible;
+            if (wantAudio && !root.controlsModel.settingsVisible) root.controlsModel.openSettings();
+            else if (!wantAudio && root.controlsModel.settingsVisible) root.controlsModel.closeSettings();
+        }
+        if (root.powerModel) {
+            const wantPower = id === "power" && root.visible;
+            if (wantPower && !root.powerModel.settingsVisible) root.powerModel.openSettings();
+            else if (!wantPower && root.powerModel.settingsVisible) root.powerModel.closeSettings();
+        }
+        if (id !== "power" && root.powerMenuModel)
+            root.powerMenuModel.cancelConfirmation("settings");
+        if (root.defaultsModel) {
+            const wantDefaults = id === "defaults" && root.visible;
+            if (wantDefaults && !root.defaultsModel.settingsVisible) root.defaultsModel.openSettings();
+            else if (!wantDefaults && root.defaultsModel.settingsVisible) root.defaultsModel.closeSettings();
+        }
+        if (root.autostartModel) {
+            const wantAutostart = id === "defaults" && root.visible;
+            if (wantAutostart && !root.autostartModel.settingsVisible) root.autostartModel.openSettings();
+            else if (!wantAutostart && root.autostartModel.settingsVisible) root.autostartModel.closeSettings();
+        }
+        if (root.appearanceModel) {
+            const wantAppearance = id === "appearance" && root.visible;
+            if (wantAppearance && !root.appearanceModel.settingsVisible) root.appearanceModel.openSettings();
+            else if (!wantAppearance && root.appearanceModel.settingsVisible) root.appearanceModel.closeSettings();
+        }
         if (id === "displays") root.refreshDisplays();
         if (id === "input") root.refreshInput();
     }
@@ -471,6 +525,14 @@ Scope {
         inputDiscoverProcess.running = false;
         displayWatchProcess.running = false;
         inputWatchProcess.running = false;
+		if (root.networkModel) root.networkModel.closeSettings();
+		if (root.bluetoothModel) root.bluetoothModel.closeSettings();
+		if (root.controlsModel) root.controlsModel.closeSettings();
+		if (root.powerModel) root.powerModel.closeSettings();
+		if (root.powerMenuModel) root.powerMenuModel.cancelConfirmation("settings");
+		if (root.defaultsModel) root.defaultsModel.closeSettings();
+		if (root.autostartModel) root.autostartModel.closeSettings();
+		if (root.appearanceModel) root.appearanceModel.closeSettings();
 			inputSettleTimer.stop();
         root.visible = false;
         root.busy = false;
@@ -500,6 +562,13 @@ Scope {
         }
     }
 
+    FileView {
+        id: watchOwnerStat
+        path: "/proc/" + Quickshell.processId.toString() + "/stat"
+        blockLoading: true
+        printErrors: false
+    }
+
     Process {
         id: displayDiscoverProcess
         command: Commands.settingsDisplayCommand("discover")
@@ -518,14 +587,14 @@ Scope {
 
     Process {
         id: displayWatchProcess
-        command: Commands.settingsDisplayCommand("watch")
+        command: Commands.settingsDisplayCommand("watch", root.watchOwnerArguments())
         running: false
         stdout: SplitParser { onRead: root.refreshDisplays() }
     }
 
     Process {
         id: inputWatchProcess
-        command: Commands.settingsInputCommand("watch")
+        command: Commands.settingsInputCommand("watch", root.watchOwnerArguments())
         running: false
 			stdout: SplitParser { onRead: inputSettleTimer.restart() }
     }

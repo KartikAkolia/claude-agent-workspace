@@ -9,9 +9,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 test_uid=$(id -u)
 
-mkdir -p "$work/bin" "$work/config/dwm-titus" "$work/home/Pictures/backgrounds" "$work/data/dwm-titus/config/quickshell" "$work/power-state"
+mkdir -p "$work/bin" "$work/config/dwm-titus" "$work/home/Pictures/backgrounds" \
+	"$work/data/dwm-titus/config/quickshell" "$work/state" "$work/runtime" "$work/power-state"
 mkdir -p "$work/config/quickshell"
 cp "$repo/config/themes.toml" "$work/config/dwm-titus/themes.toml"
+cp "$repo/config/themes.toml" "$work/data/dwm-titus/config/themes.toml"
 cp "$repo/config/hotkeys.toml" "$work/config/dwm-titus/hotkeys.toml"
 : >"$work/data/dwm-titus/config/quickshell/shell.qml"
 : >"$work/config/quickshell/shell.qml"
@@ -26,7 +28,7 @@ SH
 	chmod +x "$work/bin/$name"
 }
 
-for name in quickshell xprop dwm-quickshell-launcher dwm-quickshell-controlcenter dex picom feh maim notify-send pactl brightnessctl xset gsettings light-locker setsid dwm-terminal dwm-default-apps xdg-open nwg-look pkill pgrep dnf; do
+for name in quickshell xprop dwm-quickshell-launcher dwm-quickshell-controlcenter dex picom feh maim notify-send pactl brightnessctl xset gsettings light-locker setsid dwm-terminal dwm-default-apps dwm-settings-wallpaper xdg-open nwg-look pkill pgrep dnf; do
 	stub_command "$name"
 done
 
@@ -192,12 +194,21 @@ esac
 SH
 chmod +x "$work/bin/pactl"
 
+cat >"$work/bin/theme-apply-stub" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$work/bin/theme-apply-stub"
+
 run_helper() {
 	DWM_TEST_LOG="$work/actions.log" \
 		DWM_TEST_SYNC=1 \
 		HOME="$work/home" \
 		XDG_CONFIG_HOME="$work/config" \
 		XDG_DATA_HOME="$work/data" \
+		XDG_STATE_HOME="$work/state" \
+		XDG_RUNTIME_DIR="$work/runtime" \
+		DWM_APPEARANCE_APPLY_HELPER="$work/bin/theme-apply-stub" \
 		DWM_TEST_POWER_STATE="$work/power-state" \
 		DWM_TEST_MODE=1 \
 		DWM_TEST_QUICKSHELL_VERSION="${DWM_TEST_QUICKSHELL_VERSION:-0.3.0}" \
@@ -246,6 +257,11 @@ printf '%s\n' "$outdated_health" | grep -Fqx 'error	Quickshell	Outdated'
 fc43_health=$(DWM_TEST_QUICKSHELL_VERSION=0.2.1^git20260209.dacfa9d-3.fc43 run_helper health)
 printf '%s\n' "$fc43_health" | grep -Fqx 'error	Quickshell	Outdated'
 
+sed -i 's/^\[active\]$/  [active] # retained header comment/' \
+	"$work/config/dwm-titus/themes.toml"
+sed -i 's/^\[theme.dracula\]$/  [theme.dracula] # retained theme comment/' \
+	"$work/config/dwm-titus/themes.toml"
+
 info=$(run_helper info)
 printf '%s\n' "$info" | grep -Fqx 'Theme	nord'
 printf '%s\n' "$info" | grep -Fqx 'Audio	PipeWire'
@@ -261,7 +277,22 @@ grep -Fq 'theme = "dracula"' "$work/config/dwm-titus/themes.toml"
 if run_helper theme-set missing-theme 2>"$work/theme-set.err"; then
 	exit 1
 fi
-grep -Fqx 'unknown theme: missing-theme' "$work/theme-set.err"
+grep -Fq 'theme is unavailable, invalid, or the source is unsafe to mutate: missing-theme' \
+	"$work/theme-set.err"
+
+mkdir -p "$work/prefix/bin"
+cp "$repo/scripts/dwm-quickshell-controlcenter" "$work/prefix/bin/"
+rm "$work/config/dwm-titus/themes.toml"
+installed_themes=$(HOME="$work/home" XDG_CONFIG_HOME="$work/config" \
+	XDG_DATA_HOME="$work/data" "$work/prefix/bin/dwm-quickshell-controlcenter" themes)
+printf '%s\n' "$installed_themes" | grep -Fqx 'active	nord'
+printf '%s\n' "$installed_themes" | grep -Fqx 'available	dracula'
+cp "$work/data/dwm-titus/config/themes.toml" "$work/config/dwm-titus/themes.toml"
+
+rm "$work/config/dwm-titus/themes.toml" "$work/data/dwm-titus/config/themes.toml"
+run_helper theme-set dracula >"$work/theme-set-source.out"
+grep -Fqx 'theme	dracula' "$work/theme-set-source.out"
+grep -Fq 'theme = "dracula"' "$work/config/dwm-titus/themes.toml"
 
 keybinds=$(run_helper keybinds)
 printf '%s\n' "$keybinds" | grep -Fqx 'Super + r	App launcher'
@@ -384,10 +415,21 @@ grep -Fqx 'nwg-look is unavailable' "$work/gtk-settings.err"
 : >"$work/actions.log"
 run_helper action reload-wallpaper >"$work/reload-wallpaper.out"
 grep -Fqx 'action	reload-wallpaper' "$work/reload-wallpaper.out"
-grep -Fq "feh --randomize --bg-fill $work/home/Pictures/backgrounds/wallpaper.png" "$work/actions.log"
+grep -Fqx 'dwm-settings-wallpaper randomize' "$work/actions.log"
+if grep -Fq 'feh --randomize --bg-fill' "$work/actions.log"; then
+	printf 'Managed wallpaper reload bypassed the settings helper\n' >&2
+	exit 1
+fi
+
+: >"$work/actions.log"
+DWM_SETTINGS_WALLPAPER_HELPER=$work/missing-wallpaper-helper \
+	run_helper action reload-wallpaper >"$work/legacy-reload-wallpaper.out"
+grep -Fq "feh --randomize --bg-fill $work/home/Pictures/backgrounds/wallpaper.png" \
+	"$work/actions.log"
 
 rm -f "$work/home/Pictures/backgrounds/wallpaper.png"
-if run_helper action reload-wallpaper 2>"$work/reload-wallpaper.err"; then
+if DWM_SETTINGS_WALLPAPER_HELPER=$work/missing-wallpaper-helper \
+	run_helper action reload-wallpaper 2>"$work/reload-wallpaper.err"; then
 	exit 1
 fi
 grep -Fqx "no loadable wallpaper images found in $work/home/Pictures/backgrounds" "$work/reload-wallpaper.err"
@@ -397,14 +439,16 @@ if run_helper action not-real 2>"$work/action.err"; then
 fi
 grep -Fqx 'unknown action: not-real' "$work/action.err"
 
-grep -Fq 'watchChanges: true' "$repo/config/quickshell/core/Theme.qml"
-grep -Fq 'themes.toml' "$repo/config/quickshell/core/Theme.qml"
+grep -Fq 'watchChanges: true' "$repo/config/quickshell/appearance/AppearanceModel.qml"
+[ "$(grep -Fc 'watchChanges: true' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 5 ]
+[ "$(grep -Fc 'onFileChanged: reload()' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 6 ]
+grep -Fq 'themes.toml' "$repo/config/quickshell/appearance/AppearanceModel.qml"
 grep -Fq 'ClickAwayPopup {' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
 grep -Fq 'onDismissed: controlCenterModel.close()' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
 grep -Fq 'grabFocus: true' "$repo/config/quickshell/core/ClickAwayPopup.qml"
-grep -Fq 'function applyThemes(themeText)' "$repo/config/quickshell/core/Theme.qml"
-grep -Fq 'root.text = value("normfgcolor", root.text)' "$repo/config/quickshell/core/Theme.qml"
-grep -Fq 'text: root.busy ? "Connecting..." : "Connect"' "$repo/config/quickshell/network/NetworkWifiRow.qml"
+grep -Fq 'function applyAppearanceColors(colors, darkMode)' "$repo/config/quickshell/core/Theme.qml"
+grep -Fq 'root.text = colors.text' "$repo/config/quickshell/core/Theme.qml"
+grep -Fq 'label: root.delegated ? "Advanced" : root.busy ? "Connecting..." : "Connect"' "$repo/config/quickshell/network/NetworkWifiRow.qml"
 grep -Fq 'property bool wifiPasswordPromptVisible: false' "$repo/config/quickshell/network/NetworkModel.qml"
 grep -Fq 'root.wifiPasswordPromptVisible = true;' "$repo/config/quickshell/network/NetworkModel.qml"
 grep -Fq 'root.networkModel.cancelWifiPasswordPrompt()' "$repo/config/quickshell/network/NetworkWindow.qml"
@@ -453,7 +497,7 @@ grep -Fq 'root.wifiPasswordPromptVisible && root.selectedWifiIndex < 0' "$repo/c
 grep -Fq 'args.push("--password-stdin");' "$repo/config/quickshell/network/NetworkModel.qml"
 grep -Fq 'args.push(network.security);' "$repo/config/quickshell/network/NetworkModel.qml"
 grep -Fq 'stdinEnabled: true' "$repo/config/quickshell/network/NetworkModel.qml"
-test "$(grep -Fc 'if (root.busy || actionProcess.running) {' "$repo/config/quickshell/network/NetworkModel.qml")" -eq 3
+test "$(grep -Fc 'root.busy || actionProcess.running' "$repo/config/quickshell/network/NetworkModel.qml")" -eq 4
 if grep -Fq 'args.push(root.wifiPassword)' "$repo/config/quickshell/network/NetworkModel.qml"; then
 	exit 1
 fi
@@ -509,8 +553,14 @@ grep -Fq 'onFocusRequested: windowId => root.state.focusWindow(windowId)' "$repo
 grep -Fq 'source: Icons.launcherIcon(root.app.appClass)' "$repo/config/quickshell/panel/RunningAppItem.qml"
 grep -Fq 'root.state.activeWindowTitle' "$repo/config/quickshell/panel/DwmPanel.qml"
 grep -Fq 'root.state.statusSegments' "$repo/config/quickshell/panel/DwmPanel.qml"
-grep -Fq 'root.state.batteryPercent.toString() + "%"' "$repo/config/quickshell/panel/DwmPanel.qml"
-grep -Fq 'visible: root.state.batteryAvailable' "$repo/config/quickshell/panel/DwmPanel.qml"
+grep -Fq 'required property var powerModel' "$repo/config/quickshell/panel/DwmPanel.qml"
+grep -Fq 'root.powerModel.batteryPercent.toString() + "%"' "$repo/config/quickshell/panel/DwmPanel.qml"
+grep -Fq 'visible: root.powerModel.batteryAvailable' "$repo/config/quickshell/panel/DwmPanel.qml"
+[ "$(grep -Fc 'PowerModel {' "$repo/config/quickshell/shell.qml")" -eq 1 ]
+grep -Fq 'powerModel: powerModel' "$repo/config/quickshell/shell.qml"
+if grep -Fq 'visible: root.state.batteryAvailable' "$repo/config/quickshell/panel/DwmPanel.qml"; then
+	exit 1
+fi
 grep -Fq 'root.batteryAvailable = true;' "$repo/config/quickshell/state/DwmState.qml"
 grep -Fq 'trimmed.indexOf("BAT ") === 0' "$repo/config/quickshell/state/DwmState.qml"
 grep -Fq 'color: Theme.barBackground' "$repo/config/quickshell/panel/DwmPanel.qml"

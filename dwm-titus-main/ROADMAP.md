@@ -28,11 +28,74 @@ when optional components fail.
 ## Planning Rules
 
 `SPEC.md` defines the durable product contract. This roadmap defines ordered
-outcomes. `TASKS.md` contains detailed work only for the active phase.
+outcomes. `TASKS.md` contains detailed work only for the active numbered
+product phase and may order that phase into multiple reviewable pull-request
+slices.
 
 A phase may advance only when its exit criteria are validated and remaining
 limitations are recorded. Completed implementation belongs in `CHANGELOG.md`
 and release history rather than in a permanent checked-off task list.
+
+## Integrated Omarchy-Inspired X11 UI Delivery
+
+Status: Integrated into the numbered roadmap; `P3-UI4` is complete in PR #163
+
+The Omarchy-inspired overhaul is not a second roadmap. Its visual and
+interaction work is folded into the existing Fedora product phases while DWM,
+X11, Fedora providers, helpers, IPC, and session policy remain authoritative.
+The `UI-1` through `UI-6` names identify the approved review boundaries from
+the design plan; the `P3-UI4` form identifies where a slice belongs in the
+product roadmap.
+
+- UI-1, semantic theme tokens and shared controls: Phase 3 prerequisite,
+  complete in PR #157.
+- UI-2, DWM command menu and shared launcher model: Phase 3 prerequisite,
+  complete in PR #158 and corrective PR #160.
+- UI-3, panel and existing quick panels: Phase 3 prerequisite, complete in
+  PR #159.
+- P3-UI4, Settings, System Health, notifications, and launcher: complete in
+  PR #163.
+- UI-5, optional X11-native experiences: planned for Phase 5 personalization
+  and accessibility; split backend-heavy work when needed.
+- UI-6, whole-shell integration hardening: planned for Phase 7 image and
+  release qualification, with no major features.
+
+### Integrated Boundaries
+
+- Reuse `themes.toml`, root-scoped state models, installed helpers, IPC names,
+  window titles, X11 surface types, and the existing 30px panel contract.
+- Do not ship Wayland, Hyprland, layer-shell, UWSM, `wl-*`, or Omarchy service
+  and plugin backends.
+- Keep `P3-UI4` visual and interaction focused. Phase 3 provider and action
+  work was delivered in the later, separate PR #164 and PR #166 slices.
+- Keep lock, polkit, idle, power, and background policy on the existing X11 and
+  Fedora implementations.
+- Treat an event-driven clipboard-history backend as a separate review boundary
+  if UI-5 adopts it.
+
+### Integrated Delivery Order
+
+UI-1 is the merged foundation. UI-2 and UI-3 were parallel children and are
+now unified on `main`. `P3-UI4` established the shared large-surface language
+used by the completed Phase 3 provider work and the later power, defaults,
+personalization, accessibility, and system-management phases. Phases 3 and 4
+are complete and product Phase 5 is active. UI-5 candidates are evaluated in
+Phase 5 and approved experiences are delivered as separate review boundaries;
+UI-6 closes the desktop during Phase 7 release qualification.
+
+### UI Overhaul Exit Criteria
+
+- Every converted surface preserves its backend, lifecycle, IPC, X11 focus,
+  click-away, stacking, and monitor-selection behavior.
+- Managed QML contains no Wayland or Hyprland runtime dependency.
+- Focused source checks, Quickshell lint, nested-X11 interaction tests, the full
+  managed repository suite, and real-session manual checks pass.
+- Closed surfaces leave no resident list models, scans, duplicate subscriptions,
+  or overlapping helper commands, and the mean idle CPU delta remains within
+  0.5 percentage points of one CPU.
+- The final approved revision is synchronized through
+  `scripts/dev-sync-install.sh`, with installed parity and any required
+  logout/login activation gate recorded.
 
 ## Phase 1: Settings Platform Foundation
 
@@ -141,7 +204,7 @@ Make common monitor and input changes available from the Settings application.
 
 ## Phase 3: Connectivity and Audio
 
-Status: Ready to start (2026-08-15)
+Status: Complete (2026-08-21)
 
 ### Objective
 
@@ -155,14 +218,41 @@ Provide desktop-grade network, Bluetooth, and sound management.
 - Output and input device selection, volume, mute, per-application streams, and
   microphone visibility through PipeWire/WirePlumber-compatible interfaces.
 - Event-driven updates with bounded command execution and no overlapping polls.
+- Omarchy-inspired large-surface styling for Settings, System Health,
+  notifications, and the application launcher, using the merged design system
+  without changing their providers or X11 contracts.
 
 ### Exit Criteria
 
 - Common connection and audio workflows no longer require a terminal.
 - Authentication cancellation and service unavailability fail safely.
 - Existing panel quick controls remain synchronized with Settings.
+- The converted large surfaces preserve their existing IPC, focus, lifecycle,
+  privilege, and backend behavior in real and nested X11 sessions.
+
+### Completion Evidence
+
+- PR #163 completed the large-surface visual integration while preserving the
+  existing Settings, System Health, notification, launcher, IPC, focus, and X11
+  contracts in real and nested sessions.
+- PR #164 added shared versioned NetworkManager and BlueZ providers, fixed
+  bounded actions, secret-safe Wi-Fi handling, real Ethernet, adapter, and
+  discovery qualification, and explicit delegation for advanced workflows.
+- PR #166 added the native-first shared PipeWire model, bounded versioned audio
+  inventory, output/input/stream workflows, generation-checked fallback, and
+  real Fedora output, microphone, and application-stream qualification.
+- The managed clean build and full repository suite passed. The active X11
+  session retained exactly one NetworkManager and one media subscription, no
+  native-overlapping audio fallback, and a 0.000 percentage-point Quickshell
+  CPU delta after every Settings section was opened and closed.
+- The host had no Wi-Fi adapter, so real Wi-Fi association and authentication
+  remain fixture-qualified. Bluetooth adapter and discovery were qualified,
+  but pairing recovery remains fixture-qualified because no sacrificial device
+  was available. These limitations are recorded in the Phase 3 evidence files.
 
 ## Phase 4: Power, Session, and Defaults
+
+Status: Complete (2026-08-22)
 
 ### Objective
 
@@ -184,7 +274,30 @@ Unify normal session behavior and application defaults.
 - Destructive power actions keep confirmation and authorization boundaries.
 - Defaults are visible through standard XDG inspection tools.
 
+### Completion Evidence
+
+- PR #168 delivered the shared Power and session-action models, transactional
+  default-application management, XDG autostart controls, event-driven provider
+  lifecycle, and Fedora package/install integration.
+- The clean build, full managed repository suite, Quickshell lint, focused shell
+  checks, nested-X11 workflows, and exact-head hosted checks passed. Reversible
+  live power, browser, file-manager, MIME, and autostart mutations converged and
+  restored their recorded baselines.
+- After installation, a fresh Fedora 44 LightDM X11 login ran the installed DWM
+  byte-for-byte, launched one managed Quickshell instance with one panel per
+  active monitor and tray clients, and passed user acceptance of the Phase 4
+  Settings and confirmation surfaces. The observed upgrade login reached DWM
+  and Quickshell without retries or duplicate processes; the active DWM now
+  owns the bounded completion-aware logout path.
+- Battery and lid transitions remain fixture-qualified because this workstation
+  has neither device. Actual suspend, reboot, and shutdown were not executed;
+  their confirmation, authorization-denial, fixed-command, and failure paths are
+  automated. Real `startx` and repeated destructive login cycles also remain
+  fixture-qualified.
+
 ## Phase 5: Personalization and Accessibility
+
+Status: Active (2026-08-22)
 
 ### Objective
 

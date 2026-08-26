@@ -55,24 +55,16 @@ ClickAwayPopup {
             enabled: !root.networkModel.wifiPasswordPromptVisible
             spacing: Theme.popupSpacing
 
-            RowLayout {
+            PanelHero {
                 Layout.fillWidth: true
-                spacing: Theme.rowSpacing
-
-                Text {
-                    Layout.fillWidth: true
-                    text: root.networkModel.statusText
-                    color: Theme.text
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.titleFontSize
-                    font.bold: true
-                    elide: Text.ElideRight
-                    verticalAlignment: Text.AlignVCenter
-                }
+                iconText: root.networkModel.statusText.indexOf("offline") >= 0
+                    || root.networkModel.statusText.indexOf("unavailable") >= 0 ? "󰤭" : "󰤨"
+                iconColor: root.networkModel.statusText.indexOf("unavailable") >= 0
+                    ? Theme.menuMutedText : Theme.popupText
+                title: "Network"
+                subtitle: root.networkModel.statusText
 
                 ShellButton {
-                    Layout.preferredWidth: implicitWidth
-                    Layout.preferredHeight: Theme.buttonHeight
                     label: "Scan"
                     enabled: !root.networkModel.busy
                     onActivated: root.networkModel.refresh(true)
@@ -88,6 +80,8 @@ ClickAwayPopup {
                 font.pixelSize: Theme.smallFontSize
                 elide: Text.ElideRight
             }
+
+            PanelSeparator {}
 
             SectionLabel {
                 label: "Active"
@@ -106,6 +100,7 @@ ClickAwayPopup {
                     width: ListView.view.width
                     profile: modelData
                     active: true
+                    actionsEnabled: root.networkModel.actionsAvailable && !root.networkModel.busy
                     onDisconnectRequested: device => root.networkModel.disconnectDevice(device)
                 }
             }
@@ -138,6 +133,8 @@ ClickAwayPopup {
                     network: modelData
                     selected: index === root.networkModel.selectedWifiIndex
                     busy: root.networkModel.busy
+                    actionsEnabled: root.networkModel.actionsAvailable
+                    delegated: !root.networkModel.supportsFixedWifiSecurity(modelData.security)
                     onSelectedRequested: root.networkModel.selectWifi(index)
                     onConnectRequested: network => {
                         root.networkModel.selectWifi(index);
@@ -172,6 +169,7 @@ ClickAwayPopup {
                     width: ListView.view.width
                     profile: modelData
                     active: false
+                    actionsEnabled: root.networkModel.actionsAvailable && !root.networkModel.busy
                     onConnectRequested: profile => root.networkModel.connectProfile(profile)
                 }
             }
@@ -203,6 +201,7 @@ ClickAwayPopup {
             title: "dwm network password"
             screen: root.panelWindow ? root.panelWindow.screen : null
             visible: root.networkModel.wifiPasswordPromptVisible
+                && root.networkModel.wifiPasswordPromptOrigin === "panel"
             implicitWidth: 440
             implicitHeight: 210
             color: Theme.transparent
@@ -225,9 +224,9 @@ ClickAwayPopup {
             Rectangle {
                 anchors.fill: parent
                 focus: true
-                color: Theme.surface
-                border.color: Theme.accent
-                border.width: 1
+                color: Theme.popupBackground
+                border.color: Theme.popupBorder
+                border.width: Theme.controlBorderWidth
                 radius: Theme.radius
 
                 Keys.onPressed: function(event) {
@@ -271,9 +270,10 @@ ClickAwayPopup {
                         Rectangle {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            color: Theme.bg
-                            border.color: wifiPasswordInput.activeFocus ? Theme.accent : Theme.border
-                            border.width: 1
+                            color: Theme.controlNormalFill
+                            border.color: wifiPasswordInput.activeFocus ? Theme.controlFocusBorder : Theme.controlNormalBorder
+                            border.width: wifiPasswordInput.activeFocus
+                                ? Theme.controlFocusBorderWidth : Theme.controlBorderWidth
                             radius: Theme.radius
 
                             TextInput {
