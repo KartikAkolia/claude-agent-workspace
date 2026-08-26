@@ -185,6 +185,14 @@ Separately, Cloudflare's own zone-health checks flagged the bare `kartikpassbolt
 
 `claude-agent-workspace` (this `Github` root) and `loopwire` (`personal-website`, separate GitHub repo/remote) each had local commits ahead of `origin` from the work above — both clean otherwise. Pushed both (`7b3ead8..e5ae367` on `master`, `06b68bd..69aac74` on `main`) and confirmed `git status -sb` shows no ahead/behind divergence on either.
 
+### This session's work (2026-08-27): `java-calculator` — keystroke-level input validation, then intentionally left uncommitted
+
+Kartik asked for numeric input validation on a separate Java Swing calculator project (`java-calculator/`, not part of this repo's own scaffold — deliberately gitignored, see below). A literal "only numbers" reading would have broken the scientific mode's typed-expression workflow, so three options were put to him before writing code (keystroke-level expression-grammar filtering / literal digits-only field / non-blocking visual validation); he picked keystroke-level filtering. Implementation: `Tokenizer.isValidChar(char)` in the engine layer (single source of truth for which characters can ever appear in a valid expression), re-exported via `ExpressionEvaluator.isValidChar(char)`, consumed by a new `ExpressionDocumentFilter` installed on the display field's `Document` — blocks invalid characters on both typing and paste. One bug caught before shipping: the same filter would have mangled app-generated text (error messages containing `:`) if it governed every write, not just user keystrokes; fixed with a `CalculatorFrame.setDisplayText()` helper that detaches the filter for programmatic writes only. Verified with a new unit test, an off-screen `PlainDocument` harness (no live display touched, consistent with this project's standing rule against simulating input on Kartik's real desktop session), and a clean `mvn verify` (21/21 tests, checkstyle, package). Docs updated: `java-calculator/README.md` (Features list, project layout, build instructions) and `java-calculator/docs/BUILD_LOG.md` (§12).
+
+Earlier the same overall effort (not detailed here since `java-calculator/docs/BUILD_LOG.md` is the authoritative log): the calculator was built from scratch with a Swing+FlatLaf GUI, then audited for code quality with an explicit LOC-reduction goal — three refactors were proposed, and honestly measured to net zero lines despite real deduplication (Java's per-file/per-override ceremony ate the savings); Kartik chose to keep all three anyway, prioritizing reduced duplication over the raw line-count target.
+
+**Kartik's explicit choice: `java-calculator/` stays out of git entirely** — added to this repo's root `.gitignore` rather than committed, same treatment as `pi-homelab/`, `personal-website/`, and `fishing-locations/`. If this project comes up again, `java-calculator/README.md` and `java-calculator/docs/BUILD_LOG.md` are the source of truth for its status, not this file — and remember it won't show up in `git log`/`git status` here since it's ignored.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -202,6 +210,7 @@ Separately, Cloudflare's own zone-health checks flagged the bare `kartikpassbolt
 - `personal-website/` — the Loopwire project, live at `https://loopwire.kartikpassbolt.org`. Its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` are the source of truth for its status, not this file.
 - `docs/vaultwarden-pi-setup.md` — the separate Raspberry Pi 5 Vaultwarden instance: user-invite flow and the plaintext-to-Argon2 `ADMIN_TOKEN` migration.
 - `docs/cloudflare-zone-settings.md` — the `kartikpassbolt.org` Cloudflare zone: what was hardened (WAF entrypoint, Smart Tiered Cache, Early Hints, DNSSEC, root/www redirect) and what's deliberately left for Kartik (2FA, Hotlink Protection, HSTS preload).
+- `java-calculator/` — a Java Swing calculator project, gitignored on purpose (Kartik's explicit choice, not tracked in this or any repo). Won't show up in `git log`/`git status` here — its own `java-calculator/README.md` and `java-calculator/docs/BUILD_LOG.md` are the source of truth for status.
 
 ## Open items for Kartik
 
