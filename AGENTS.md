@@ -4,7 +4,7 @@ Read this before every task. `SPEC.md` is the product contract; this file covers
 
 ## Non-Negotiables (rules that override the rest)
 
-1. Never write into `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, or `winutil-main/`. They are ChrisTitusTech's reference clones, read-only research material, not this project's own code.
+1. Never hand-edit `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, or `winutil-main/`. They are ChrisTitusTech's reference clones, read-only research material, not this project's own code. The one exception: an explicit, Kartik-authorized wholesale resync of a mirror with its GitHub upstream (via `refresh-reference-clone.sh`), which replaces a mirror's content outright rather than editing it — still never mix your own changes into one.
 2. Never fabricate what's installed, configured, or delivered. Verify by reading the actual file or the actual tool output before reporting something done.
 3. Ask before a decision only Kartik can make (which repo gets scaffolding, which connectors to wire up, whether to force a structural code merge). Don't guess and proceed on those.
 
@@ -12,7 +12,7 @@ Read this before every task. `SPEC.md` is the product contract; this file covers
 
 - `claude-agent-templates/`: blank AGENTS.md/SPEC.md/ROADMAP.md/TASKS.md/CLAUDE.md/GEMINI.md templates, plus the research notes they were distilled from (`agent-scaffold-guide.md`, `titus-ai-windows-setup.md`, `titus-ai-windows-packages-research.md`). Reusable scaffolding for Kartik's own future repos, kept blank on purpose. Copy these out to a real project before filling them in, don't fill them in here.
 - `productivity/`: Cowork's productivity-skill artifact. A kanban dashboard (`dashboard.html`), its own `TASKS.md` (Active/Waiting On/Someday/Done convention, unrelated to this file's `TASKS.md`), and Cowork's memory file (`CLAUDE.md`, unrelated to Claude Code's per-repo `CLAUDE.md` despite the shared name).
-- `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`: ChrisTitusTech's own repos, downloaded as research material for the AGENTS.md convention. Read-only reference. Do not edit.
+- `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`: ChrisTitusTech's own repos, downloaded as research material for the AGENTS.md convention. Read-only reference. Do not edit by hand; `refresh-reference-clone.sh <owner/repo> <branch> <local-dir>` resyncs one from its upstream tarball when asked.
 - `docs/vscode-integration-plan.md`: the five-phase plan for bringing this setup into VS Code, with a running status log of what's actually done, declined, or on hold.
 - `docs/handoff.md`: continuity note for Cowork sessions. Read this and the files it points to before resuming work after a session gap.
 
