@@ -79,6 +79,39 @@ kartikpassbolt.org. 3600 IN DS 2371 13 2 25E366A3280339758EB5C8F73CA845C53DEC374
 - Digest: `25E366A3280339758EB5C8F73CA845C53DEC374CD86E32AC9A02224A65569357`
 
 Added at Namecheap (Domain → Advanced DNS → DNSSEC) 2026-08-26.
-Cloudflare-side status was still `pending` as of the last check before
-propagation was confirmed — see git history/session notes for the
-final confirmed-active timestamp if this doc wasn't updated after.
+Confirmed propagated: `GET /zones/{id}/dnssec` → `status: active`.
+
+## Root + www redirect (2026-08-26)
+
+Cloudflare's own zone-health checks flagged `kartikpassbolt.org` and
+`www.kartikpassbolt.org` as unreachable — neither had an A/AAAA/CNAME
+record, so a visitor hitting either directly got a connection error.
+Kartik confirmed he wants both to redirect to the real site,
+`loopwire.kartikpassbolt.org` (see `personal-website/ROADMAP.md` Phase
+4), rather than actually serving content at the bare root.
+
+Implemented the standard Cloudflare pattern for this:
+
+- Two proxied (orange-cloud) `A` records added, both pointing at the
+  documentation/reserved dummy IP `192.0.2.1` — never actually
+  contacted, since Cloudflare intercepts the request before it would
+  reach an origin, as long as the record is proxied and a redirect
+  rule matches:
+   - `kartikpassbolt.org` → `192.0.2.1`
+   - `www.kartikpassbolt.org` → `192.0.2.1`
+- One Redirect Rule (Single Redirect, free-plan feature) deployed to
+  the `http_request_dynamic_redirect` phase entrypoint: matches
+  `http.host eq "kartikpassbolt.org"` or `http.host eq
+  "www.kartikpassbolt.org"`, `301`-redirects to
+  `https://loopwire.kartikpassbolt.org` with the original path and
+  query string preserved (`concat("https://loopwire.kartikpassbolt.org",
+  http.request.uri.path)`, `preserve_query_string: true`).
+
+Verified live via `curl -o /dev/null -w '%{http_code} -> %{redirect_url}'`:
+`kartikpassbolt.org/` and `kartikpassbolt.org/dashboard/` both `301` to
+the matching `loopwire.kartikpassbolt.org` path; `www.kartikpassbolt.org/`
+same. One false alarm along the way: Kartik's own browser initially
+showed "server IP address could not be found" for `www` — that was his
+machine's local DNS cache, not a real propagation issue (public
+resolvers Cloudflare/Google/Quad9 all resolved it correctly at the
+time); resolved by clearing the browser cache.
