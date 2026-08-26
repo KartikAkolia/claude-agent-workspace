@@ -193,6 +193,10 @@ Earlier the same overall effort (not detailed here since `java-calculator/docs/B
 
 **Kartik's explicit choice: `java-calculator/` stays out of git entirely** — added to this repo's root `.gitignore` rather than committed, same treatment as `pi-homelab/`, `personal-website/`, and `fishing-locations/`. If this project comes up again, `java-calculator/README.md` and `java-calculator/docs/BUILD_LOG.md` are the source of truth for its status, not this file — and remember it won't show up in `git log`/`git status` here since it's ignored.
 
+### This session's work (2026-08-27, cont'd): `spotify-client` install error on `dell-optiplex` — missing menu-spec directory, not a broken package
+
+Kartik hit `xdg-desktop-menu: No writable system menu directory found.` installing `spotify-client` via apt. Diagnosed by reading `xdg-desktop-menu`'s own source rather than guessing: this minimal dwm-titus/quickshell setup never had a full freedesktop menu-spec provider, so `/usr/share/desktop-directories` didn't exist anywhere in `$XDG_DATA_DIRS`, which the script checks unconditionally before installing any `.desktop` file — so Spotify's `.desktop` never actually landed in `/usr/share/applications/`, and the SUPER+r quickshell launcher (which only scans that path) would never have shown it regardless of the visible error. `dpkg` itself considered the package fully configured throughout (no `set -e` in `spotify-client`'s postinst), so `dpkg --configure` correctly refused to help. Fixed with `sudo mkdir -p /usr/share/desktop-directories` plus a manual `sudo xdg-desktop-menu install --novendor /usr/share/spotify/spotify.desktop` re-run; verified the `.desktop` file now exists correctly and `dwm-quickshell-launcher list` returns Spotify. Full detail in `docs/dwm-titus-debian-port.md`'s new "Follow-up (2026-08-27)" section — the fix is permanent for any future GUI `.deb` on this host, not Spotify-specific.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.

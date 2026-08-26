@@ -289,3 +289,20 @@ Kartik asked to diagnose a pattern in `systemctl status lightdm` output: a burst
 Full `journalctl`/`~/.xsession-errors` analysis (using `mcp__headroom__headroom_retrieve` to recover content the tool output had compressed) showed two completely normal, deliberate logout sequences — one about 7 minutes long, the other about 8.5 seconds — with no crashes, segfaults, or errors anywhere in either. `dwm-titus`'s own `scripts/autostop.sh` (the cleanup hook `dwm.c`'s `runautostop()` calls on normal exit — confirmed by grepping `dwm.c` for `autostop`) is exactly what produces this pattern on an ordinary logout: it calls `loginctl terminate-session` for an X11 display-manager session, which is what makes LightDM cycle back to a fresh greeter session immediately afterward. That's expected behavior for *any* logout under this setup, not a symptom of a crash.
 
 This was **not independently confirmed by Kartik against what he was actually seeing at the physical console** — the diagnosis is based entirely on log evidence showing no error condition, and Kartik moved on to other work before responding to that question. Revisit if the same pattern is reported again alongside an actual observed symptom (frozen screen, unexpected logout, etc.) rather than just the systemd status output.
+
+## Follow-up (2026-08-27): `xdg-desktop-menu` error on `apt install spotify-client` — missing menu-spec directory
+
+Kartik hit `xdg-desktop-menu: No writable system menu directory found.` while installing `spotify-client` from Spotify's own apt repo. Root cause, confirmed by reading `xdg-desktop-menu`'s actual source rather than guessing: the script unconditionally checks every entry in `$XDG_DATA_DIRS` (defaults to `/usr/local/share:/usr/share`) for a subdirectory literally named `desktop-directories`, before it ever gets to the step that copies a `.desktop` file into `/usr/share/applications/`. This dwm-titus/quickshell setup never pulled in a full freedesktop menu-spec provider (no GNOME/KDE/Xfce menu package), so `/usr/share/desktop-directories` never existed, and the check failed every time — for any GUI `.deb`, not just Spotify.
+
+Because `spotify-client`'s `postinst` has no `set -e` and never checks `xdg-desktop-menu`'s exit code, `dpkg` still recorded the package as fully configured (`ii`) despite the internal failure — so `sudo dpkg --configure spotify-client` correctly refused with "already installed and configured" when tried as a fix; the package itself was never broken, only the desktop-file registration step inside its postinst silently failed.
+
+The functional consequence was real, not just a stderr warning: `/usr/local/bin/dwm-quickshell-launcher` (the SUPER+r launcher's helper) only scans `$XDG_DATA_DIRS/*/applications/*.desktop`. Spotify's shipped `.desktop` file lives at `/usr/share/spotify/spotify.desktop` — outside that scan path — so it would never have shown up in the launcher regardless of the error message.
+
+Fix, two commands, permanent for any future GUI package install on this host:
+
+```sh
+sudo mkdir -p /usr/share/desktop-directories
+sudo xdg-desktop-menu install --novendor /usr/share/spotify/spotify.desktop
+```
+
+Verified: `/usr/share/applications/spotify.desktop` now exists with the correct `Exec`/`Icon`/`Categories` fields, and `dwm-quickshell-launcher list` returns a populated Spotify entry.
