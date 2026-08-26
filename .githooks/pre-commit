@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Lints staged markdown with mdl before allowing a commit. Skips the
-# read-only ChrisTitusTech reference clones and vendored/tool-generated
-# content (see AGENTS.md non-negotiable #1). Config: ../.mdlrc, ../.mdl_style.rb
-set -euo pipefail
+# Lints staged markdown with mdl and checks local cross-references for rot
+# before allowing a commit. Skips the read-only ChrisTitusTech reference
+# clones and vendored/tool-generated content (see AGENTS.md non-negotiable
+# #1). Config: ../.mdlrc, ../.mdl_style.rb
+set -uo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root"
+cd "$repo_root" || exit 1
 
 exclude_dirs=(dwm-titus-main linutil-main titus-ai-main website-master winutil-main)
 
@@ -36,4 +37,8 @@ if ! command -v mdl >/dev/null 2>&1; then
 	exit 1
 fi
 
-mdl "${files[@]}"
+status=0
+mdl "${files[@]}" || status=1
+"$repo_root/check-markdown-links.py" "${files[@]}" || status=1
+
+exit "$status"
