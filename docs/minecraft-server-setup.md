@@ -35,6 +35,12 @@ Result: one finding, `SC2086` (info-level) on the `tar` line — `$TS` (from `TS
 
 Applied with a timestamped backup kept alongside (`backup.sh.bak-20260825-130343`, owned `minecraft:minecraft`, matching the original file's hardened ownership). Re-verified clean afterward: `shellcheck` reports zero warnings, `bash -n` confirms valid syntax. `checkbashisms` reported no bashisms either before or after the fix (the script is intentionally `#!/usr/bin/env bash`, not POSIX `sh`, so `set -o pipefail` is expected and not something to change).
 
+## Follow-up (2026-08-26): firewall was blocking xrdp (port 3389)
+
+Kartik reported xrdp (`docs/dwm-titus-debian-port.md`'s remote-access setup) had stopped accepting connections. Root cause: this session's `nftables` ruleset (item 7 above) only explicitly allowed loopback, established/related, ICMP, SSH (22), and Minecraft (25565) — xrdp's port 3389 was never in the allow list, because xrdp had been set up and verified working *earlier the same day*, before this firewall existed. Not an xrdp misconfiguration: `xrdp.service`/`xrdp-sesman.service` were both active and listening on `*:3389` the whole time; the firewall was simply dropping the inbound connection before it reached them.
+
+Fixed by adding `tcp dport 3389 accept` to `/etc/nftables.conf` (backed up first as `/etc/nftables.conf.bak-2026-08-26`), reloaded live with `nft -f /etc/nftables.conf`, and verified with a raw TCP connect test from the Windows side (`/dev/tcp/192.168.0.222/3389`) — succeeded. Persists across reboots since it's in the file `nftables.service` loads at boot, not just the live ruleset. Current full allow list on `enp3s0`: loopback, established/related, ICMP echo, SSH (22), xrdp (3389), Minecraft (25565); RCON (25575) remains deliberately excluded.
+
 ## Sources
 
 - [PaperMC — Getting Started / Java requirements](https://docs.papermc.io/paper/getting-started) (Java-version-per-Minecraft-version table)

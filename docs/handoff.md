@@ -135,6 +135,12 @@ Kartik asked to fix the deeper root cause behind the previous section's "known r
 
 **Net state on `dell-optiplex` as of 2026-08-26**: `git` → SSH deploy key (`~/.ssh/id_ed25519_github`, `origin` on `git@github.com:...`). `gh` → `GH_TOKEN` env var via `/etc/profile.d/gh-token.sh` reading `~/.config/gh/token`. Neither depends on the GNOME keyring or requires anyone at the physical console. The keyring itself remains genuinely broken under LightDM autologin (`gh auth status`'s old `default` keyring-backed account still reports invalid/inactive — expected, harmless, `GH_TOKEN` takes priority) — if anything else on this host ever depends on Secret-Service-backed secret storage in the future, expect the same class of hang and route around it the same way rather than revisiting the PAM path.
 
+### This session's work (2026-08-26, cont'd): xrdp connectivity fixed — firewall gap, not xrdp itself
+
+Kartik reported xrdp had stopped connecting. Root cause: the `nftables` firewall added 2026-08-24 for the Minecraft server (default-drop `INPUT`, explicit allows for loopback/established/SSH/25565 only) never accounted for xrdp — xrdp had been set up and verified *earlier the same day*, before that firewall existed, so port 3389 was simply never added to the allow list. Confirmed xrdp itself was healthy the whole time (`xrdp.service`/`xrdp-sesman.service` both active, listening on `*:3389`) — the firewall was silently dropping inbound connections before they reached it.
+
+Fixed by adding `tcp dport 3389 accept` to `/etc/nftables.conf` (backed up first, exact-match Python edit rather than `sed` after a first `sed` attempt mangled the tab indentation), reloaded live (`nft -f /etc/nftables.conf`), and verified with a raw out-of-band TCP connect test from the Windows side — succeeded. Persists across reboots. Full detail, including the corrected current allow list, is in `docs/minecraft-server-setup.md`'s new "Follow-up (2026-08-26)" section; the now-stale "no firewall changes needed" claim in `docs/dwm-titus-debian-port.md`'s original xrdp section was also corrected to point there.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
