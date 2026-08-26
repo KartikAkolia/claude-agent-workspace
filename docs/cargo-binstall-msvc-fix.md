@@ -4,7 +4,7 @@
 
 Running `cargo install cargo-binstall` (or building any Rust crate) from Git Bash fails during linking with an error like:
 
-```
+```text
 error: linking with `link.exe` failed: exit code: 1
   ...
   = note: link: extra operand 'C:\...\build_script_build....rcgu.o'
@@ -30,7 +30,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --silent --override "
 
 This installs MSVC (`cl.exe`, `link.exe`) and the Windows 10/11 SDK under:
 
-```
+```text
 C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\<version>\bin\Hostx64\x64\
 ```
 

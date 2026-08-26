@@ -6,7 +6,7 @@ Everything below was verified against this host's actual installed state (`dpkg 
 
 ## 1. Base OS
 
-```
+```text
 $ cat /etc/os-release
 PRETTY_NAME="Debian GNU/Linux forky/sid"
 ```
@@ -81,7 +81,7 @@ Two plugins from the official marketplace, enabled at the project level (`/home/
 
 To replicate, inside a Claude Code session:
 
-```
+```text
 /plugin marketplace add anthropics/claude-plugins-official
 /plugin install code-simplifier@claude-plugins-official
 /plugin install pr-review-toolkit@claude-plugins-official

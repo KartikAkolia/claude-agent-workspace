@@ -73,7 +73,7 @@ A second libvirt network, `br0net`, was defined on top of `br0` so VMs can get a
 
 Confirmed active, autostart, and persistent under `qemu:///system` alongside `default`:
 
-```
+```text
  Name      State    Autostart   Persistent
 --------------------------------------------
  br0net    active   yes         yes
@@ -103,7 +103,7 @@ virsh -c qemu:///system dumpxml <vm> > /dev/null   # validates the result
 
 Deployed at `/home/kartik/bin/vm-set-virtio-input.sh` on the host (not committed to this repo — operational scripts live on-host; this repo's `docs/` holds planning/reference notes, mirroring the existing pattern for e.g. the Minecraft backup script).
 
-```
+```text
 vm-set-virtio-input.sh <vm-name> [<vm-name> ...]   # process one or more VMs by name
 vm-set-virtio-input.sh                             # prompt interactively, one VM per line, blank line to stop
 ```

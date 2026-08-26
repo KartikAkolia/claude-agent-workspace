@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Lints staged markdown with mdl before allowing a commit. Skips the
+# read-only ChrisTitusTech reference clones and vendored/tool-generated
+# content (see AGENTS.md non-negotiable #1). Config: ../.mdlrc, ../.mdl_style.rb
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+exclude_dirs=(dwm-titus-main linutil-main titus-ai-main website-master winutil-main)
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -- '*.md')
+
+files=()
+for f in "${staged[@]}"; do
+	skip=0
+	case "$f" in
+	.*/*) skip=1 ;;
+	*/node_modules/*) skip=1 ;;
+	esac
+	for dir in "${exclude_dirs[@]}"; do
+		case "$f" in
+		"$dir"/*) skip=1 ;;
+		esac
+	done
+	[ "$skip" -eq 0 ] && [ -f "$f" ] && files+=("$f")
+done
+
+if [ "${#files[@]}" -eq 0 ]; then
+	exit 0
+fi
+
+if ! command -v mdl >/dev/null 2>&1; then
+	printf 'pre-commit: mdl not found on PATH (gem install --user-install mdl, then add %s to PATH)\n' \
+		"$(ruby -e 'puts Gem.user_dir')/bin" >&2
+	exit 1
+fi
+
+mdl "${files[@]}"

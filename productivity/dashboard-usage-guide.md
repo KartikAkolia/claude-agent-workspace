@@ -4,7 +4,7 @@
 
 Your `TASKS.md` and `CLAUDE.md` are saved to `Github\productivity\` in your Downloads folder. The dashboard you already downloaded is sitting in `Downloads\` directly (from clicking the file card), one level up. Move `dashboard.html` into that same `Github\productivity\` folder so everything lives together:
 
-```
+```text
 C:\Users\Kartik\Downloads\Github\productivity\
     dashboard.html
     TASKS.md

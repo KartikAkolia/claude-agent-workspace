@@ -6,13 +6,13 @@ Sourced per your research standards: official/primary sources only, cross-checke
 
 **Claude Code CLI itself.** Anthropic's own docs (code.claude.com/docs/en/setup) document a native winget package:
 
-```
+```powershell
 winget install Anthropic.ClaudeCode
 ```
 
 No admin rights required. Winget installs don't auto-update by default; run `winget upgrade Anthropic.ClaudeCode` periodically, or set `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1` to have Claude Code run that upgrade for you in the background. The same docs also document a native installer that does auto-update:
 
-```
+```powershell
 irm https://claude.ai/install.ps1 | iex
 ```
 
@@ -22,7 +22,7 @@ Git for Windows is called out as optional but recommended: without it, Claude Co
 
 **PowerShell 7.** Microsoft's own docs (learn.microsoft.com) give:
 
-```
+```powershell
 winget install --id Microsoft.PowerShell --source winget
 ```
 
@@ -30,13 +30,13 @@ This is the one titus-ai's `install.ps1` actually needs, not Claude Code. Claude
 
 **Git.** git-scm.com's own install page documents:
 
-```
+```powershell
 winget install --id Git.Git -e --source winget
 ```
 
 **GitHub CLI.** The `cli/cli` project's own Windows install docs document:
 
-```
+```powershell
 winget install --id GitHub.cli --source winget
 ```
 

@@ -11,6 +11,7 @@ Replace this file's contents when the phase completes, don't accumulate history.
 - [ ] step
 
 Acceptance:
+
 - `<testable condition>`
 
 ## Phase Completion

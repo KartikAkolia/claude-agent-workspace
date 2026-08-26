@@ -57,7 +57,7 @@ Option B was chosen and implemented. What changed in `productivity/dashboard.htm
 
 Phases 0–2 (automated) are done and green — 48 tests total across `dashboard-baseline.test.js` (regression coverage for `createCard`/`createListItem`, run against the post-change code), `dashboard-start-editing.test.js` (Phase 1: the four unified helpers, board- and list-styled invocations), `dashboard-interactions.test.js` (Phase 2: full click → edit → commit chains through the real, edited call sites in both views), and the pre-existing `escapeHtml.test.js`. Run with:
 
-```
+```sh
 node --test productivity/dashboard-baseline.test.js productivity/dashboard-start-editing.test.js productivity/dashboard-interactions.test.js productivity/escapeHtml.test.js
 ```
 

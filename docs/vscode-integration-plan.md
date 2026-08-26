@@ -24,7 +24,7 @@ Confirm both are working: open VS Code, look for the Spark icon in the editor to
 
 The templates already sitting in `Github\claude-agent-templates\` map directly onto Claude Code's own conventions, with one naming detail to get right. Claude Code's native per-repo entry point is `CLAUDE.md`, not `AGENTS.md` directly. The pattern from titus-ai's own repos handles this with a one-line pointer:
 
-```
+```text
 @AGENTS.md
 ```
 

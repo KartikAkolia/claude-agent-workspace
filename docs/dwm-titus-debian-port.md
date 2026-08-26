@@ -20,6 +20,7 @@ fedora)
 	exit 1
 	;;
 esac
+
 ```
 
 So this was a manual port: apt equivalents for every Fedora package, plus the same non-package install steps (Herdr, Meslo font, Nordic theme, Nord wallpapers) the installer would otherwise run, followed by `make` / `sudo make install` from the dwm-titus source itself, which are distro-agnostic.
@@ -189,6 +190,7 @@ Built from a real, clean git clone at `/home/kartik/dwm-titus` on the host (`git
 cd /home/kartik/dwm-titus
 make            # produced ./dwm (132,440 bytes)
 sudo make install
+
 ```
 
 `make install` is designed to be run once, as root, and handles the root/non-root split itself: it re-execs the build step as the invoking user via `SUDO_USER`/`runuser` (never builds as root), runs `install-system` for the system-wide pieces, then drops back to the target user for `install-user`. No manual profile-splitting or separate `install-system`/`install-user` invocations were needed.
@@ -248,10 +250,13 @@ Kartik wanted to reach the dwm-titus session remotely over RDP. Lower blast radi
 
 - Installed `xrdp` (0.10.6.1-2) and `xorgxrdp` (1:0.10.5-2) from the Debian repo — the modern Xorg-backend RDP stack, not the legacy Xvnc one. Each RDP login gets its own virtual X server via `xorgxrdp`'s driver; it doesn't touch the physical GPU/display, so it runs independently of the existing lightdm/console dwm session with no conflict.
 - xrdp has no session picker equivalent to lightdm's `/usr/share/xsessions`. To pin the RDP session to dwm-titus specifically (rather than whatever `/etc/X11/Xsession`'s default fallback would pick), created `/home/kartik/.xsession`:
-  ```
+
+  ```sh
   exec /usr/local/bin/dwm
   ```
+
   This mirrors `/usr/share/xsessions/dwm.desktop`'s own `Exec=/usr/local/bin/dwm` line exactly — same binary, same autostart (`dwm.c`'s `runautostart()` calls `scripts/autostart.sh` internally, so the raw binary is the complete session; no wrapper script needed).
+
 - **Real gap found and fixed**: the `xrdp` system user wasn't in the `ssl-cert` group, so it couldn't read `/etc/xrdp/key.pem` (symlinked to `/etc/ssl/private/ssl-cert-snakeoil.key`, `root:ssl-cert 640`) — the package's postinst doesn't add this automatically on Debian. Fixed with `sudo adduser xrdp ssl-cert` + `systemctl restart xrdp xrdp-sesman`. Confirmed via `/var/log/xrdp.log`: `Using default X.509 certificate: /etc/xrdp/cert.pem` / `Using default X.509 key file: /etc/xrdp/key.pem` logged cleanly on the next connection attempt, no permission error.
 - No firewall changes needed at the time — `nft list ruleset` on this host was empty (no active rules) as of 2026-08-24, so port 3389 wasn't blocked. **Stale as of 2026-08-25**: the Minecraft setup (`docs/minecraft-server-setup.md`) later added a default-drop `nftables` ruleset that didn't include 3389, which silently broke xrdp connectivity until fixed 2026-08-26 (see that doc's "Follow-up (2026-08-26)" section).
 - Verified: `xrdp`/`xrdp-sesman` both `enabled` and `active`, `ss -tulpn` shows `*:3389` listening.
@@ -264,12 +269,13 @@ Kartik wanted the box to boot straight into the dwm-titus desktop with no manual
 
 `lightdm --show-config` confirmed `/etc/lightdm/lightdm.conf`'s `[Seat:*]` section is the sole authoritative config on this host — no `/etc/lightdm/lightdm.conf.d/` drop-in directory exists or is scanned — so the settings were added there directly (original backed up alongside as `lightdm.conf.bak-20260825`):
 
-```
+```ini
 [Seat:*]
 autologin-user=kartik
 autologin-user-timeout=0
 autologin-session=dwm
 user-session=dwm
+
 ```
 
 The xsession id is `dwm` (the filename of `/usr/share/xsessions/dwm.desktop`), even though its `Name=` field displays as "dwm-titus" in the greeter — using the display name instead of the filename here would silently fail to autologin. No PAM or group changes were needed: Debian's `lightdm-autologin` PAM service already permits any non-root user passwordlessly by default.
