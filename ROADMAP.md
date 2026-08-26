@@ -136,7 +136,7 @@ Status: done (2026-08-21). `.claude/skills/productivity-update/SKILL.md` written
 
 ### 3. Scaffold a new project from `claude-agent-templates/`
 
-Status: started (2026-08-21). Kartik named the project this session: his personal website (Home/Dashboard/AI-hooking/Web-embed, per the storyboard/moodboard built earlier), using `website-master`'s Astro conventions as a read-only structural reference and `claude-agent-templates/` as the documentation-convention starting point. Scaffolded to `Github/personal-website/` (its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` track its phases from here; Phase 1 of that project's own `ROADMAP.md` is complete, unverified since this Cowork session had no npm registry access to actually run the build). `website-master` itself was not written to, per the non-negotiable in this file.
+Status: mostly complete (2026-08-26, was "started" as of 2026-08-21). Kartik's personal website — named "Loopwire" this session — is scaffolded, built, and deployed live at `https://loopwire.kartikpassbolt.org` (Cloudflare Workers + static assets, custom domain via Namecheap/Cloudflare). `website-master`'s Astro conventions were used as a read-only structural reference only, never written to, per the non-negotiable in this file. Its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` under `Github/personal-website/` are the source of truth for phase detail from here — Phases 1–4 complete, Phase 5 (AI hooking) built then removed (Anthropic billing blocker, no working payment method), Phase 5's Dashboard sub-effort not started (blocked on a data-source decision only Kartik can make). See `docs/handoff.md` for the same-day build-to-deploy summary.
 
 ### 4. Revisit declined connectors (GitHub, Notion, Asana)
 
