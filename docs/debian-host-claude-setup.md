@@ -115,23 +115,42 @@ sudo apt update && sudo apt install gh
 
 `gh` also needs `gh auth login` (or the `GH_TOKEN`-based workaround this host actually uses — see the memory note on git push auth and `docs/handoff.md`'s PAM/keyring section) before `pr-readiness` or any `gh`-backed workflow can authenticate.
 
-## 9. Present but not required by any current skill
+## 9. Repo-root scripts — not tied to any single skill
 
-Installed on this host, useful, but nothing above depends on them: `podman` (container runtime — used ad hoc, e.g. testing CI workflows locally), `fzf`, `rsync`. Not installed and not currently a gap: `docker` (podman covers the same need), `node`/`npm`, `jq`, `ansible`, `tmux`, `fd`, `bat`, `ninja-build`. Worth revisiting only if a skill starts actually needing one of these — `jq` in particular is a likely near-term add if any future CI or scripting work leans on JSON parsing (already recommended, unrelated to this list, for `Debian-titus`'s Thorium download step).
-
-## 10. Quick reference: one-shot apt install
-
-Everything from §8/§9 that comes from Debian's default archive, in one line (does not include `gh`'s separate third-party repo from §8, or `uv`/`claude`/`headroom` from §2–4, which aren't apt packages):
+`lint-markdown.sh` and `.githooks/pre-commit` (staged-markdown-only variant) both need `mdl`, a Ruby gem rather than an apt package:
 
 ```sh
-sudo apt install shellcheck shfmt devscripts bind9-dnsutils \
+gem install --user-install mdl
+```
+
+Confirmed: `mdl --version` → `0.18.1`, installed to `~/.local/share/gem/ruby/3.3.0/bin` (`ruby -e 'puts Gem.user_dir'` + `/bin`) — that directory needs to be on `PATH` for `mdl` to resolve, same as `~/.local/bin` for the other tools in this doc. Both scripts also run `check-markdown-links.py` (pure Python 3 stdlib, no extra dependency) alongside `mdl`.
+
+`refresh-reference-clone.sh` needs `gh` (§8, already covered) and `rsync`:
+
+```sh
+sudo apt install rsync
+```
+
+Confirmed: `rsync --version` → `3.4.4`.
+
+## 10. Present but not required by any current skill or repo-root script
+
+Installed on this host, useful, but nothing above depends on them: `podman` (container runtime — used ad hoc, e.g. testing CI workflows locally), `fzf`. Not installed and not currently a gap: `docker` (podman covers the same need), `node`/`npm`, `jq`, `ansible`, `tmux`, `fd`, `bat`, `ninja-build`. Worth revisiting only if a skill starts actually needing one of these — `jq` in particular is a likely near-term add if any future CI or scripting work leans on JSON parsing (already recommended, unrelated to this list, for `Debian-titus`'s Thorium download step).
+
+## 11. Quick reference: one-shot apt install
+
+Everything from §8/§9/§10 that comes from Debian's default archive, in one line (does not include `gh`'s separate third-party repo from §8, `mdl`'s gem install from §9, or `uv`/`claude`/`headroom` from §2–4, none of which are apt packages):
+
+```sh
+sudo apt install shellcheck shfmt devscripts bind9-dnsutils rsync \
   quickshell qt6-declarative-dev-tools cmake ninja-build hugo podman
 ```
 
-## 11. Verification checklist
+## 12. Verification checklist
 
 - `claude --version`, `uv --version`, `headroom --version` all print version numbers.
 - `headroom doctor` reports the proxy running and version-matched (0 failures; warnings for unrouted `codex`/no budget are expected and informational, per `docs/headroom-setup-plan.md`'s Phase 3 note).
 - Inside a Claude Code session, the skills/connectors/plugins listed above all appear in their respective system reminders (skills list, deferred MCP tools, available agents).
 - `shellcheck --version`, `shfmt --version`, `gh --version` all resolve.
 - For `quickshell` work specifically: `quickshell --version` resolves, and `/usr/lib/qt6/bin/qmllint --help` runs (even though it's not on `PATH` by default).
+- `mdl --version` and `rsync --version` both resolve; `./lint-markdown.sh` from the repo root exits 0.
