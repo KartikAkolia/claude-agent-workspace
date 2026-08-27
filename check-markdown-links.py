@@ -4,8 +4,12 @@
 # Only matches multi-segment paths (e.g. "docs/foo.md"); bare filenames like
 # "SKILL.md" or "CHANGELOG.md" are generic terms in this repo's prose, not
 # literal single-file references, so they're deliberately not checked.
+# A target that's gitignored (e.g. java-calculator/, referenced from
+# docs/handoff.md as cross-host continuity notes) is also skipped: it's
+# deliberately absent from this checkout, not a broken link.
 import os
 import re
+import subprocess
 import sys
 
 BACKTICK_MD = re.compile(r'`([A-Za-z0-9_][A-Za-z0-9_./-]*/[A-Za-z0-9_.-]*\.md)`')
@@ -22,6 +26,21 @@ def candidates(line):
         yield target.split('#')[0]
 
 
+def is_gitignored(repo_root, path):
+    # A gitignored target is deliberately absent from this checkout (e.g.
+    # cross-host reference material like java-calculator/), not a broken
+    # link -- don't flag it. Best-effort: if git itself isn't available,
+    # treat nothing as ignored rather than erroring the whole check.
+    try:
+        result = subprocess.run(
+            ['git', 'check-ignore', '-q', path],
+            cwd=repo_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
 def check(repo_root, files):
     broken = []
     for f in files:
@@ -33,6 +52,8 @@ def check(repo_root, files):
                     root_relative = os.path.join(repo_root, target)
                     file_relative = os.path.join(file_dir, target)
                     if os.path.exists(root_relative) or os.path.exists(file_relative):
+                        continue
+                    if is_gitignored(repo_root, root_relative) or is_gitignored(repo_root, file_relative):
                         continue
                     broken.append((f, lineno, target))
     return broken

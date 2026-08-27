@@ -29,7 +29,14 @@ Version control: private GitHub repo at `github.com/KartikAkolia/claude-agent-wo
 
 ## Testing & CI
 
-None. Validation is manual: confirm on-disk state directly, never report something done without having verified it.
+No test suite (this repo is overwhelmingly documentation, not application code). Two automated layers exist:
+
+- **Local pre-commit hook** (`.githooks/pre-commit`, wired via `git config core.hooksPath .githooks`): lints staged markdown with `mdl`, checks local cross-references for rot (`check-markdown-links.py`), and validates staged JSON/YAML config parses cleanly (`validate-config.sh`). Skips the five reference clones.
+- **GitHub Actions** (`.github/workflows/`): `lint.yml` re-runs the same checks via `lint-markdown.sh` as a backstop for a bypassed (`--no-verify`) or elsewhere-made commit; `gitleaks.yml` scans for secrets on every push/PR.
+
+Neither is an enforced gate in GitHub's UI — this repo has no branch protection (private repos need a paid tier for rulesets), so a failing Actions check is informational, not blocking. The pre-commit hook is the only mechanism that stops a bad commit before it leaves a machine, and only on machines where `git config core.hooksPath .githooks` has been run and `mdl`/`ruby` are on `PATH`.
+
+Beyond that, validation is manual: confirm on-disk state directly, never report something done without having verified it.
 
 ## Acceptance Criteria / Definition of Done
 

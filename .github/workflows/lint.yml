@@ -1,0 +1,22 @@
+name: Lint
+
+# Backstop for the local pre-commit hook (.githooks/pre-commit): catches a
+# --no-verify bypass or a commit pushed from a machine where the hook wasn't
+# wired up (git config core.hooksPath .githooks). Reuses the exact same
+# scripts as the local hook and lint-markdown.sh -- see AGENTS.md
+# non-negotiable #1 for why the reference clones are out of scope for both.
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mdl
+        run: gem install --no-document mdl
+
+      - name: Lint markdown and validate JSON/YAML config
+        run: ./lint-markdown.sh
