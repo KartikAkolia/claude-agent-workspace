@@ -21,8 +21,15 @@ if data.get("tool_name") != "Bash":
 
 command = (data.get("tool_input") or {}).get("command", "") or ""
 
+# Strip heredoc bodies before matching -- otherwise a command that merely
+# *mentions* grep/find in a heredoc payload (e.g. `git commit -m "$(cat
+# <<'EOF' ... EOF)"` describing this very hook) false-positives.
+command_for_matching = re.sub(
+    r"<<[-~]?['\"]?(\w+)['\"]?\n.*?\n\1\b", "", command, flags=re.DOTALL
+)
+
 # Only fire for grep/rg/find-style code search, not general Bash use.
-if not re.search(r"\b(grep|rg|find\b.*-name|Select-String)\b", command, re.IGNORECASE):
+if not re.search(r"\b(grep|rg|find\b.*-name|Select-String)\b", command_for_matching, re.IGNORECASE):
     sys.exit(0)
 
 # Don't nudge for searches inside the read-only reference clones -- those
