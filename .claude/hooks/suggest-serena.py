@@ -21,9 +21,18 @@ if data.get("tool_name") != "Bash":
 
 command = (data.get("tool_input") or {}).get("command", "") or ""
 
-# Strip heredoc bodies before matching -- otherwise a command that merely
-# *mentions* grep/find in a heredoc payload (e.g. `git commit -m "$(cat
-# <<'EOF' ... EOF)"` describing this very hook) false-positives.
+# `git commit`/`git commit --amend` never legitimately invoke grep/find as
+# their actual action, no matter what the message text says (this hook's
+# own commit messages, describing grep/find matching in prose, proved that
+# the hard way -- twice). Exclude by command verb rather than trying to
+# parse quoted strings/heredocs generically, which can't reliably tell
+# "grep invoked" from "grep mentioned" anyway.
+if re.match(r"^\s*git\s+commit\b", command):
+    sys.exit(0)
+
+# Strip heredoc bodies before matching -- covers other commands (not just
+# git commit) that pass free text containing "grep"/"find" through a
+# heredoc, e.g. `cat <<'EOF' ... EOF > notes.md`.
 command_for_matching = re.sub(
     r"<<[-~]?['\"]?(\w+)['\"]?\n.*?\n\1\b", "", command, flags=re.DOTALL
 )
