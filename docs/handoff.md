@@ -218,9 +218,47 @@ Kartik asked to set up [router-for-me/CLIProxyAPI](https://github.com/router-for
 
 5. **Known side effect**: pointing `ANTHROPIC_BASE_URL` at a custom endpoint disables Claude Code's Remote Control (`/rc`) for any session using this routing — `headroom doctor` surfaces this as a warning, not a bug.
 
-**Known doc gap**: `~/cli-proxy-api/config.yaml`'s header comment points at `docs/cliproxyapi-setup.md` for "the full setup record" — that file doesn't exist yet. This section is currently the only record; a dedicated doc hasn't been written.
-
 **Left open, not acted on**: linking additional provider accounts to CLIProxyAPI (Codex, Gemini, Grok, Kimi); widening CLIProxyAPI beyond `127.0.0.1` to the LAN (needs an `nftables` change requiring Kartik's own sudo).
+
+**Follow-up (2026-08-27, later same day):** `docs/cliproxyapi-setup.md` written (install, config, the SSH-tunnel OAuth flow, the Quadlet unit, the Headroom-chaining summary), validated before commit (`python3` YAML parse, `podman quadlet -dryrun`, `systemd-analyze --user verify`, and the repo's `mdl`/`check-markdown-links.py` pipeline — `mdl` caught 5 real MD031 blank-line violations, fixed), then committed (`acece16`) and pushed. This handoff update itself was committed (`68f72bd`) and pushed too. The doc gap flagged above is resolved.
+
+### This session's work (2026-08-27, cont'd): `youtube_windowed_outline.py` — in progress, blocked on Gemini API-side model availability
+
+Unrelated side task, not part of the CLIProxyAPI work above. Kartik has a personal script, `youtube_windowed_outline.py` (Gemini-API-backed, generates a full timestamped outline + YouTube chapter markers for long videos via real server-side video clipping, one time-window per Gemini call) — untracked at this repo's root on both `dell-optiplex` and his Windows `Downloads\Github` copy, not committed anywhere. Runs on his Windows machine directly, not through this session's tools (this session only has shell access to `dell-optiplex`).
+
+Goal: generate an outline/chapters for a 387-minute YouTube video (`https://www.youtube.com/watch?v=egZOUdA0iaw`), which the script splits into 5 windows of ~90 min each.
+
+What happened, in order:
+
+1. First run failed immediately: no API key passed. Fixed by passing `--api-key`.
+2. **Kartik pasted his real Gemini API key into this chat in plaintext.** Flagged immediately as compromised; he was told to rotate it at `aistudio.google.com/apikey`. Not confirmed whether he's done so yet — worth checking next time this comes up.
+3. Window 1 then failed 3/3 retries with `503 UNAVAILABLE` ("high demand") on the script's default model, `gemini-3.6-flash`.
+4. Retried with `--only-window 1`, same 3/3 `503` failures, full traceback this time (`tenacity`-wrapped retry inside the `google-genai` SDK itself, on top of the script's own outer 3-attempt retry loop).
+5. Suggested falling back to `--model gemini-2.5-flash`, per the script's own `--model` help text — **this was wrong**, based on stale training-data knowledge of Gemini's model lineup. Real result: `404 NOT_FOUND`, `gemini-2.5-flash` is "no longer available to new users" on Kartik's key/tier; the error message itself pointed back at `gemini-3.6-flash` as the currently-correct model.
+6. Reverted to the script's default (`gemini-3.6-flash`, no `--model` override) — **same `503 UNAVAILABLE`** as step 3, now on a second separate attempt.
+
+**Current state: blocked, not resolved.** No window has completed yet; no output files exist in `./youtube_outline_output/`. This looks like a real, possibly sustained Gemini API capacity issue on `gemini-3.6-flash` specifically (two separate attempts, both exhausting all retries with identical 503s), not a config or script problem — the script itself is fine as written.
+
+**Suggested next steps when picked back up**:
+
+- Run `python -c "from google import genai; c = genai.Client(api_key='...'); [print(m.name) for m in c.models.list()]"` on the Windows side first, to see exactly which models Kartik's key can actually use, rather than guessing model names again.
+- Space retries out further (an hour+, not minutes) — hammering the same model right after a failure hasn't helped so far.
+- Check Gemini API status (`aistudio.google.com/status` or `status.cloud.google.com`) for a broader outage before assuming it's account-specific.
+- Confirm the exposed API key from step 2 has actually been rotated.
+
+### This session's work (2026-08-27, cont'd): `youtube_windowed_outline.py` pivot — replacing Gemini video ingestion with a transcript + Claude Code approach
+
+Continuation of the section above, same day.
+
+1. **Kartik asked whether the GCP Cloud Console "welcome" page for his API key's auto-generated project (`gen-lang-client-0626668160`) helps.** Couldn't open it directly (needs his Google login), but explained why it's relevant: free-tier AI Studio keys run on a more capacity-constrained, deprioritized pool than a billing-enabled project — plausibly explaining both the `503` (high-demand) and `404` (model retired for free tier) errors seen. Pointed him at Billing and APIs & Services → Generative Language API → Quotas on that project as the places to check/fix.
+
+2. **Kartik asked whether the existing Claude Code subscription (via CLIProxyAPI) could replace Gemini for this task instead**, to sidestep the API-key/billing trouble entirely. Verified via web search rather than relying on possibly-stale training knowledge: as of August 2026, **Claude's Messages API has no video input capability at all** — text, images, and documents only, no `video` content-block type. ([MetaCTO — Anthropic API Guide 2026](https://www.metacto.com/blogs/what-is-the-anthropic-api-a-comprehensive-guide-to-claude), [TokenMix — Anthropic Messages API Documentation 2026](https://tokenmix.ai/blog/anthropic-messages-api-documentation-examples-2026)) Answer: **no**, not as a drop-in swap, for two independent reasons — (a) the script's actual technique (handing Gemini a raw YouTube URL, having Google's infrastructure clip and "watch" a specific window server-side via `VideoMetadata start_offset/end_offset`) has no Claude equivalent at all; (b) CLIProxyAPI (see `docs/cliproxyapi-setup.md`) only has a Claude Code account linked right now, not a Gemini one, and its per-provider endpoints each need their own backing OAuth account — there's no cross-provider routing.
+
+3. **Proposed and Kartik approved a real alternative**: pull the video's transcript/captions separately (`yt-dlp --write-auto-sub` or the `youtube-transcript-api` package, neither depending on Gemini at all), then feed that transcript text — not raw video — to Claude via CLIProxyAPI for the outline/chapter-generation step. This rides Kartik's existing Claude Code subscription instead of Gemini pay-per-token credits, sidestepping the billing/capacity issue entirely. Tradeoff flagged up front: transcript-only means no visual/on-screen content, weaker for demo-heavy videos with little narration, fine for talk-heavy ones.
+
+4. **Kartik confirmed: "Yes engineer and scaffold that script."** Goal stated explicitly: detailed timestamps are the main requirement, and the new script's prompts should be based on an existing file, `youtube-prompt.md`, that Kartik referenced but hasn't provided content for yet.
+
+**Blocked, not started**: searched this entire `dell-optiplex` host (`find / -xdev -iname "*youtube*prompt*"`) and found no `youtube-prompt.md` — it isn't here, and this session has no filesystem access to Kartik's Windows machine to look for it there either (same limitation as `youtube_windowed_outline.py` itself, which also only exists Windows-side plus this repo's untracked root copy). Waiting on Kartik to paste its contents before scaffolding the new transcript-based script's prompts around it.
 
 ## Files to read first
 
@@ -258,7 +296,8 @@ Kartik asked to set up [router-for-me/CLIProxyAPI](https://github.com/router-for
 13. **Cloudflare items deliberately left open** (2026-08-26): account 2FA (dashboard-only, can't be scripted), Hotlink Protection (likely safe but held for explicit confirmation because of `personal-website`'s deliberately-embeddable `/embed/widget/` route), and HSTS preload (effectively irreversible once submitted). See `docs/cloudflare-zone-settings.md`.
 14. **CLIProxyAPI: additional provider accounts?** (2026-08-27) Only Claude Code is linked so far; CLIProxyAPI also supports Codex, Gemini, Grok, Kimi — Kartik hasn't said whether he wants any of those linked too.
 15. **CLIProxyAPI: widen beyond `127.0.0.1`?** (2026-08-27) Currently loopback-only on `dell-optiplex`; opening it to the LAN would need an `nftables` change requiring Kartik's own sudo — not requested yet.
-16. **`docs/cliproxyapi-setup.md` doesn't exist yet** (2026-08-27) — `~/cli-proxy-api/config.yaml`'s own header comment references it as "the full setup record", but it was never written. `docs/handoff.md`'s 2026-08-27 CLIProxyAPI section is the only record right now.
+16. ~~`docs/cliproxyapi-setup.md` doesn't exist yet.~~ Done, 2026-08-27 — written, validated (YAML/Quadlet/markdown-lint checks all clean), committed (`acece16`), and pushed.
+17. **`youtube_windowed_outline.py`: superseded by a transcript + Claude Code rewrite, currently blocked on missing input.** Original Gemini-video-ingestion approach hit sustained `503`s (`gemini-3.6-flash`) and a retired-model `404` (`gemini-2.5-flash`) — see the two 2026-08-27 sections above for the full log. Kartik approved a pivot: pull the transcript via `yt-dlp`/`youtube-transcript-api` instead of raw video, then generate the outline/chapters through Claude Code (via CLIProxyAPI) instead of Gemini. **Next action: Kartik needs to paste the contents of `youtube-prompt.md`** (referenced as the basis for the new script's prompts, not present on `dell-optiplex`, no Windows filesystem access from this session) before the new script can be scaffolded. Separately, still unconfirmed: whether the Gemini API key Kartik pasted into chat mid-session has been rotated.
 
 ## Notes
 
