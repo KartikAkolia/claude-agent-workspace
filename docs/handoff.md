@@ -302,6 +302,26 @@ Follow-up on item 18 below (`mdl`/`ruby` not on this Windows machine's `PATH`, s
 
 **Closed out (2026-08-27, same session):** Kartik ran the PowerShell `Path` append himself, opened a new terminal, and confirmed `mdl --version` prints `0.18.1`. The Windows-side pre-commit hook is now fully functional — `mdl`/`ruby`/`check-markdown-links.py`/`validate-config.sh` all resolve on this machine, matching the Debian host. No longer an open item.
 
+**Committed and pushed (2026-08-27):** both fixes above (`.gitignore`'s missing `titus-ai-main` entry, and this doc) went into one commit, `8572637`, pushed to `origin/master` (`8d6d8e5..8572637`). One wrinkle worth noting for future sessions: *this Claude Code session's own Bash-tool shell* was spawned before Kartik's PATH change and still doesn't see `mdl` on a bare `PATH` — it's the same stale-PATH pattern documented throughout this file (topgrade/pnpm on the Debian host, the earlier `ruby`/`gem` check here), just now hitting the pre-commit hook itself. The commit above only succeeded because `mdl` was pointed at explicitly for that one command (`PATH="$PATH:/c/Users/Kartik/.local/share/gem/ruby/3.4.0/bin" git commit ...`), not because the hook was bypassed — it ran for real and passed.
+
+**Pending confirmation:** Kartik is refreshing/restarting the Claude Code session now specifically so this session's own shell picks up the updated PATH too, closing the loop on the note above (a plain `mdl --version`/`git commit` should work with no PATH prefix needed afterward). Verify this first thing next session before doing anything else — the check is simply `which mdl` or `mdl --version` with no PATH override, expecting it to resolve to `/c/Users/Kartik/.local/share/gem/ruby/3.4.0/bin/mdl` / print `0.18.1` cleanly.
+
+### This session's work (2026-08-27, cont'd): AdGuardHome Pi — DNS cache tuned, plain-DNS-disabled confirmed intentional
+
+Kartik asked for a settings review of his separate Raspberry Pi 5 running AdGuardHome (`ssh pi`, `192.168.0.166`, not `dell-optiplex` — a third homelab host alongside the Debian box and the Vaultwarden Pi). No sudo access on this host (`pi` has no `NOPASSWD` rule), so the review was limited to what's visible without root: `systemctl status`, open ports, and `journalctl` — `/opt/AdGuardHome/AdGuardHome.yaml` itself (`600 root:root`) couldn't be read or edited directly.
+
+**Applied, confirmed live:** cache size `4194304` → `67108864` (64 MiB — default was sized for constrained devices, this Pi has 7.6 GiB RAM free), override minimum TTL `0` → `60` (stops near-zero-TTL ad/tracker/CDN domains from defeating the cache entirely), override maximum TTL `0` → `86400` (required alongside the min override by AdGuardHome's own `min ≤ max` validation, per [GitHub issue #6409](https://github.com/AdguardTeam/AdGuardHome/issues/6409)). Kartik applied all three himself via the web UI (Settings → DNS settings → cache config); verified via `journalctl` showing a live `dnsforward: reconfiguring server` with the new values (`min=60 max=86400 size=67108864`), no restart needed, no errors.
+
+**Investigated, not changed:**
+
+- **Plain DNS (port 53) is fully disabled on this instance** (`dnsforward: warning: plain dns is disabled` in the startup log, confirmed with a direct `nslookup` timeout) — only DoT/DoQ (853) and DoH (`https://adguardhome.kartikpassbolt.org:8443`) respond. Flagged as a possible gap (most home routers/IoT/smart-TVs only ever speak plain DNS), but **Kartik confirmed this was his own deliberate choice** — no action needed.
+- Journal also showed a steady stream of TLS handshake failures against ports 443/853 from public IPs (scanner bots), consistent with this being intentionally WAN-exposed for remote/mobile encrypted DNS (matches the disabled-plain-DNS setup above) rather than an accident — not pursued further since plain DNS being off was confirmed intentional.
+- `/opt/AdGuardHome` has `0755` perms, AdGuardHome's own `permcheck` wants `0700` — low-risk one-line fix, needs sudo, not applied (no sudo access this session).
+- TLS cert has no IP SANs, so DDR (client auto-discovery of the encrypted resolver) doesn't work — only matters if Kartik relies on auto-discovery rather than configuring DoT/DoH manually per client; not raised as urgent.
+- Upstream mode already `parallel` (queries multiple upstreams, uses fastest reply) — already optimal, nothing to change.
+
+**Left open, Kartik declined for now:** a deeper config review (upstream server list, filter/blocklist set, query log retention, rate limiting) needs either a `NOPASSWD` sudo rule for `pi` or Kartik pasting the relevant Settings screens — he said to leave it here rather than set that up now.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
