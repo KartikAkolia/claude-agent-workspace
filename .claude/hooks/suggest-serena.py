@@ -21,20 +21,22 @@ if data.get("tool_name") != "Bash":
 
 command = (data.get("tool_input") or {}).get("command", "") or ""
 
-# `git commit`/`git commit --amend` never legitimately invoke grep/find as
-# their actual action, no matter what the message text says (this hook's
-# own commit messages, describing grep/find matching in prose, proved that
-# the hard way -- twice). Exclude by command verb rather than trying to
-# parse quoted strings/heredocs generically, which can't reliably tell
-# "grep invoked" from "grep mentioned" anyway.
-if re.match(r"^\s*git\s+commit\b", command):
-    sys.exit(0)
-
-# Strip heredoc bodies before matching -- covers other commands (not just
-# git commit) that pass free text containing "grep"/"find" through a
-# heredoc, e.g. `cat <<'EOF' ... EOF > notes.md`.
+# Commit-message text (and free text piped through a heredoc) can mention
+# "grep"/"find" in prose without the command actually invoking them --
+# this hook's own commit messages proved that three times, including once
+# in a `git add && git commit && git push` chain where commit wasn't the
+# first verb, so excluding by leading-verb alone wasn't enough either.
+# Strip both patterns' payload text before matching, regardless of where
+# they sit in the command.
+command_for_matching = command
+# -m/--message '...' or "..." (git commit -m, gh pr create -m, etc.)
 command_for_matching = re.sub(
-    r"<<[-~]?['\"]?(\w+)['\"]?\n.*?\n\1\b", "", command, flags=re.DOTALL
+    r"(?:-m|--message)\s+(['\"])(?:\\.|(?!\1).)*\1",
+    "", command_for_matching, flags=re.DOTALL,
+)
+# heredoc bodies, e.g. `cat <<'EOF' ... EOF`
+command_for_matching = re.sub(
+    r"<<[-~]?['\"]?(\w+)['\"]?\n.*?\n\1\b", "", command_for_matching, flags=re.DOTALL
 )
 
 # Only fire for grep/rg/find-style code search, not general Bash use.
