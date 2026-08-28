@@ -1,6 +1,6 @@
 # Laptop Dual-Boot: Debian 12 (bookworm) Stable + Windows 11 Pro — Setup Plan
 
-Status: **planned, not yet executed** (planned 2026-08-28). Kartik wants Debian Stable as a minimal, SSH-first second OS on his ASUS Vivobook M6500XV laptop, keeping Windows 11 Pro only for native Office 365 desktop apps and other Windows-only coursework software. Unlike `dell-optiplex` and the Pi 5, this box gets **no local desktop environment** — it's driven remotely, same as the other two homelab boxes are driven, just without even the optional GUI `dell-optiplex` ended up with via dwm-titus.
+Status: **Phase 1 done, Phase 2 not yet executed** (planned 2026-08-28; Phase 1 run 2026-08-28). Kartik wants Debian Stable as a minimal, SSH-first second OS on his ASUS Vivobook M6500XV laptop, keeping Windows 11 Pro only for native Office 365 desktop apps and other Windows-only coursework software. Unlike `dell-optiplex` and the Pi 5, this box gets **no local desktop environment** — it's driven remotely, same as the other two homelab boxes are driven, just without even the optional GUI `dell-optiplex` ended up with via dwm-titus.
 
 Full design rationale, decision table, and validation matrix live in the session plan this doc was generated from (`ai-project-manager`/`engineering-*` skills + a Plan-agent review against this repo's own homelab conventions). This file is the copy-pasteable execution runbook.
 
@@ -168,7 +168,9 @@ Any generated credential (e.g. an initial user password) gets written to a file 
 
 ## What actually happened
 
-*(append here once Phases 1–4 are executed, including any deviations from this plan — matching the convention in `docs/homelab-networkmanager-plan.md`)*
+- **Phase 1 (2026-08-28):** `chkdsk C: /f` run from an elevated Command Prompt as planned — no deviations, reported no errors. Windows boots normally. Phase 2 (partition shrink) is next.
+
+*(append further entries here as Phases 2–4 are executed, including any deviations from this plan — matching the convention in `docs/homelab-networkmanager-plan.md`)*
 
 ## Sources
 
