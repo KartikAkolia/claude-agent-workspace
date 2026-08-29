@@ -142,6 +142,27 @@ reboot — deliberately **not** restarted mid-session here, since `loginctl list
 live session on seat0 (this very desktop) that a restart would kill. Kartik hasn't confirmed the
 greeter visually yet; next natural checkpoint is the next logout/reboot.
 
+### Follow-up (2026-08-29, after reboot): background was pointed at the logo, not a wallpaper
+
+The machine rebooted and the staged greeter config above went live. Kartik reported seeing "a
+massive dwm-titus logo" at the login screen instead of a Nordic look. Verified: `background=` in
+`lightdm-gtk-greeter.conf` had been set to `/home/kartik/dwm-titus/dwm-titus.png` — a 1024×1024
+**logo** graphic, not a wallpaper. That was a mistake from when this file was first staged (above);
+`dwm-titus-main/lightdm/slick-greeter.conf` (read-only reference) treats `logo=` and `background=`
+as two separate assets and never conflates them.
+
+Fixed by changing `background=` to a flat color, `#2E3440` (Nord "Polar Night" — the same fallback
+color the reference config uses behind its wallpaper), rather than sourcing another image asset.
+`lightdm-gtk-greeter`'s `background` key accepts a hex color directly, no separate
+`background-color=` key needed (that's a `slick-greeter`-only key).
+
+Change made via the same backup-then-`sudo install` pattern as before:
+`lightdm-gtk-greeter.conf.pre-flat-nord-bg.20260829164228.bak`. Not restarting `lightdm` again this
+session for the same reason as above (live seat0 session) — takes effect on next logout/reboot.
+
+**Confirmed** by Kartik on logout/login the same day: flat Nord background displays correctly,
+no more oversized logo. Greeter theming for `asus-vivobook` is done.
+
 ## Unrelated fix surfaced during this session: broken `amdgpu-dkms` package removed
 
 Installing `inkscape x11-apps bc` (for the Capitaine Cursors build, above) triggered dpkg to
