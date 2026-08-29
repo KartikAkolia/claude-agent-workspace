@@ -87,6 +87,24 @@ Backups: `lightdm.conf.pre-nordic-greeter.20260829155939.bak`,
 (`display-setup-script=/usr/local/bin/display-setup` under `[Seat:*]`) — read-only confirmed, not
 touched; resolution was already correct.
 
+### Follow-up (2026-08-29): Nordic theme was never actually installed system-wide
+
+A pre-reboot static re-verification (asked for once Kartik requested confirming the greeter after
+reboot, which isn't something achievable from inside this same live session — see "What's live now
+vs. pending" below) caught a real gap: `theme-name=Nordic` in `lightdm-gtk-greeter.conf` had nothing
+backing it. The Nordic theme only existed at `~/.themes/Nordic` (kartik's own home directory) — the
+same "system-wide only" rule already applied to the cursor theme and font (see above) was missed for
+the GTK theme itself. The greeter, running as its own system user, has no access to `~/.themes`, so
+this would have silently fallen back to a default GTK theme at the login screen.
+
+Fixed: copied the known-good `~/.themes/Nordic` to `/usr/share/themes/Nordic` (root:root, dirs 0755
+/ files 0644 — same permission pattern as the cursor theme and font). Re-verified with
+`lightdm --show-config` (LightDM's own authoritative merged config view, confirms no conflicting
+overrides between `lightdm.conf` and `lightdm.conf.d/50-monitors.conf`), existence checks on all
+four greeter-referenced assets, `sudo -u lightdm test -r` on the wallpaper path specifically (not
+just permission bits eyeballed), and an exact `fc-list` family match for the font. Everything now
+checks out as far as static analysis can confirm.
+
 ### Two gaps found and closed: cursor theme and font, both missing on disk
 
 `theme-apply.sh` hardcodes `Capitaine-Cursors-White` (dark mode) / `Capitaine-Cursors` (light mode)
