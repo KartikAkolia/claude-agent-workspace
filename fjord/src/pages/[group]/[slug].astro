@@ -1,0 +1,21 @@
+---
+// /[group]/[slug]/ — one specific doc.
+import ReaderPage from "../../components/ReaderPage.astro";
+import { getCollection } from "astro:content";
+import { GROUPS } from "../../lib/groups";
+
+export async function getStaticPaths() {
+  const paths = [];
+  for (const g of GROUPS) {
+    const entries = await getCollection(g.key);
+    for (const e of entries) {
+      paths.push({ params: { group: g.key, slug: e.id }, props: { groupKey: g.key, id: e.id } });
+    }
+  }
+  return paths;
+}
+
+const { groupKey, id } = Astro.props;
+---
+
+<ReaderPage groupKey={groupKey} id={id} />

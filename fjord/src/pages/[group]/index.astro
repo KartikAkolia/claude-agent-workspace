@@ -1,0 +1,21 @@
+---
+// /[group]/ — same reading UI as /[group]/<first-file>/, for the same
+// reason as src/pages/index.astro: no server to redirect through.
+import ReaderPage from "../../components/ReaderPage.astro";
+import { getCollection } from "astro:content";
+import { GROUPS } from "../../lib/groups";
+import { sortEntries } from "../../lib/sortEntries";
+
+export async function getStaticPaths() {
+  return Promise.all(
+    GROUPS.map(async (g) => {
+      const [first] = sortEntries(await getCollection(g.key));
+      return { params: { group: g.key }, props: { groupKey: g.key, id: first.id } };
+    }),
+  );
+}
+
+const { groupKey, id } = Astro.props;
+---
+
+<ReaderPage groupKey={groupKey} id={id} />

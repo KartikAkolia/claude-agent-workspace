@@ -1,0 +1,395 @@
+---
+// The one page template for every route Fjord serves (/, /[group]/,
+// /[group]/[slug]/) — each just picks a (groupKey, id) and renders this.
+// Nord Terminal direction (fjord/moodboards/fjord-moodboard-2-nord-terminal.html,
+// Kartik's pick, 2026-08-29): dwm-style status bar, ranger/lf three-pane
+// layout (source → file list → preview), dense monospace throughout.
+import { getCollection, getEntry, render } from "astro:content";
+import { GROUPS, EXCLUDED, type GroupKey } from "../lib/groups";
+import { sortEntries } from "../lib/sortEntries";
+import { fileSize, wordCount } from "../lib/fileMeta";
+
+interface Props {
+  groupKey: GroupKey;
+  id: string;
+}
+const { groupKey, id } = Astro.props;
+
+const group = GROUPS.find((g) => g.key === groupKey);
+if (!group) throw new Error(`Fjord: unknown group "${groupKey}"`);
+
+const entry = await getEntry(groupKey, id);
+if (!entry) throw new Error(`Fjord: no entry "${id}" in collection "${groupKey}"`);
+const { Content } = await render(entry);
+
+const counts = await Promise.all(
+  GROUPS.map(async (g) => ({ key: g.key, count: (await getCollection(g.key)).length })),
+);
+const totalFiles = counts.reduce((sum, g) => sum + g.count, 0);
+
+const fileList = sortEntries(await getCollection(groupKey)).map((e) => ({
+  id: e.id,
+  href: `/${groupKey}/${e.id}/`,
+  size: fileSize(group.base, e.id),
+  active: e.id === id,
+}));
+
+const words = wordCount(entry.body);
+const today = new Date().toISOString().slice(0, 10);
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{id}.md — fjord</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap"
+    />
+  </head>
+  <body>
+    <div class="frame">
+      <!-- dwm-style status bar -->
+      <header class="statusbar">
+        <span class="brand">fjord</span>
+        <nav class="tabs">
+          {
+            GROUPS.map((g, i) => (
+              <a href={`/${g.key}/`} class:list={["tab", { active: g.key === groupKey }]}>
+                {i + 1}:{g.key}
+              </a>
+            ))
+          }
+        </nav>
+        <div class="statusbar-right">
+          <span>{totalFiles} files</span>
+          <span class="dev">● dev</span>
+          <span>{today}</span>
+        </div>
+      </header>
+
+      <div class="panes">
+        <!-- source pane -->
+        <nav class="source-pane">
+          <div class="pane-heading">SOURCE/</div>
+          {
+            GROUPS.map((g) => (
+              <a href={`/${g.key}/`} class:list={["source-item", { active: g.key === groupKey }]}>
+                {g.label}
+              </a>
+            ))
+          }
+          <div class="pane-heading excluded-heading">EXCLUDED/</div>
+          {EXCLUDED.map((name) => <div class="excluded-item">{name}</div>)}
+        </nav>
+
+        <!-- file list pane -->
+        <nav class="file-pane">
+          <div class="file-pane-heading">
+            {group.label} — {fileList.length} file{fileList.length === 1 ? "" : "s"}
+          </div>
+          {
+            fileList.map((f) => (
+              <a href={f.href} class:list={["file-item", { active: f.active }]}>
+                <span class="file-name">
+                  {f.active ? "> " : "  "}
+                  {f.id}.md
+                </span>
+                <span class="file-size">{f.size}</span>
+              </a>
+            ))
+          }
+        </nav>
+
+        <!-- preview pane -->
+        <main class="preview-pane">
+          <div class="prose">
+            <Content />
+          </div>
+        </main>
+      </div>
+
+      <!-- status line -->
+      <footer class="statusline">
+        <span>{groupKey}/{id}.md</span>
+        <span class="statusline-right">{words} words</span>
+        <span class="readonly">read-only</span>
+      </footer>
+    </div>
+
+    <style>
+      :root {
+        --n0: #2e3440;
+        --n1: #3b4252;
+        --n2: #434c5e;
+        --n3: #4c566a;
+        --n4: #d8dee9;
+        --n6: #eceff4;
+        --frost2: #88c0d0;
+        --yellow: #ebcb8b;
+        --green: #a3be8c;
+        --red: #bf616a;
+        --purple: #b48ead;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--n0);
+        color: var(--n6);
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 13px;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .frame {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      /* status bar */
+      .statusbar {
+        height: 30px;
+        flex: none;
+        background: var(--n1);
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        gap: 18px;
+        border-bottom: 1px solid var(--n2);
+      }
+      .statusbar .brand {
+        color: var(--yellow);
+        font-weight: 700;
+      }
+      .tabs {
+        display: flex;
+        gap: 4px;
+      }
+      .tab {
+        padding: 2px 9px;
+        color: var(--n4);
+        border-radius: 2px;
+      }
+      .tab.active {
+        background: var(--frost2);
+        color: var(--n0);
+        font-weight: 700;
+      }
+      .tab:hover:not(.active) {
+        color: var(--n6);
+      }
+      .statusbar-right {
+        margin-left: auto;
+        display: flex;
+        gap: 16px;
+        color: var(--n4);
+      }
+      .statusbar-right .dev {
+        color: var(--green);
+      }
+
+      /* panes */
+      .panes {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+      }
+      .source-pane {
+        width: 220px;
+        flex: none;
+        border-right: 1px solid var(--n2);
+        padding: 18px 0;
+        overflow-y: auto;
+      }
+      .pane-heading {
+        padding: 4px 18px;
+        color: var(--n3);
+        font-size: 11px;
+        letter-spacing: 1px;
+        margin-bottom: 6px;
+      }
+      .excluded-heading {
+        margin-top: 14px;
+      }
+      .source-item {
+        display: block;
+        padding: 6px 18px;
+        color: var(--n4);
+        border-left: 2px solid transparent;
+      }
+      .source-item.active {
+        background: var(--n1);
+        border-left-color: var(--frost2);
+        color: var(--n6);
+      }
+      .source-item:hover:not(.active) {
+        color: var(--n6);
+      }
+      .excluded-item {
+        padding: 6px 18px;
+        color: var(--n2);
+        text-decoration: line-through;
+      }
+
+      .file-pane {
+        width: 320px;
+        flex: none;
+        border-right: 1px solid var(--n2);
+        overflow-y: auto;
+      }
+      .file-pane-heading {
+        padding: 8px 18px;
+        color: var(--n3);
+        border-bottom: 1px solid var(--n2);
+      }
+      .file-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 7px 18px;
+        color: var(--n4);
+        white-space: nowrap;
+      }
+      .file-item.active {
+        background: var(--n1);
+        color: var(--frost2);
+      }
+      .file-item:hover:not(.active) {
+        color: var(--n6);
+      }
+      .file-item .file-size {
+        color: var(--n3);
+      }
+
+      .preview-pane {
+        flex: 1;
+        overflow-y: auto;
+        padding: 24px 32px;
+        min-width: 0;
+      }
+
+      /* markdown typography, still dense/monospace per the Nord Terminal direction */
+      .prose {
+        max-width: 860px;
+        line-height: 1.7;
+        color: var(--n4);
+      }
+      .prose h1,
+      .prose h2,
+      .prose h3,
+      .prose h4 {
+        color: var(--n6);
+        line-height: 1.4;
+      }
+      .prose h1 {
+        color: var(--yellow);
+        font-size: 1.4em;
+        border-bottom: 1px solid var(--n2);
+        padding-bottom: 8px;
+      }
+      .prose h2 {
+        font-size: 1.15em;
+        margin-top: 2em;
+        color: var(--frost2);
+      }
+      .prose h3 {
+        font-size: 1.05em;
+        margin-top: 1.6em;
+      }
+      .prose a {
+        color: var(--frost2);
+        text-decoration: underline;
+        text-decoration-color: var(--n2);
+      }
+      .prose a:hover {
+        color: var(--yellow);
+      }
+      .prose code {
+        background: var(--n1);
+        color: var(--yellow);
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 0.95em;
+      }
+      .prose pre {
+        padding: 14px 16px;
+        border-radius: 4px;
+        border: 1px solid var(--n2);
+        overflow-x: auto;
+      }
+      .prose pre code {
+        background: none;
+        color: inherit;
+        padding: 0;
+      }
+      .prose blockquote {
+        border-left: 2px solid var(--purple);
+        margin: 1em 0;
+        padding-left: 14px;
+        color: var(--n3);
+      }
+      .prose ul,
+      .prose ol {
+        padding-left: 1.4em;
+      }
+      .prose li {
+        margin: 4px 0;
+      }
+      .prose li::marker {
+        color: var(--frost2);
+      }
+      .prose table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1em 0;
+        font-size: 0.95em;
+      }
+      .prose th,
+      .prose td {
+        border: 1px solid var(--n2);
+        padding: 6px 10px;
+        text-align: left;
+      }
+      .prose th {
+        background: var(--n1);
+        color: var(--n6);
+      }
+      .prose hr {
+        border: none;
+        border-top: 1px solid var(--n2);
+        margin: 2em 0;
+      }
+
+      /* status line */
+      .statusline {
+        height: 26px;
+        flex: none;
+        background: var(--n1);
+        border-top: 1px solid var(--n2);
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        font-size: 12px;
+        color: var(--n4);
+        gap: 20px;
+      }
+      .statusline-right {
+        margin-left: auto;
+        color: var(--n3);
+      }
+      .statusline .readonly {
+        color: var(--green);
+      }
+    </style>
+  </body>
+</html>

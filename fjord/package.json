@@ -1,0 +1,25 @@
+{
+  "name": "fjord",
+  "version": "0.1.0",
+  "description": "Read-only Astro site for browsing this repo's own documentation (Nord Terminal theme).",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "astro": "^7.2.9"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@types/node": "^26.4.0",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+  />
+</head>
+<body>
+
+<helmet>
+  <style>
+    :root {
+      --n0: #2e3440; --n1: #3b4252; --n2: #434c5e; --n3: #4c566a; --n4: #d8dee9; --n6: #eceff4;
+      --frost2: #88c0d0; --frost4: #5e81ac; --yellow: #ebcb8b; --green: #a3be8c; --purple: #b48ead;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: 'Sora', sans-serif; background: var(--n0); color: var(--n6); }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</helmet>
+
+<div style="width:1440px; height:960px; padding:36px; display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(0,1fr)); gap:20px;">
+
+  <!-- big tile: all docs -->
+  <div style="grid-column: span 2; grid-row: span 2; background:var(--n1); border-radius:20px; padding:28px; display:flex; flex-direction:column; justify-content:space-between; border-top:3px solid var(--frost4);">
+    <div>
+      <div style="font-size:13px; color:var(--n3); text-transform:uppercase; letter-spacing:1px;">Fjord — all documentation</div>
+      <div style="font-size:64px; font-weight:800; margin-top:10px;">36</div>
+      <div style="font-size:13px; color:var(--n4);">files, read-only</div>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px; background:var(--n0); border-radius:12px; padding:12px 16px;">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#88c0d0" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.6" y2="16.6" stroke-linecap="round"/></svg>
+      <span class="mono" style="font-size:13px; color:var(--n4);">search…</span>
+    </div>
+  </div>
+
+  <!-- root tile -->
+  <div style="grid-column: span 2; background:var(--n1); border-radius:20px; padding:24px; border-top:3px solid var(--frost2); display:flex; flex-direction:column; gap:8px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-weight:600; font-size:16px;">Root</span>
+      <span class="mono" style="font-size:12px; color:var(--frost2);">7</span>
+    </div>
+    <div style="font-size:13px; color:var(--n4);">AGENTS · SPEC · ROADMAP · TASKS</div>
+  </div>
+
+  <!-- docs/ tile -->
+  <div style="background:var(--n1); border-radius:20px; padding:24px; border-top:3px solid var(--purple); display:flex; flex-direction:column; justify-content:space-between;">
+    <span style="font-weight:600; font-size:16px;">docs/</span>
+    <div>
+      <div style="font-size:28px; font-weight:700; color:var(--purple);">20</div>
+      <div style="font-size:12px; color:var(--n4);">runbooks &amp; plans</div>
+    </div>
+  </div>
+
+  <!-- productivity/ tile -->
+  <div style="background:var(--n1); border-radius:20px; padding:24px; border-top:3px solid var(--green); display:flex; flex-direction:column; justify-content:space-between;">
+    <span style="font-weight:600; font-size:16px;">productivity/</span>
+    <div>
+      <div style="font-size:28px; font-weight:700; color:var(--green);">2</div>
+      <div style="font-size:12px; color:var(--n4);">post-dashboard</div>
+    </div>
+  </div>
+
+  <!-- templates tile -->
+  <div style="grid-column: span 2; background:var(--n1); border-radius:20px; padding:24px; border-top:3px solid var(--yellow); display:flex; flex-direction:column; gap:8px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-weight:600; font-size:16px;">claude-agent-templates/</span>
+      <span class="mono" style="font-size:12px; color:var(--yellow);">9</span>
+    </div>
+    <div style="font-size:13px; color:var(--n4);">scaffold docs &amp; research notes</div>
+  </div>
+
+  <!-- last updated stat -->
+  <div style="background:var(--n1); border-radius:20px; padding:24px; display:flex; flex-direction:column; justify-content:center; gap:4px;">
+    <div style="font-size:12px; color:var(--n3); text-transform:uppercase; letter-spacing:1px;">Last updated</div>
+    <div class="mono" style="font-size:20px; font-weight:600;">2026-08-29</div>
+  </div>
+
+  <!-- excluded stat -->
+  <div style="background:var(--n1); border-radius:20px; padding:24px; display:flex; flex-direction:column; justify-content:center; gap:4px;">
+    <div style="font-size:12px; color:var(--n3); text-transform:uppercase; letter-spacing:1px;">Excluded</div>
+    <div style="font-size:14px; color:var(--n4);">5 reference clones</div>
+  </div>
+
+</div>
+
+</body>
+</html>

@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap"
+  />
+</head>
+<body>
+
+<helmet>
+  <style>
+    :root {
+      --n0: #2e3440; --n1: #3b4252; --n2: #434c5e; --n3: #4c566a;
+      --n4: #d8dee9; --n6: #eceff4;
+      --frost2: #88c0d0; --yellow: #ebcb8b; --green: #a3be8c; --red: #bf616a;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: 'JetBrains Mono', monospace; background: var(--n0); color: var(--n6); }
+    a { color: var(--frost2); text-decoration: none; }
+    a:hover { color: var(--yellow); }
+  </style>
+</helmet>
+
+<div style="width:1440px; height:960px; display:flex; flex-direction:column; overflow:hidden;">
+
+  <!-- dwm-style status bar -->
+  <div style="height:30px; background:var(--n1); display:flex; align-items:center; padding:0 14px; gap:18px; border-bottom:1px solid var(--n2); font-size:13px;">
+    <span style="color:var(--yellow); font-weight:700;">fjord</span>
+    <div style="display:flex; gap:4px;">
+      <span style="padding:2px 9px; background:var(--frost2); color:var(--n0); font-weight:700; border-radius:2px;">1:root</span>
+      <span style="padding:2px 9px; color:var(--n4);">2:docs</span>
+      <span style="padding:2px 9px; color:var(--n4);">3:productivity</span>
+      <span style="padding:2px 9px; color:var(--n4);">4:templates</span>
+    </div>
+    <div style="margin-left:auto; display:flex; gap:16px; color:var(--n4);">
+      <span>36 files</span>
+      <span style="color:var(--green);">● dev</span>
+      <span>2026-08-29</span>
+    </div>
+  </div>
+
+  <div style="flex:1; display:flex;">
+
+    <!-- left: source pane -->
+    <div style="width:220px; border-right:1px solid var(--n2); padding:18px 0; font-size:13px;">
+      <div style="padding:4px 18px; color:var(--n3); font-size:11px; letter-spacing:1px; margin-bottom:6px;">SOURCE/</div>
+      <div style="padding:6px 18px; background:var(--n1); border-left:2px solid var(--frost2); color:var(--n6);">root/</div>
+      <div style="padding:6px 18px; color:var(--n4);">docs/</div>
+      <div style="padding:6px 18px; color:var(--n4);">productivity/</div>
+      <div style="padding:6px 18px; color:var(--n4);">claude-agent-templates/</div>
+      <div style="padding:6px 18px; color:var(--n3); margin-top:14px; font-size:11px; letter-spacing:1px;">EXCLUDED/</div>
+      <div style="padding:6px 18px; color:var(--n2); text-decoration:line-through;">dwm-titus-main/</div>
+      <div style="padding:6px 18px; color:var(--n2); text-decoration:line-through;">website-master/</div>
+    </div>
+
+    <!-- middle: file list -->
+    <div style="width:420px; border-right:1px solid var(--n2); font-size:13px;">
+      <div style="padding:8px 18px; color:var(--n3); border-bottom:1px solid var(--n2);">root/ — 7 files</div>
+      <div style="padding:7px 18px; background:var(--n1); display:flex; justify-content:space-between;"><span style="color:var(--frost2);">&gt; AGENTS.md</span><span style="color:var(--n3);">6.3K</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>SPEC.md</span><span style="color:var(--n3);">4.0K</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>ROADMAP.md</span><span style="color:var(--n3);">10K</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>TASKS.md</span><span style="color:var(--n3);">1.8K</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>README.md</span><span style="color:var(--n3);">3.1K</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>CLAUDE.md</span><span style="color:var(--n3);">11B</span></div>
+      <div style="padding:7px 18px; display:flex; justify-content:space-between;"><span>GEMINI.md</span><span style="color:var(--n3);">95B</span></div>
+    </div>
+
+    <!-- right: preview pane -->
+    <div style="flex:1; padding:20px 26px; font-size:13px; line-height:1.7;">
+      <div style="color:var(--n3); margin-bottom:12px;">── AGENTS.md ──────────────────────────</div>
+      <div style="color:var(--yellow);"># AGENTS.md</div>
+      <div style="color:var(--n4); margin-top:8px;">Read this before every task. `SPEC.md` is</div>
+      <div style="color:var(--n4);">the product contract; this file covers</div>
+      <div style="color:var(--n4);">how to work here.</div>
+      <div style="color:var(--n3); margin-top:14px;">## Non-Negotiables</div>
+      <div style="color:var(--n4); margin-top:6px;">1. Never hand-edit `dwm-titus-main/`,</div>
+      <div style="color:var(--n4);">&nbsp;&nbsp;&nbsp;`linutil-main/`…</div>
+      <div style="color:var(--frost2); margin-top:22px;">█</div>
+    </div>
+  </div>
+
+  <!-- status line -->
+  <div style="height:26px; background:var(--n1); border-top:1px solid var(--n2); display:flex; align-items:center; padding:0 14px; font-size:12px; color:var(--n4); gap:20px;">
+    <span>root/AGENTS.md</span>
+    <span style="margin-left:auto; color:var(--n3);">read-only</span>
+    <span style="color:var(--red);">dashboard.html — retired</span>
+  </div>
+
+</div>
+
+</body>
+</html>

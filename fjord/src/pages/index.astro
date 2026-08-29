@@ -1,0 +1,13 @@
+---
+// Site root: same reading UI as /root/<first-file>/, rendered directly
+// rather than redirected (this is a static site — there's no server to
+// redirect through, and duplicating the render call is simpler than
+// wiring a build-time redirect table for one route).
+import ReaderPage from "../components/ReaderPage.astro";
+import { getCollection } from "astro:content";
+import { sortEntries } from "../lib/sortEntries";
+
+const [first] = sortEntries(await getCollection("root"));
+---
+
+<ReaderPage groupKey="root" id={first.id} />
