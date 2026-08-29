@@ -7,7 +7,9 @@ Replace this file's contents when the phase completes, don't accumulate history.
 
 Phase 4 (VS Code integration) completed 2026-08-21, see `ROADMAP.md` and `docs/vscode-integration-plan.md`. No phase is currently active.
 
-`ROADMAP.md`'s Candidate Next Step 6 (Fjord, a Nord-themed docs viewer replacing `productivity/dashboard.html`) started 2026-08-29: scaffolded at `fjord/` with its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` tracking phases from here on, same as `personal-website`/Loopwire. Nothing further to track in this root's `TASKS.md` for it beyond this pointer.
+`ROADMAP.md`'s Candidate Next Step 6 (Fjord, a Nord-themed docs viewer replacing `productivity/dashboard.html`) started 2026-08-29: scaffolded at `fjord/` with its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` tracking phases from here on, same as `personal-website`/Loopwire. Halted the same day (Phases 0–3 complete) once Kartik chose to fork it instead of continuing — see Candidate Next Step 7. Nothing further to track in this root's `TASKS.md` for Fjord beyond this pointer.
+
+`ROADMAP.md`'s Candidate Next Step 7 (Estuary, the University of Greenwich pre-course e-reader forked from Fjord) started 2026-08-29: scaffolded at `estuary/` with its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` tracking phases from here on, same pattern. Nothing further to track in this root's `TASKS.md` for it beyond this pointer.
 
 `ROADMAP.md`'s Candidate Next Step 3 (scaffolding a separate project from `claude-agent-templates/`) started 2026-08-21: Kartik named his personal website, now at `Github/personal-website/` with its own AGENTS.md/SPEC.md/ROADMAP.md/TASKS.md tracking its phases from here on. Nothing further to track in this root's TASKS.md for it.
 

@@ -9,6 +9,8 @@ Phases 0–3 are all complete — see `ROADMAP.md` for each phase's Completion E
 
 **Production on Fjord is halted, Kartik's explicit call (2026-08-29)**: he wants to fork this same structure for a separate, University-focused idea (not this homelab repo) with different content, starting fresh in a future session — not this one. No further phases here (Phase 4 or otherwise) should proceed until Kartik explicitly resumes this project or asks for the fork.
 
+**Update, same day:** the fork happened — see `estuary/` (its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md`). Fjord itself remains exactly as left above; nothing in this file changes as a result.
+
 Phase 4 (`productivity/dashboard.html` retirement) was already gated on a fresh, explicit go-ahead per `AGENTS.md` non-negotiable 6 before the halt — his earlier "(c) retire outright" answer authorized the decision, not the moment of deletion. This file intentionally holds no Phase 4 task breakdown.
 
 Phase 5 (polish + the deployment decision) remains untouched and on hold.
