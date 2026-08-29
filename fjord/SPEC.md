@@ -29,10 +29,11 @@ Fjord is a read-only Astro website for Kartik to browse and read this repo's own
 
 - **Framework**: Astro, static output (`output: "static"`, matching `website-master`), TypeScript.
 - **Content sourcing**: Astro content collections using the `glob()` loader. Verified against Astro's official docs via Context7 (2026-08-29) that `base` accepts any filesystem path, including paths outside the project root — so collections point directly at:
-  - repo root: `*.md` (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `README.md`, `CLAUDE.md`, `GEMINI.md`)
-  - `../docs/*.md`
-  - `../productivity/*.md`, excluding `dashboard.html`, `dashboard-baseline.test.js`, `dashboard-interactions.test.js`, `dashboard-start-editing.test.js`, `escapeHtml.test.js`, and `backups/`
-  - `../claude-agent-templates/*.md` (verified 2026-08-29: 9 files, all flat — no nested subdirectory currently exists there, correcting this line's earlier assumption)
+
+   - repo root: `*.md` (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `README.md`, `CLAUDE.md`, `GEMINI.md`)
+   - `../docs/*.md`
+   - `../productivity/*.md`, excluding `dashboard.html`, `dashboard-baseline.test.js`, `dashboard-interactions.test.js`, `dashboard-start-editing.test.js`, `escapeHtml.test.js`, and `backups/`
+   - `../claude-agent-templates/*.md` (verified 2026-08-29: 9 files, all flat — no nested subdirectory currently exists there, correcting this line's earlier assumption)
 
   No transform/copy step is needed — unlike `website-master`'s `scripts/prepare-content.mjs` (which exists for shortcodes, taxonomy slugs, and legacy-URL tables that don't apply here), Astro's built-in markdown renderer (Shiki for code blocks) is sufficient.
 - **Live reload**: Astro's content layer watches each collection's `base` directory in dev mode; edits to any in-scope file elsewhere in the repo trigger HMR without restarting `npm run dev`.
