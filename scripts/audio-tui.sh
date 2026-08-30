@@ -89,12 +89,18 @@ pick_source() {
 	default_mark=$(default_source_name)
 	local menu_args=()
 	local name desc tag
+	# Monitor sources (a sink's "record what you hear" loopback) are
+	# included, not filtered out — pavucontrol's own default view ("All
+	# Input Devices") shows them too, and hiding them would make it
+	# impossible to route a stream's recording to one. Tagged so they're
+	# distinguishable from a physical mic/line input.
 	while IFS=$'\t' read -r name desc; do
 		[ -z "$name" ] && continue
 		tag="$desc"
+		case "$name" in *.monitor) tag="$tag [monitor]" ;; esac
 		[ "$name" = "$default_mark" ] && tag="$tag (default)"
 		menu_args+=("$name" "$tag")
-	done < <(pa_json sources | jq -r '.[] | select(.name | endswith(".monitor") | not) | [.name, .description] | @tsv')
+	done < <(pa_json sources | jq -r '.[] | [.name, .description] | @tsv')
 
 	[ "${#menu_args[@]}" -eq 0 ] && {
 		wt --msgbox "No input devices found." 8 50
@@ -228,6 +234,15 @@ action_volume() {
 				continue
 				;;
 			esac
+			# The prompt says 0-150; actually enforce it. (pactl/PipeWire
+			# themselves accept much higher — pavucontrol's own slider caps
+			# at PA_VOLUME_UI_MAX, ~355% of normal — but 150% is a more
+			# conservative ceiling for unattended speaker/hearing safety,
+			# chosen deliberately rather than matching that.)
+			if [ "$pct" -gt 150 ]; then
+				wt --msgbox "$pct% is above the 150% cap." 6 40
+				continue
+			fi
 			pactl "set-${kind}-volume" "$name" "${pct}%"
 			;;
 		back | "") return 0 ;;
@@ -244,14 +259,18 @@ action_card_profile() {
 	card=$(pick_card) || return 0
 	[ -z "$card" ] && return 0
 
-	local menu_args=() active key desc
+	local menu_args=() active key desc avail
 	active=$(pa_json cards | jq -r --arg c "$card" '.[] | select(.name==$c) | .active_profile')
-	while IFS=$'\t' read -r key desc; do
+	while IFS=$'\t' read -r key desc avail; do
 		[ -z "$key" ] && continue
+		# pactl reports a profile's .available (e.g. an HDMI profile before
+		# any display is detected) — flag it rather than silently offering
+		# a profile switch that won't actually do anything useful.
+		[ "$avail" = "false" ] && desc="$desc [unavailable]"
 		[ "$key" = "$active" ] && desc="$desc (active)"
 		menu_args+=("$key" "$desc")
 	done < <(pa_json cards | jq -r --arg c "$card" \
-		'.[] | select(.name==$c) | .profiles | to_entries[] | [.key, .value.description] | @tsv')
+		'.[] | select(.name==$c) | .profiles | to_entries[] | [.key, .value.description, .value.available] | @tsv')
 
 	local profile
 	profile=$(wt --menu "Profile for $card" 0 0 0 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 0
@@ -270,14 +289,22 @@ action_port() {
 	fi
 	[ -z "$name" ] && return 0
 
-	local active menu_args=() pname pdesc
+	local active menu_args=() pname pdesc avail
 	active=$(pa_json "${kind}s" | jq -r --arg n "$name" '.[] | select(.name==$n) | .active_port // empty')
-	while IFS=$'\t' read -r pname pdesc; do
+	while IFS=$'\t' read -r pname pdesc avail; do
 		[ -z "$pname" ] && continue
+		# pactl reports "available"/"not available"/"availability unknown"
+		# (jack-detection state) — surface it, since picking a port that's
+		# reported not plugged in is a silent no-op otherwise. Leave the
+		# common "unknown" case (most jacks can't detect this) unannotated.
+		case "$avail" in
+		"not available") pdesc="$pdesc [not plugged in]" ;;
+		"available") pdesc="$pdesc [plugged in]" ;;
+		esac
 		[ "$pname" = "$active" ] && pdesc="$pdesc (active)"
 		menu_args+=("$pname" "$pdesc")
 	done < <(pa_json "${kind}s" | jq -r --arg n "$name" \
-		'.[] | select(.name==$n) | .ports[]? | [.name, .description] | @tsv')
+		'.[] | select(.name==$n) | .ports[]? | [.name, .description, .availability] | @tsv')
 
 	if [ "${#menu_args[@]}" -eq 0 ]; then
 		wt --msgbox "$name has no selectable ports." 8 50
