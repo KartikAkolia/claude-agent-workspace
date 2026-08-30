@@ -19,10 +19,12 @@ Already present on this machine (asus-vivobook), verified 2026-08-30:
 - `python3` with `requests` + `bs4` (for discovery) — system packages, already installed.
 - `poppler-utils` (`pdfunite`, `pdfinfo`) — for merging and page-count checks.
 - A throwaway venv for `playwright` (Debian's `python3` is externally-managed, so `pip install` needs a venv):
+
   ```bash
   python3 -m venv ~/.venvs/mathsisfun-pdf
   ~/.venvs/mathsisfun-pdf/bin/pip install playwright
   ```
+
   No `playwright install` step needed — the render script launches the system Chrome via `channel="chrome"`, not Playwright's bundled Chromium.
 
 ## Usage
