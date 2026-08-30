@@ -138,19 +138,35 @@ fi
 # --- 5. run the bridge (+ optional lossless recording) ---------------------
 # One MJPEG input, one or two outputs: decoded/converted into the loopback for
 # apps, and (with -r) the original packets copied verbatim to a file.
-ff_out=(-map 0:v -vf format=yuv420p -f v4l2 "$DEVICE")
+# MJPEG decodes to the legacy full-range yuvj420p pixel format, which the
+# v4l2 muxer rejects outright ("Unknown V4L2 pixel format equivalent for
+# yuvj420p") -- converting to yuv420p is required, not optional. Doing that
+# conversion via plain `format=yuv420p` works but routes through libswscale's
+# deprecated yuvj* handling and logs "deprecated pixel format used, make sure
+# you did set range correctly" on every run. zscale (libzimg, not swscale)
+# does the identical full->limited range remap without that code path.
+ff_out=(-map 0:v -vf "zscale=in_range=full:range=limited,format=yuv420p" -f v4l2 "$DEVICE")
 if [[ -n "$RECORD" ]]; then
 	ff_out+=(-map 0:v -c:v copy "$RECORD")
 	printf 'Recording raw camera stream -> %s\n' "$RECORD"
 fi
 
+# Ctrl-C's SIGINT lands on the whole foreground process group at once --
+# script, gphoto2, and ffmpeg all get it directly, not just the script.
+# cleanup() must therefore stay silent and just make sure both children are
+# actually gone (belt-and-suspenders for SIGTERM, which -- unlike SIGINT from
+# a terminal -- is NOT broadcast to the group); it must NOT print the final
+# "Stopped." message itself. If it did, that print would race ffmpeg's own
+# asynchronous shutdown (it flushes the muxer and logs its own diagnostics on
+# receiving SIGINT), landing before ffmpeg's trailing output instead of after
+# it. The one `wait "$bridge_pid"` below is what actually blocks until ffmpeg
+# has fully exited, so the final message is printed only once that's true.
 cleaned_up=0
 cleanup() {
 	trap - INT TERM EXIT
 	[[ "$cleaned_up" -eq 1 ]] && return
 	cleaned_up=1
 	pkill -P $$ >/dev/null 2>&1 || true
-	printf '\nStopped. %s left in place (remove with: sudo modprobe -r v4l2loopback).\n' "$DEVICE"
 }
 trap cleanup INT TERM EXIT
 
@@ -163,4 +179,5 @@ wait "$bridge_pid"
 status=$?
 trap - INT TERM EXIT
 cleanup
+printf '\nStopped. %s left in place (remove with: sudo modprobe -r v4l2loopback).\n' "$DEVICE"
 exit "$status"
