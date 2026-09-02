@@ -9,6 +9,10 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
+# Shell scripts must stay LF even on Windows checkouts — CRLF breaks shebangs
+# and heredocs under strict sh/dash, and trips shellcheck's SC1017 on every line.
+*.sh text eol=lf
+
 # Binary files should never be touched by line-ending conversion.
 *.png binary
 *.jpg binary
