@@ -42,8 +42,8 @@ def dismiss_consent_modal(page, timeout: int) -> None:
         btn.first.wait_for(state="visible", timeout=timeout)
         btn.first.click(timeout=1500)
         btn.first.wait_for(state="hidden", timeout=1500)
-    except Exception:
-        pass
+    except Exception:  # noqa: S110, BLE001 — best-effort dismiss; the modal
+        pass            # not showing up is the expected/common case, not an error
 
 
 def dismiss_cookie_banner(page, timeout: int) -> None:
@@ -60,7 +60,7 @@ def dismiss_cookie_banner(page, timeout: int) -> None:
         ok.first.wait_for(state="visible", timeout=timeout)
         ok.first.click(timeout=1500)
         ok.first.wait_for(state="hidden", timeout=1500)
-    except Exception:
+    except Exception:  # noqa: S110, BLE001 — best-effort dismiss, see above
         pass
     # cookOK()'s own JS just empties #cookOK's innerHTML on click, it
     # doesn't hide the div — so an empty, still-styled (light-blue
@@ -69,7 +69,7 @@ def dismiss_cookie_banner(page, timeout: int) -> None:
         page.evaluate(
             "document.querySelectorAll('#cookOK').forEach(el => { if (!el.textContent.trim()) el.style.display = 'none'; })"
         )
-    except Exception:
+    except Exception:  # noqa: S110, BLE001 — same rationale
         pass
 
 
@@ -107,7 +107,7 @@ def main() -> int:
                          margin={"top": "12mm", "bottom": "12mm",
                                  "left": "10mm", "right": "10mm"})
                 print(f"[{i}/{len(urls)}] ok: {url}", flush=True)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — one bad page shouldn't kill the whole run
                 print(f"[{i}/{len(urls)}] FAILED: {url}: {exc}", file=sys.stderr, flush=True)
                 fail += 1
 

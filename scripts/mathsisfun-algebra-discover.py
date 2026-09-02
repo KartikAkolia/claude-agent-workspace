@@ -38,9 +38,7 @@ def same_section(url: str) -> bool:
         return False
     if not parts.path.endswith(".html"):
         return False
-    if "/worksheets/" in parts.path:
-        return False
-    return True
+    return "/worksheets/" not in parts.path
 
 
 def crawl(start: str, delay: float = 1.0) -> list[str]:
