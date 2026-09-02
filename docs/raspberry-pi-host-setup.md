@@ -1,8 +1,9 @@
 # Raspberry Pi 5 host — Claude Code + Headroom setup
 
 This documents the Claude Code CLI environment on the Raspberry Pi 5 host
-(`raspberrypi`, Debian `forky/sid`, `aarch64`, user `pi`). It is the third
-host-specific setup record, alongside:
+(`raspberrypi`, `192.168.0.166`, Debian `forky/sid`, `aarch64`, user `pi`) —
+the same box that runs AdGuardHome (see `docs/handoff.md`'s 2026-08-27 entry).
+It is the third host-specific setup record, alongside:
 
 - `docs/headroom-setup-plan.md` — the Windows 11 machine (`winget` / PowerShell).
 - `docs/debian-host-claude-setup.md` — the `dell-optiplex` Debian desktop
@@ -21,6 +22,8 @@ assumed.
 | Model | Raspberry Pi 5 Model B Rev 1.0 (Cortex-A76 ×4, 8 GB RAM) |
 | OS | Debian GNU/Linux `forky/sid`, kernel `6.18.x-rpt-rpi-2712`, `aarch64` |
 | User / home | `pi` / `/home/pi` |
+| Also runs | AdGuardHome (DNS, port 853/DoH), Docker daemon |
+| `sudo` | password required; one `NOPASSWD` rule only (a sysctl) — apt installs need Kartik's password |
 | Root FS | NVMe (`/dev/nvme0n1p2`), ~205 GB free |
 | `loginctl` linger | `Linger=yes` for `pi` — `--user` services run without an active login and survive reboot |
 
