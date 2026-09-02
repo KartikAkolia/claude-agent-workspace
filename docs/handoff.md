@@ -398,6 +398,24 @@ This whole session ran on the **AdGuardHome Raspberry Pi 5** (`raspberrypi`, `19
 
 **Not committed, host-level and machine-specific** (correctly outside the repo): the Headroom `systemd --user` service, `~/.claude/settings.json`, `~/.bashrc`, and the `claude`/`uv`/`headroom`/`ruby`/`mdl`/`shfmt` installs themselves.
 
+### This session's work (2026-09-02, cont'd, on Windows): mathsisfun.com → PDF scripts generalized, two real render bugs fixed, full quality pass (ruff/shellcheck/CRLF)
+
+Different host from the AdGuardHome Pi entry above — this ran on Kartik's Windows machine (`Github\scripts`), not the Pi. Three pre-existing scripts (`mathsisfun-algebra-discover.py`, `mathsisfun-algebra-render.py`, `mathsisfun-algebra-merge.sh`, previously hardcoded to `/algebra/` only, built 2026-08-30 on `asus-vivobook`) were generalized to crawl/render/merge any `mathsisfun.com/<section>/`, then run end-to-end against `/data/` (statistics/probability) — study material for the University of Greenwich course starting 2026-09-14 (see `estuary/`).
+
+1. **Scripts generalized**: `discover.py` takes an optional start-URL arg and derives its same-section prefix from it instead of a hardcoded `/algebra/`; `render.py`'s `slugify()` and `merge.sh`'s `slugify()` both strip whichever leading path segment the URL has, not just `/algebra/`.
+
+2. **Two real bugs found and fixed in `render.py`'s consent/banner handling**, via manual diagnostic Playwright scripts and multi-point screenshot spot-checks (not just trusting "0 failures") — neither was caught by the original `/algebra/` run:
+   - The ad-tech CMP's full-page consent modal is injected ~2-3s *after* `networkidle`, so the original immediate-check-then-click logic silently never worked. Fixed with an explicit `wait_for(state="visible", ...)`.
+   - mathsisfun's own small "We may use Cookies" banner is a `<div onclick="cookOK()">`, not an ARIA `<button>` — the original `get_by_role("button", name="OK")` matched nothing. Fixed with a CSS locator, plus a `page.evaluate()` to hide the empty leftover div `cookOK()`'s own JS leaves behind.
+
+3. **Full `/data/` run**: 94/94 pages discovered and rendered, 0 failures, merged into a 458-page/~34MB PDF. Output at `C:\Users\Kartik\Documents\Maths\data-pdfs\` and `...\data-mathsisfun.pdf`.
+
+4. **Quality pass**: `ruff check` on both `.py` scripts — fixed a real `SIM103` (collapsible boolean return) and suppressed 3 intentional bare `except: pass` blocks (`S110`/`BLE001`) with inline `# noqa` + rationale, not narrowed exception types. `shellcheck` on `mathsisfun-algebra-merge.sh` — logic itself was clean, but 39 SC1017 "literal carriage return" findings traced to the *Windows working-tree checkout* having CRLF (via `core.autocrlf`) even though the git-tracked blob was already LF; root-caused via `git show HEAD:...`/`xxd`, fixed at the repo level by pinning `*.sh text eol=lf` in `.gitattributes` (same pattern as the existing `.bat`/`.cmd`/`.ps1` → `eol=crlf` pins) and re-checking out every `.sh` file in the repo. All 8 tracked shell scripts confirmed shellcheck-clean afterward; no script content changed.
+
+5. **End-to-end pipeline re-verified working** after all the above changes: a live 5-page sample (trimmed from a fresh real discovery of all 94 `/data/` URLs) run through all three steps, output pixel-identical to the previously-verified full-run screenshot baseline. Scratch artifacts cleaned up afterward.
+
+6. Full detail (prerequisites, usage, all three gotchas, linting results) in `docs/mathsisfun-pdf-scrape.md`. Committed across 4 commits on `master` (`eea56cf`, `f7918ac`, `f699dc4`, `46634c9`), all pushed to `origin/master`.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
@@ -419,6 +437,7 @@ This whole session ran on the **AdGuardHome Raspberry Pi 5** (`raspberrypi`, `19
 - `java-calculator/` — a Java Swing calculator project, gitignored on purpose (Kartik's explicit choice, not tracked in this or any repo). Won't show up in `git log`/`git status` here — its own `java-calculator/README.md` and `java-calculator/docs/BUILD_LOG.md` are the source of truth for status.
 - `docs/laptop-vfio-passthrough.md` — `asus-vivobook` (Kartik's laptop, separate host from `dell-optiplex`): NVIDIA RTX 4060 VFIO passthrough to a `win11` VM. Phase 1 (host isolation) + Wi-Fi→NetworkManager migration + Looking Glass client/KVMFR/IVSHMEM are done & verified; Windows-side IDD install is the next real step. `br0` (an NM bridge over a USB Ethernet dongle) is what the VM's networking actually uses, and its unwanted boot-time autoconnect (45s DHCP-timeout stall) has an identified fix not yet applied — see the 2026-08-28 session entry above. Its AMD iGPU driver notes now also cover the 2026-08-29 `amdgpu-dkms` removal (broken DKMS build, unrelated to the live in-tree driver).
 - `docs/lightdm-nordic-theme-setup.md` — LightDM resolution fix (Arch-Wiki `display-setup-script=` mechanism) + Nordic theme/Papirus icons on a Fedora reference VM (192.168.0.254), then the same theming matched on `asus-vivobook`'s own `lightdm-gtk-greeter`, plus building `Capitaine-Cursors-White` from source and installing `MesloLGS Nerd Font` system-wide since neither had a package. Greeter changes on `asus-vivobook` are staged but not yet live — pending the next logout/reboot (item 22 below).
+- `docs/mathsisfun-pdf-scrape.md` — the `scripts/mathsisfun-algebra-*` pipeline (discover → render → merge) that archives any `mathsisfun.com/<section>/` to PDF, on Windows. Covers prerequisites for both Windows and Debian, the three consent/cookie-banner dismissal gotchas (and their fixes), and the 2026-09-02 lint pass (ruff, shellcheck, the `.gitattributes` CRLF fix).
 
 ## Open items for Kartik
 
