@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Crawl mathsisfun.com/algebra/ and list every same-section HTML page.
+"""Crawl a mathsisfun.com section and list every same-section HTML page.
 
-Stays inside /algebra/, skips worksheet generator endpoints (robots.txt
-disallows those anyway), follows only same-domain links, breadth-first.
-Self-imposed 1s delay between requests to stay polite to the site.
+Stays inside whatever top-level section START is under (e.g. /algebra/,
+/data/), skips worksheet generator endpoints (robots.txt disallows those
+anyway), follows only same-domain links, breadth-first. Self-imposed 1s
+delay between requests to stay polite to the site.
 
 Usage:
-    python3 mathsisfun-algebra-discover.py > urls.txt
+    python3 mathsisfun-algebra-discover.py [start_url] > urls.txt
+
+    # defaults to /algebra/; pass any mathsisfun.com/<section>/index.html
+    # to crawl that section instead, e.g.:
+    python3 mathsisfun-algebra-discover.py \\
+        https://www.mathsisfun.com/data/index.html > urls.txt
 """
 import sys
 import time
@@ -16,8 +22,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-START = "https://www.mathsisfun.com/algebra/index.html"
-PREFIX = "/algebra/"
+START = (sys.argv[1].split("#")[0] if len(sys.argv) > 1
+         else "https://www.mathsisfun.com/algebra/index.html")
+PREFIX = "/" + urlparse(START).path.strip("/").split("/")[0] + "/"
 HEADERS = {
     "User-Agent": "kartik-personal-study-archiver/1.0 (+offline reading, low request rate)"
 }

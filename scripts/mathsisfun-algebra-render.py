@@ -23,20 +23,54 @@ DEFAULT_PROFILE = Path.home() / ".cache" / "mathsisfun-algebra-pdf" / "chrome-pr
 
 def slugify(url: str) -> str:
     path = re.sub(r"^https?://[^/]+", "", url)
-    path = re.sub(r"^/algebra/", "", path)
+    path = re.sub(r"^/[^/]+/", "", path)  # drop leading section, e.g. /algebra/ or /data/
     path = re.sub(r"\.html$", "", path)
     slug = re.sub(r"[^A-Za-z0-9]+", "-", path).strip("-")
     return slug or "index"
 
 
-def dismiss_banners(page) -> None:
-    for role, name in [("button", "Consent"), ("button", "OK")]:
-        try:
-            btn = page.get_by_role(role, name=name, exact=True)
-            if btn.count() and btn.first.is_visible():
-                btn.first.click(timeout=1500)
-        except Exception:
-            pass
+def dismiss_consent_modal(page, timeout: int) -> None:
+    # The ad-tech CMP's full-page "This site asks for consent to use your
+    # data" modal. It's injected by an async ad script well after
+    # networkidle (~2-3s observed), so this has to actively wait for it
+    # rather than checking immediately — an immediate check just sees an
+    # empty page and assumes there's nothing to dismiss. Once accepted,
+    # though, it's genuinely sticky and won't reappear for the rest of the
+    # persistent-profile session.
+    try:
+        btn = page.get_by_role("button", name="Consent", exact=True)
+        btn.first.wait_for(state="visible", timeout=timeout)
+        btn.first.click(timeout=1500)
+        btn.first.wait_for(state="hidden", timeout=1500)
+    except Exception:
+        pass
+
+
+def dismiss_cookie_banner(page, timeout: int) -> None:
+    # mathsisfun's own small "We may use Cookies" notice is a
+    # <div class="btn" onclick="cookOK()">OK</div>, not a <button>, so it
+    # needs a CSS locator rather than role-based matching. Unlike the modal
+    # above, dismissing it isn't sticky across navigations (no cookie/local
+    # storage set — it just re-renders on every page load, on its own timer
+    # that isn't tied to networkidle either), so this has to run before
+    # every page.pdf() call, and also has to wait for the element to
+    # actually appear rather than checking it immediately.
+    try:
+        ok = page.locator("#cookOK .btn")
+        ok.first.wait_for(state="visible", timeout=timeout)
+        ok.first.click(timeout=1500)
+        ok.first.wait_for(state="hidden", timeout=1500)
+    except Exception:
+        pass
+    # cookOK()'s own JS just empties #cookOK's innerHTML on click, it
+    # doesn't hide the div — so an empty, still-styled (light-blue
+    # background) box is left behind in the corner. Force it closed too.
+    try:
+        page.evaluate(
+            "document.querySelectorAll('#cookOK').forEach(el => { if (!el.textContent.trim()) el.style.display = 'none'; })"
+        )
+    except Exception:
+        pass
 
 
 def main() -> int:
@@ -54,15 +88,21 @@ def main() -> int:
         )
         page = ctx.new_page()
 
-        # Prime consent once up front.
+        # Prime consent once up front. Generous timeout here since it's a
+        # one-time cost and the modal can take a couple seconds to load.
         page.goto(urls[0], wait_until="networkidle")
-        dismiss_banners(page)
+        dismiss_consent_modal(page, timeout=8000)
+        dismiss_cookie_banner(page, timeout=3000)
 
         for i, url in enumerate(urls, 1):
             dest = out_dir / f"{slugify(url)}.pdf"
             try:
                 page.goto(url, wait_until="networkidle", timeout=30000)
-                dismiss_banners(page)
+                # Short timeout per page: consent is sticky (shouldn't
+                # reappear) and the cookie banner, when it shows at all,
+                # tends to render within ~1s.
+                dismiss_consent_modal(page, timeout=1000)
+                dismiss_cookie_banner(page, timeout=2500)
                 page.pdf(path=str(dest), format="A4", print_background=True,
                          margin={"top": "12mm", "bottom": "12mm",
                                  "left": "10mm", "right": "10mm"})

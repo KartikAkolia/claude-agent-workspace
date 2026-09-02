@@ -16,12 +16,14 @@ command -v pdfunite >/dev/null 2>&1 || {
 }
 
 slugify() {
+    # drops leading section (/algebra/, /data/, ...), same rule as render.py
     printf '%s' "$1" |
-        sed -E 's#^https?://[^/]+##; s#^/algebra/##; s#\.html$##; s#[^A-Za-z0-9]+#-#g; s#^-+|-+$##g'
+        sed -E 's#^https?://[^/]+##; s#^/[^/]+/##; s#\.html$##; s#[^A-Za-z0-9]+#-#g; s#^-+|-+$##g'
 }
 
 files=()
 while IFS= read -r url; do
+    url="${url%$'\r'}"  # urls.txt may have CRLF line endings (e.g. from Python on Windows)
     [ -z "$url" ] && continue
     slug=$(slugify "$url")
     f="$pdf_dir/${slug:-index}.pdf"
