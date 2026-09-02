@@ -70,6 +70,13 @@ Fix: `dismiss_cookie_banner()` uses a CSS locator (`#cookOK .btn`) instead of a 
 
 **Verification approach that caught #2 and #3**: don't trust "0 failures" alone — the script "succeeds" on every page regardless, because a rendered-but-wrong PDF isn't a script failure. Render actual sample pages to PNG (`pdftoppm -png -r 100 -f N -l N file.pdf`) and look at them — several points through the book, not just the first page (gotcha #3's residual banner is easy to miss on a single glance since it's a small corner artifact, and gotcha #2 was intermittent enough that a single spot-check could pass by chance).
 
+## Linting
+
+All four scripts (three Python-driven pipeline steps plus the shell merge step) pass clean as of 2026-09-02.
+
+- **`ruff check` (`discover.py`, `render.py`)**: clean. Two real findings fixed: `SIM103` (a chain of `if ...: return False` in `same_section()` collapsed into a single trailing boolean expression), and `S110`/`BLE001` on the three bare `except Exception: pass` blocks around the best-effort consent-modal/cookie-banner dismissal — suppressed inline with `# noqa: S110, BLE001` plus a comment explaining why the broad catch is intentional (the element simply not showing up is the expected, common case, not an error worth narrowing the exception type for).
+- **`shellcheck` (`mathsisfun-algebra-merge.sh`)**: clean (exit 0, 0 findings). The one issue found wasn't in the script's actual logic — the *working-tree checkout* on this Windows machine had CRLF line endings on every line (`core.autocrlf` converting the repo's LF-stored git blob at checkout time), which shellcheck flagged as SC1017 ("literal carriage return") 39 times, once per line. `git show HEAD:...` confirmed the git-tracked content was already LF and correct; only the on-disk checkout was affected. Fixed at the repo level, not per-script: pinned `*.sh text eol=lf` in the top-level `.gitattributes` (same pattern already used there to pin `.bat`/`.cmd`/`.ps1` to `eol=crlf`), then force-re-checked-out every `.sh` file in the repo to pick up the new attribute. No script content changed.
+
 ## Politeness / robots.txt
 
 `https://www.mathsisfun.com/robots.txt` disallows only `/worksheets/print*.php`, `/includes/`, and the 404 handler — arbitrary sections like `/algebra/` or `/data/` are unrestricted, and there's no `Crawl-delay` for a generic user-agent (only `Slurp` gets one). The discovery script still self-imposes a 1s delay between requests and sends a descriptive `User-Agent` identifying it as a low-rate personal archiver.
