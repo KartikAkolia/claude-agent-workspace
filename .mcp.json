@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "serena": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/oraios/serena",
+        "serena",
+        "start-mcp-server",
+        "--context",
+        "ide-assistant",
+        "--project",
+        "/home/pi/claude-agent-workspace",
+        "--open-web-dashboard",
+        "false"
+      ]
+    },
+    "headroom": {
+      "command": "headroom",
+      "args": ["mcp", "serve"]
+    }
+  }
+}

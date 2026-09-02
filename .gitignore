@@ -1,5 +1,6 @@
 .claude/settings.local.json
 .claude/.headroom_wrap_marker.json
+.claude/.headroom_wrap_settings.lock
 pi-homelab/
 personal-website/
 personal-website.zip
