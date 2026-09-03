@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Lints this repo's own markdown with mdl and checks local cross-references
-# for rot, and validates tracked JSON/YAML config parses cleanly, skipping
-# the read-only ChrisTitusTech reference clones (see AGENTS.md non-negotiable #1).
+# for rot; validates tracked JSON/YAML config parses cleanly; and runs
+# lint-bash.sh/lint-python.sh over this repo's own bash and Python scripts.
+# The name predates the JSON/YAML/bash/Python checks -- kept as-is since
+# .githooks/pre-commit and .github/workflows/lint.yml both call it by name
+# and it's already the repo's one lint entry point, not just markdown.
+# Skips the read-only ChrisTitusTech reference clones (see AGENTS.md
+# non-negotiable #1).
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -19,6 +24,28 @@ for dir in "${exclude_dirs[@]}"; do
 	config_pathspec+=(":!$dir")
 done
 mapfile -t config_files < <(git ls-files "${config_pathspec[@]}")
+
+# Bash scripts aren't reliably *.sh (e.g. .githooks/pre-commit has no
+# extension), so find them by shebang instead of extension.
+all_pathspec=(':!node_modules' ':!**/node_modules')
+for dir in "${exclude_dirs[@]}"; do
+	all_pathspec+=(":!$dir")
+done
+mapfile -t all_files < <(git ls-files "${all_pathspec[@]}")
+bash_files=()
+for f in "${all_files[@]}"; do
+	[ -f "$f" ] || continue
+	IFS= read -r first_line <"$f" 2>/dev/null || continue
+	case "$first_line" in
+	'#!'*bash) bash_files+=("$f") ;;
+	esac
+done
+
+python_pathspec=('*.py' ':!node_modules' ':!**/node_modules')
+for dir in "${exclude_dirs[@]}"; do
+	python_pathspec+=(":!$dir")
+done
+mapfile -t python_files < <(git ls-files "${python_pathspec[@]}")
 
 status=0
 
@@ -48,5 +75,7 @@ else
 fi
 
 ./validate-config.sh "${config_files[@]}" || status=1
+./lint-bash.sh "${bash_files[@]}" || status=1
+./lint-python.sh "${python_files[@]}" || status=1
 
 exit "$status"

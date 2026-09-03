@@ -12,6 +12,7 @@ download needed.
 Usage:
     .venv/bin/python mathsisfun-algebra-render.py urls.txt out_dir [profile_dir]
 """
+
 import re
 import sys
 from pathlib import Path
@@ -23,7 +24,9 @@ DEFAULT_PROFILE = Path.home() / ".cache" / "mathsisfun-algebra-pdf" / "chrome-pr
 
 def slugify(url: str) -> str:
     path = re.sub(r"^https?://[^/]+", "", url)
-    path = re.sub(r"^/[^/]+/", "", path)  # drop leading section, e.g. /algebra/ or /data/
+    path = re.sub(
+        r"^/[^/]+/", "", path
+    )  # drop leading section, e.g. /algebra/ or /data/
     path = re.sub(r"\.html$", "", path)
     slug = re.sub(r"[^A-Za-z0-9]+", "-", path).strip("-")
     return slug or "index"
@@ -43,7 +46,7 @@ def dismiss_consent_modal(page, timeout: int) -> None:
         btn.first.click(timeout=1500)
         btn.first.wait_for(state="hidden", timeout=1500)
     except Exception:  # noqa: S110, BLE001 — best-effort dismiss; the modal
-        pass            # not showing up is the expected/common case, not an error
+        pass  # not showing up is the expected/common case, not an error
 
 
 def dismiss_cookie_banner(page, timeout: int) -> None:
@@ -103,12 +106,24 @@ def main() -> int:
                 # tends to render within ~1s.
                 dismiss_consent_modal(page, timeout=1000)
                 dismiss_cookie_banner(page, timeout=2500)
-                page.pdf(path=str(dest), format="A4", print_background=True,
-                         margin={"top": "12mm", "bottom": "12mm",
-                                 "left": "10mm", "right": "10mm"})
+                page.pdf(
+                    path=str(dest),
+                    format="A4",
+                    print_background=True,
+                    margin={
+                        "top": "12mm",
+                        "bottom": "12mm",
+                        "left": "10mm",
+                        "right": "10mm",
+                    },
+                )
                 print(f"[{i}/{len(urls)}] ok: {url}", flush=True)
             except Exception as exc:  # noqa: BLE001 — one bad page shouldn't kill the whole run
-                print(f"[{i}/{len(urls)}] FAILED: {url}: {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"[{i}/{len(urls)}] FAILED: {url}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 fail += 1
 
         ctx.close()

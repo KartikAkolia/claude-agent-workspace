@@ -7,13 +7,14 @@ additionalContext when it fires. Backs up the "Tool Selection" rule in
 AGENTS.md, which memory-only enforcement wasn't holding (see
 feedback_use_all_tools.md, reconfirmed 2026-08-27).
 """
+
 import json
 import re
 import sys
 
 try:
     data = json.load(sys.stdin)
-except Exception:
+except Exception:  # noqa: BLE001 -- malformed/empty stdin shouldn't block the tool call
     sys.exit(0)
 
 if data.get("tool_name") != "Bash":
@@ -32,7 +33,9 @@ command_for_matching = command
 # -m/--message '...' or "..." (git commit -m, gh pr create -m, etc.)
 command_for_matching = re.sub(
     r"(?:-m|--message)\s+(['\"])(?:\\.|(?!\1).)*\1",
-    "", command_for_matching, flags=re.DOTALL,
+    "",
+    command_for_matching,
+    flags=re.DOTALL,
 )
 # heredoc bodies, e.g. `cat <<'EOF' ... EOF`
 command_for_matching = re.sub(
@@ -40,7 +43,9 @@ command_for_matching = re.sub(
 )
 
 # Only fire for grep/rg/find-style code search, not general Bash use.
-if not re.search(r"\b(grep|rg|find\b.*-name|Select-String)\b", command_for_matching, re.IGNORECASE):
+if not re.search(
+    r"\b(grep|rg|find\b.*-name|Select-String)\b", command_for_matching, re.IGNORECASE
+):
     sys.exit(0)
 
 # Don't nudge for searches inside the read-only reference clones -- those
@@ -56,16 +61,20 @@ reference_clones = (
 if any(name in command for name in reference_clones):
     sys.exit(0)
 
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "additionalContext": (
-            "Reminder (AGENTS.md Tool Selection): for symbol-level Python/code "
-            "navigation or edits in this repo's own scripts, prefer Serena's "
-            "find_symbol / find_referencing_symbols / replace_symbol_body over "
-            "grep+edit string-matching, when the task fits."
-        ),
-    }
-}))
+print(
+    json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "additionalContext": (
+                    "Reminder (AGENTS.md Tool Selection): for symbol-level Python/code "
+                    "navigation or edits in this repo's own scripts, prefer Serena's "
+                    "find_symbol / find_referencing_symbols / replace_symbol_body over "
+                    "grep+edit string-matching, when the task fits."
+                ),
+            }
+        }
+    )
+)
 sys.exit(0)

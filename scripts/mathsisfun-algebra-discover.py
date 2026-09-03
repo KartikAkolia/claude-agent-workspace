@@ -14,6 +14,7 @@ Usage:
     python3 mathsisfun-algebra-discover.py \\
         https://www.mathsisfun.com/data/index.html > urls.txt
 """
+
 import sys
 import time
 from collections import deque
@@ -22,8 +23,11 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-START = (sys.argv[1].split("#")[0] if len(sys.argv) > 1
-         else "https://www.mathsisfun.com/algebra/index.html")
+START = (
+    sys.argv[1].split("#")[0]
+    if len(sys.argv) > 1
+    else "https://www.mathsisfun.com/algebra/index.html"
+)
 PREFIX = "/" + urlparse(START).path.strip("/").split("/")[0] + "/"
 HEADERS = {
     "User-Agent": "kartik-personal-study-archiver/1.0 (+offline reading, low request rate)"

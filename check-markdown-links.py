@@ -12,8 +12,8 @@ import re
 import subprocess
 import sys
 
-BACKTICK_MD = re.compile(r'`([A-Za-z0-9_][A-Za-z0-9_./-]*/[A-Za-z0-9_.-]*\.md)`')
-MD_LINK = re.compile(r'\]\(([^)\s]+)\)')
+BACKTICK_MD = re.compile(r"`([A-Za-z0-9_][A-Za-z0-9_./-]*/[A-Za-z0-9_.-]*\.md)`")
+MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
 
 
 def candidates(line):
@@ -21,9 +21,9 @@ def candidates(line):
         yield m.group(1)
     for m in MD_LINK.finditer(line):
         target = m.group(1)
-        if target.startswith(('http://', 'https://', 'mailto:', '#')):
+        if target.startswith(("http://", "https://", "mailto:", "#")):
             continue
-        yield target.split('#')[0]
+        yield target.split("#")[0]
 
 
 def is_gitignored(repo_root, path):
@@ -33,8 +33,11 @@ def is_gitignored(repo_root, path):
     # treat nothing as ignored rather than erroring the whole check.
     try:
         result = subprocess.run(
-            ['git', 'check-ignore', '-q', path],
-            cwd=repo_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ["git", "check-ignore", "-q", path],
+            cwd=repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
         return result.returncode == 0
     except OSError:
@@ -46,26 +49,28 @@ def check(repo_root, files):
     for f in files:
         path = os.path.join(repo_root, f)
         file_dir = os.path.dirname(path)
-        with open(path, encoding='utf-8') as fh:
+        with open(path, encoding="utf-8") as fh:
             for lineno, line in enumerate(fh, start=1):
                 for target in candidates(line):
                     root_relative = os.path.join(repo_root, target)
                     file_relative = os.path.join(file_dir, target)
                     if os.path.exists(root_relative) or os.path.exists(file_relative):
                         continue
-                    if is_gitignored(repo_root, root_relative) or is_gitignored(repo_root, file_relative):
+                    if is_gitignored(repo_root, root_relative) or is_gitignored(
+                        repo_root, file_relative
+                    ):
                         continue
                     broken.append((f, lineno, target))
     return broken
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('usage: check-markdown-links.py <file.md> [file.md ...]', file=sys.stderr)
+        print("usage: check-markdown-links.py <file.md> [file.md ...]", file=sys.stderr)
         sys.exit(2)
 
     repo_root = os.path.dirname(os.path.abspath(__file__))
     broken = check(repo_root, sys.argv[1:])
     for f, lineno, target in broken:
-        print(f'{f}:{lineno}: broken reference to {target}')
+        print(f"{f}:{lineno}: broken reference to {target}")
     sys.exit(1 if broken else 0)

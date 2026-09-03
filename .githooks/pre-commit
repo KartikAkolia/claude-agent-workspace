@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Lints staged markdown with mdl and checks local cross-references for rot,
-# and validates staged JSON/YAML config parses cleanly, before allowing a
-# commit. Skips the read-only ChrisTitusTech reference clones and
+# Lints staged markdown with mdl and checks local cross-references for rot;
+# validates staged JSON/YAML config parses cleanly; and runs
+# lint-bash.sh/lint-python.sh over staged bash and Python files, before
+# allowing a commit. Skips the read-only ChrisTitusTech reference clones and
 # vendored/tool-generated content (see AGENTS.md non-negotiable #1).
 # Config: ../.mdlrc, ../.mdl_style.rb
 set -uo pipefail
@@ -44,7 +45,37 @@ for f in "${staged_config[@]}"; do
 	[ "$skip" -eq 0 ] && [ -f "$f" ] && config_files+=("$f")
 done
 
-if [ "${#md_files[@]}" -eq 0 ] && [ "${#config_files[@]}" -eq 0 ]; then
+# Bash scripts aren't reliably *.sh (e.g. .githooks/pre-commit has no
+# extension), so find them by shebang instead of extension.
+mapfile -t staged_all < <(git diff --cached --name-only --diff-filter=ACMR)
+bash_files=()
+for f in "${staged_all[@]}"; do
+	skip=0
+	case "$f" in
+	*/node_modules/*) skip=1 ;;
+	esac
+	is_reference_clone "$f" && skip=1
+	[ "$skip" -eq 1 ] && continue
+	[ -f "$f" ] || continue
+	IFS= read -r first_line <"$f" 2>/dev/null || continue
+	case "$first_line" in
+	'#!'*bash) bash_files+=("$f") ;;
+	esac
+done
+
+mapfile -t staged_py < <(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+python_files=()
+for f in "${staged_py[@]}"; do
+	skip=0
+	case "$f" in
+	*/node_modules/*) skip=1 ;;
+	esac
+	is_reference_clone "$f" && skip=1
+	[ "$skip" -eq 0 ] && [ -f "$f" ] && python_files+=("$f")
+done
+
+if [ "${#md_files[@]}" -eq 0 ] && [ "${#config_files[@]}" -eq 0 ] &&
+	[ "${#bash_files[@]}" -eq 0 ] && [ "${#python_files[@]}" -eq 0 ]; then
 	exit 0
 fi
 
@@ -82,6 +113,14 @@ fi
 
 if [ "${#config_files[@]}" -gt 0 ]; then
 	"$repo_root/validate-config.sh" "${config_files[@]}" || status=1
+fi
+
+if [ "${#bash_files[@]}" -gt 0 ]; then
+	"$repo_root/lint-bash.sh" "${bash_files[@]}" || status=1
+fi
+
+if [ "${#python_files[@]}" -gt 0 ]; then
+	"$repo_root/lint-python.sh" "${python_files[@]}" || status=1
 fi
 
 exit "$status"
