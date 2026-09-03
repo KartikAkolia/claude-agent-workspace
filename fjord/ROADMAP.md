@@ -124,7 +124,9 @@ Fjord's read-only rendering of the workspace's docs is confirmed working (Phase 
 
 ### Completion Evidence
 
-Kartik's go-ahead: "Let's pick up from where we left off and work on Phase 4" (2026-09-03), followed by his explicit scope/method answer above. Verified after the move: `git status` shows all 9 moved files as detected renames (`R`, not add+delete), so `git log --follow` will resolve each back to its original commits once this is committed; `npx astro check` and `npm run build` both clean, with the `productivity` collection now resolving exactly 2 docs (`CLAUDE.md`, `TASKS.md`) instead of 3.
+Kartik's go-ahead: "Let's pick up from where we left off and work on Phase 4" (2026-09-03), followed by his explicit scope/method answer above. Verified after the move: `git status` shows all 9 moved files as detected renames (`R`, not add+delete); `npx astro check` and `npm run build` both clean, with the `productivity` collection now resolving exactly 2 docs (`CLAUDE.md`, `TASKS.md`) instead of 3. Committed as `2d927d3`, pushed — `git log --follow` on the moved `dashboard.html` afterward confirmed the rename preserved its full history back through the `createCard`/`createListItem` merge to the original 2026-08-20 import.
+
+Re-verified with a live dev server, not just a build, per Kartik's separate follow-up ask: `npm run dev` (Astro 7's detached daemon, pid confirmed via `astro dev status`), then `curl` against `/`, `/productivity/`, and `/productivity/CLAUDE/` — all `200`, and `/productivity/`'s listing confirmed showing only `CLAUDE`/`TASKS` with no leftover `dashboard-usage-guide` entry. Stopped cleanly afterward (`astro dev stop`; `astro dev status` confirmed nothing left running).
 
 ## Phase 5: Polish and the deployment decision
 
