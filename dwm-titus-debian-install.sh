@@ -25,33 +25,33 @@ sudo apt update
 
 # build
 sudo apt install -y gcc make pkgconf libx11-dev libxft-dev libxinerama-dev \
-  libxrender-dev libimlib2-dev libxcb1-dev libxcb-util-dev libfreetype-dev \
-  libfontconfig-dev libx11-xcb-dev libxcb-res0-dev
+	libxrender-dev libimlib2-dev libxcb1-dev libxcb-util-dev libfreetype-dev \
+	libfontconfig-dev libx11-xcb-dev libxcb-res0-dev
 
 # x11
 sudo apt install -y xserver-xorg xinit x11-xserver-utils xinput x11-xkb-utils
 
 # runtime-required
 sudo apt install -y dbus-x11 curl git procps psmisc unzip util-linux xclip \
-  xdotool x11-utils xdg-utils
+	xdotool x11-utils xdg-utils
 
 # desktop
 sudo apt install -y quickshell picom feh dex mate-polkit alsa-utils \
-  brightnessctl pulseaudio-utils pipewire pavucontrol pipewire-pulse \
-  wireplumber libnotify-bin light-locker xserver-xorg-input-libinput \
-  bluez blueman playerctl
+	brightnessctl pulseaudio-utils pipewire pavucontrol pipewire-pulse \
+	wireplumber libnotify-bin light-locker xserver-xorg-input-libinput \
+	bluez blueman playerctl
 
 # desktop-optional
 sudo apt install -y thunar gvfs gvfs-backends tumbler thunar-archive-plugin \
-  file-roller xdg-user-dirs xdg-desktop-portal-gtk gnome-keyring \
-  libpam-gnome-keyring network-manager rsync
+	file-roller xdg-user-dirs xdg-desktop-portal-gtk gnome-keyring \
+	libpam-gnome-keyring network-manager rsync
 
 # theme
 sudo apt install -y dconf-cli
 
 # theme-gtk (deepin-gtk-theme skipped — no Debian package exists)
 sudo apt install -y arc-theme adw-gtk3 numix-gtk-theme yaru-theme-gtk \
-  bluebird-gtk-theme
+	bluebird-gtk-theme
 
 # theme-optional
 sudo apt install -y qt6ct qt5ct
