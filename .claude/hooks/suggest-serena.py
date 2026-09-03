@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """PreToolUse hook (Bash): nudge toward Serena's symbol tools instead of
 shelling out to grep/rg/find for code search in this repo's own scripts.
 
