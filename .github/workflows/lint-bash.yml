@@ -1,0 +1,39 @@
+name: Lint Bash
+
+# Runs lint-bash.sh (shellcheck + shfmt -d + bash -n) against every tracked
+# bash script, skipping the five read-only reference clones (see AGENTS.md
+# non-negotiable #1). Path-filtered so a markdown/Python/config-only change
+# doesn't also trigger this -- split out of the single lint.yml
+# (2026-09-03), see SPEC.md's Testing & CI section for why. Backstop for the
+# local pre-commit hook (.githooks/pre-commit).
+#
+# Bash scripts aren't reliably *.sh (list-lint-files.sh finds them by
+# shebang instead), but a GitHub Actions path filter can only match on the
+# file path itself, not its content -- so .githooks/pre-commit (the one
+# tracked bash script without a .sh extension) is listed explicitly below.
+# A future non-.sh bash script would need adding here too.
+on:
+  push:
+    paths:
+      - "**.sh"
+      - ".githooks/pre-commit"
+      - ".github/workflows/lint-bash.yml"
+  pull_request:
+    paths:
+      - "**.sh"
+      - ".githooks/pre-commit"
+      - ".github/workflows/lint-bash.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install shellcheck and shfmt
+        run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt
+
+      - name: lint-bash.sh
+        run: |
+          mapfile -t files < <(./list-lint-files.sh bash)
+          ./lint-bash.sh "${files[@]}"

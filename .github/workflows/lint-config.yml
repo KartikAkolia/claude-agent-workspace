@@ -1,0 +1,37 @@
+name: Lint Config
+
+# Validates every tracked JSON/YAML file parses cleanly (validate-config.sh)
+# -- catches a typo in .claude/settings.json or a workflow file before it
+# silently breaks hook/tool wiring at runtime. Skips the five read-only
+# reference clones (see AGENTS.md non-negotiable #1). Path-filtered so a
+# markdown/bash/Python-only change doesn't also trigger this -- split out of
+# the single lint.yml (2026-09-03), see SPEC.md's Testing & CI section for
+# why. Backstop for the local pre-commit hook (.githooks/pre-commit).
+on:
+  push:
+    paths:
+      - "**.json"
+      - "**.yml"
+      - "**.yaml"
+      - "validate-config.sh"
+      - "list-lint-files.sh"
+      - ".github/workflows/lint-config.yml"
+  pull_request:
+    paths:
+      - "**.json"
+      - "**.yml"
+      - "**.yaml"
+      - "validate-config.sh"
+      - "list-lint-files.sh"
+      - ".github/workflows/lint-config.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: validate-config.sh
+        run: |
+          mapfile -t files < <(./list-lint-files.sh config)
+          ./validate-config.sh "${files[@]}"

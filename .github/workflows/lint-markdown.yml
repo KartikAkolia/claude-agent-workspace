@@ -1,0 +1,51 @@
+name: Lint Markdown
+
+# Runs mdl plus check-markdown-links.py (catches local cross-references to
+# files that no longer exist) against every tracked markdown file, skipping
+# the five read-only reference clones (see AGENTS.md non-negotiable #1).
+# Path-filtered so a bash/Python/config-only change doesn't also trigger
+# this -- split out of the single lint.yml (2026-09-03), see SPEC.md's
+# Testing & CI section for why. Backstop for the local pre-commit hook
+# (.githooks/pre-commit): catches a --no-verify bypass or a commit pushed
+# from a machine where the hook wasn't wired up
+# (git config core.hooksPath .githooks).
+on:
+  push:
+    paths:
+      - "**.md"
+      - "check-markdown-links.py"
+      - "list-lint-files.sh"
+      - ".mdlrc"
+      - ".mdl_style.rb"
+      - ".github/workflows/lint-markdown.yml"
+  pull_request:
+    paths:
+      - "**.md"
+      - "check-markdown-links.py"
+      - "list-lint-files.sh"
+      - ".mdlrc"
+      - ".mdl_style.rb"
+      - ".github/workflows/lint-markdown.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mdl
+        # --user-install: the runner's system gem dir isn't writable by the
+        # non-root runner user.
+        run: |
+          gem install --no-document --user-install mdl
+          echo "$(ruby -e 'puts Gem.user_dir')/bin" >> "$GITHUB_PATH"
+
+      - name: mdl
+        run: |
+          mapfile -t files < <(./list-lint-files.sh markdown)
+          mdl "${files[@]}"
+
+      - name: check-markdown-links.py
+        run: |
+          mapfile -t files < <(./list-lint-files.sh markdown)
+          python3 check-markdown-links.py "${files[@]}"

@@ -3,49 +3,22 @@
 # for rot; validates tracked JSON/YAML config parses cleanly; and runs
 # lint-bash.sh/lint-python.sh over this repo's own bash and Python scripts.
 # The name predates the JSON/YAML/bash/Python checks -- kept as-is since
-# .githooks/pre-commit and .github/workflows/lint.yml both call it by name
-# and it's already the repo's one lint entry point, not just markdown.
-# Skips the read-only ChrisTitusTech reference clones (see AGENTS.md
-# non-negotiable #1).
+# .githooks/pre-commit calls it by name for a full local sweep. CI no longer
+# calls this directly: it's split into four path-filtered
+# .github/workflows/lint-*.yml files instead (2026-09-03), so e.g. a
+# markdown-only change doesn't also trigger the bash/Python/config checks.
+# This script is still useful as the "run every category at once" entry
+# point for a full local check. File discovery for each category lives in
+# list-lint-files.sh, shared with those CI workflows. Skips the read-only
+# ChrisTitusTech reference clones (see AGENTS.md non-negotiable #1).
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
-exclude_dirs=(dwm-titus-main linutil-main titus-ai-main website-master winutil-main)
-
-pathspec=('*.md' ':!.*' ':!node_modules' ':!**/node_modules')
-for dir in "${exclude_dirs[@]}"; do
-	pathspec+=(":!$dir")
-done
-mapfile -t files < <(git ls-files "${pathspec[@]}")
-
-config_pathspec=('*.json' '*.yml' '*.yaml' ':!node_modules' ':!**/node_modules')
-for dir in "${exclude_dirs[@]}"; do
-	config_pathspec+=(":!$dir")
-done
-mapfile -t config_files < <(git ls-files "${config_pathspec[@]}")
-
-# Bash scripts aren't reliably *.sh (e.g. .githooks/pre-commit has no
-# extension), so find them by shebang instead of extension.
-all_pathspec=(':!node_modules' ':!**/node_modules')
-for dir in "${exclude_dirs[@]}"; do
-	all_pathspec+=(":!$dir")
-done
-mapfile -t all_files < <(git ls-files "${all_pathspec[@]}")
-bash_files=()
-for f in "${all_files[@]}"; do
-	[ -f "$f" ] || continue
-	IFS= read -r first_line <"$f" 2>/dev/null || continue
-	case "$first_line" in
-	'#!'*bash) bash_files+=("$f") ;;
-	esac
-done
-
-python_pathspec=('*.py' ':!node_modules' ':!**/node_modules')
-for dir in "${exclude_dirs[@]}"; do
-	python_pathspec+=(":!$dir")
-done
-mapfile -t python_files < <(git ls-files "${python_pathspec[@]}")
+mapfile -t files < <(./list-lint-files.sh markdown)
+mapfile -t config_files < <(./list-lint-files.sh config)
+mapfile -t bash_files < <(./list-lint-files.sh bash)
+mapfile -t python_files < <(./list-lint-files.sh python)
 
 status=0
 

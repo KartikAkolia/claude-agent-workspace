@@ -1,0 +1,37 @@
+name: Lint Python
+
+# Runs lint-python.sh (ruff check + ruff format --check, via uvx) against
+# every tracked .py file, skipping the five read-only reference clones (see
+# AGENTS.md non-negotiable #1). Path-filtered so a markdown/bash/config-only
+# change doesn't also trigger this -- split out of the single lint.yml
+# (2026-09-03), see SPEC.md's Testing & CI section for why. Backstop for the
+# local pre-commit hook (.githooks/pre-commit).
+on:
+  push:
+    paths:
+      - "**.py"
+      - "lint-python.sh"
+      - "list-lint-files.sh"
+      - ".github/workflows/lint-python.yml"
+  pull_request:
+    paths:
+      - "**.py"
+      - "lint-python.sh"
+      - "list-lint-files.sh"
+      - ".github/workflows/lint-python.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Gives lint-python.sh's `uvx ruff` a resolvable interpreter, no
+        # system-wide install needed.
+        uses: astral-sh/setup-uv@v7
+
+      - name: lint-python.sh
+        run: |
+          mapfile -t files < <(./list-lint-files.sh python)
+          ./lint-python.sh "${files[@]}"
