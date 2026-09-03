@@ -3,17 +3,15 @@
 Implementation detail for the active phase only. See `ROADMAP.md` for phase order.
 Replace this file's contents when the phase completes, don't accumulate history.
 
-## Active Phase: none — Phase 3 complete, project halted (2026-08-29)
+## Active Phase: none — Phase 4 complete (2026-09-03)
 
-Phases 0–3 are all complete — see `ROADMAP.md` for each phase's Completion Evidence — and committed to `master` (`98b3ea3`). The reading UI (Nord Terminal direction: dwm-style status bar, ranger/lf-style source/file-list/preview panes) sources all 39 in-scope docs across `root`/`docs`/`productivity`/`claude-agent-templates` with no copies, verified against a running dev server (not assumed) and a clean production build (`npm run build`, 44 pages, 0 failures).
+Phases 0–4 are all complete — see `ROADMAP.md` for each phase's Completion Evidence. Phase 4 (dashboard retirement) resumed 2026-09-03 after the 2026-08-29 halt, on Kartik's explicit go-ahead ("Let's pick up from where we left off and work on Phase 4"). Kartik chose Option B (dashboard bundle only, not the whole `productivity/` folder) plus archival over deletion.
 
-**Production on Fjord is halted, Kartik's explicit call (2026-08-29)**: he wants to fork this same structure for a separate, University-focused idea (not this homelab repo) with different content, starting fresh in a future session — not this one. No further phases here (Phase 4 or otherwise) should proceed until Kartik explicitly resumes this project or asks for the fork.
+`productivity/dashboard.html` and everything that supported it (`dashboard-baseline.test.js`, `dashboard-interactions.test.js`, `dashboard-start-editing.test.js`, `escapeHtml.test.js`, `test-helpers/`, `dashboard-usage-guide.md`, `backups/`) now live at `productivity/dashboard-archive/`, moved via `git mv` so history is preserved, with a `README.md` there explaining what it is and how to revert. `productivity/CLAUDE.md` and `productivity/TASKS.md` were left untouched and still render in Fjord's `productivity` collection. `npx astro check` (0 errors/warnings/hints) and `npm run build` (46 pages) both verified clean after the move.
 
-**Update, same day:** the fork happened — see `estuary/` (its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md`). Fjord itself remains exactly as left above; nothing in this file changes as a result.
+Root `AGENTS.md` (repo map + the dashboard-protection line in Change Discipline) and root `ROADMAP.md`'s Phase 3 entry updated to reflect the retirement. Fjord's own `AGENTS.md`, `SPEC.md`, and `src/content.config.ts` updated to describe the archive rather than the old exclude-by-filename list.
 
-Phase 4 (`productivity/dashboard.html` retirement) was already gated on a fresh, explicit go-ahead per `AGENTS.md` non-negotiable 6 before the halt — his earlier "(c) retire outright" answer authorized the decision, not the moment of deletion. This file intentionally holds no Phase 4 task breakdown.
-
-Phase 5 (polish + the deployment decision) remains untouched and on hold.
+Phase 5 (polish + the deployment decision) remains untouched and on hold — no further phase should proceed here without Kartik raising it.
 
 ## Phase Completion
 

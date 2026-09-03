@@ -8,9 +8,11 @@ import { glob } from "astro/loaders";
 // (Context7-verified 2026-08-29).
 //
 // Every pattern below is a flat, non-recursive "*.md" on purpose: it's
-// what naturally excludes productivity/'s dashboard.html, its *.test.js
-// files, and backups/ without an explicit exclude list (none of those
-// are top-level *.md files), per SPEC.md's Architecture section.
+// what naturally excludes productivity/dashboard-archive/ (the retired
+// dashboard.html, its *.test.js files, and backups/ — archived 2026-09-03,
+// see ROADMAP.md Phase 4) without an explicit exclude list, since none of
+// it sits at the top level of productivity/. Per SPEC.md's Architecture
+// section.
 
 // Default id generation kebab-cases and lowercases filenames (github-slugger).
 // Preserve the real, exact filename instead — Fjord displays and links to

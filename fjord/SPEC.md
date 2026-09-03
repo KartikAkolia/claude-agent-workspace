@@ -32,7 +32,7 @@ Fjord is a read-only Astro website for Kartik to browse and read this repo's own
 
    - repo root: `*.md` (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `README.md`, `CLAUDE.md`, `GEMINI.md`)
    - `../docs/*.md`
-   - `../productivity/*.md`, excluding `dashboard.html`, `dashboard-baseline.test.js`, `dashboard-interactions.test.js`, `dashboard-start-editing.test.js`, `escapeHtml.test.js`, and `backups/`
+   - `../productivity/*.md` — `CLAUDE.md` and `TASKS.md` only; the retired dashboard bundle (`dashboard.html` and everything that supported it) lives one level down in `dashboard-archive/`, archived rather than deleted 2026-09-03 (`ROADMAP.md` Phase 4), so it's excluded by the same flat, non-recursive pattern with no exclude list needed
    - `../claude-agent-templates/*.md` (verified 2026-08-29: 9 files, all flat — no nested subdirectory currently exists there, correcting this line's earlier assumption)
 
   No transform/copy step is needed — unlike `website-master`'s `scripts/prepare-content.mjs` (which exists for shortcodes, taxonomy slugs, and legacy-URL tables that don't apply here), Astro's built-in markdown renderer (Shiki for code blocks) is sufficient.

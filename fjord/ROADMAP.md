@@ -106,15 +106,17 @@ Known limitation, not fixed this phase (acceptable for "plain reading and review
 
 ## Phase 4: Dashboard retirement
 
-Status: not started — gated on Phase 3 completion plus a fresh go-ahead from Kartik
+Status: complete (2026-09-03)
 
 ### Objective
 
-Retire `productivity/dashboard.html` and its associated test/backup files outright, per Kartik's explicit choice (2026-08-29, option (c) — no kanban reimplementation). `TASKS.md`/`ROADMAP.md`-style files simply render as read-only docs like any other, same as everything else in scope.
+Retire `productivity/dashboard.html` and its associated test/backup files, per Kartik's explicit choice (2026-08-29, option (c) — no kanban reimplementation). `TASKS.md`/`ROADMAP.md`-style files simply render as read-only docs like any other, same as everything else in scope.
 
 ### Outcomes
 
-`productivity/dashboard.html`, its `.test.js` files, `dashboard-usage-guide.md`, and `backups/` removed (or archived, per Kartik's preference at the time — ask, don't assume, per root `AGENTS.md` non-negotiable 3). Root `AGENTS.md`'s dashboard-protection language and `ROADMAP.md` Phase 3 entry updated to reflect retirement.
+Presented Kartik two open questions before touching anything, per root `AGENTS.md` non-negotiable 3 (ask before a decision only he can make) and its stance on hard-to-reverse actions: scope (whole `productivity/` folder, including `CLAUDE.md`/`TASKS.md`, vs. just the dashboard bundle) and method (delete outright vs. archive). Kartik chose **Option B (dashboard bundle only)** plus **archive, not delete**, "in case I want to revert back some day."
+
+`productivity/dashboard.html`, `dashboard-baseline.test.js`, `dashboard-interactions.test.js`, `dashboard-start-editing.test.js`, `escapeHtml.test.js`, `test-helpers/`, `dashboard-usage-guide.md`, and `backups/` moved (via `git mv`, preserving history) into a new `productivity/dashboard-archive/`, with a `README.md` there explaining what it is and how to revert. `productivity/CLAUDE.md` and `productivity/TASKS.md` were left in place — untouched, still live in Fjord's `productivity` collection. Root `AGENTS.md`'s dashboard-protection language and repo map, and root `ROADMAP.md`'s Phase 3 entry, updated to reflect the retirement. Fjord's own `SPEC.md`, `AGENTS.md`, and `src/content.config.ts` updated to describe the archive rather than the old exclude-by-filename list.
 
 ### Exit Criteria
 
@@ -122,7 +124,7 @@ Fjord's read-only rendering of the workspace's docs is confirmed working (Phase 
 
 ### Completion Evidence
 
-Kartik's explicit go recorded here, plus confirmation the files are gone (or archived) and nothing else references them.
+Kartik's go-ahead: "Let's pick up from where we left off and work on Phase 4" (2026-09-03), followed by his explicit scope/method answer above. Verified after the move: `git status` shows all 9 moved files as detected renames (`R`, not add+delete), so `git log --follow` will resolve each back to its original commits once this is committed; `npx astro check` and `npm run build` both clean, with the `productivity` collection now resolving exactly 2 docs (`CLAUDE.md`, `TASKS.md`) instead of 3.
 
 ## Phase 5: Polish and the deployment decision
 

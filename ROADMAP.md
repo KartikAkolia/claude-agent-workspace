@@ -54,13 +54,15 @@ Give Kartik a working local task dashboard tied to Cowork's productivity skill.
 
 `productivity/dashboard.html` (kanban, dark mode), `TASKS.md`, `CLAUDE.md` (Cowork memory), usage guide, pre-refactor backup kept.
 
+**Retired 2026-09-03** (`fjord/ROADMAP.md` Phase 4): `dashboard.html` and its supporting test/usage-guide/backup files archived, not deleted, under `productivity/dashboard-archive/`, once Fjord's read-only doc reader took over as the workspace's entry point. `TASKS.md` and `CLAUDE.md` stayed live in `productivity/`, untouched.
+
 ### Exit Criteria
 
 Dashboard opens locally, reads and writes `TASKS.md` on disk, autosaves.
 
 ### Completion Evidence
 
-`productivity/dashboard-usage-guide.md`.
+`productivity/dashboard-archive/dashboard-usage-guide.md` (moved here 2026-09-03 when the dashboard was retired, see this phase's Outcomes above).
 
 ## Phase 4: VS Code integration
 
