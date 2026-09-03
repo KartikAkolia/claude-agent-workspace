@@ -1,4 +1,5 @@
 __pycache__/
+website-master/.claude/
 .claude/settings.local.json
 .claude/.headroom_wrap_marker.json
 .claude/.headroom_wrap_settings.lock
