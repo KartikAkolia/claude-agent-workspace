@@ -77,9 +77,7 @@ Before considering this done: `claude --version` runs in VS Code's integrated te
 
 ## Open decisions for you
 
-Resolved (2026-08-21): Phase 3 connectors (GitHub, Notion, Asana) are declined for now, not wired up. Revisit only if a real need for one of them comes up; see Status below.
-
-Resolved (2026-08-21): Phase 2's target repo is this `Github` root (already scaffolded via Phase 5). Phase 4 (porting Engineering-plugin skills into `.claude/skills/`) is done, see Status below for what was ported vs. skipped vs. covered by an installed plugin.
+None outstanding. Phase 2's target repo (this `Github` root) and Phase 3's connector choices (Notion/Asana declined, GitHub later reconnected) were decided 2026-08-21; see Status below for current state and what changed since.
 
 ## Status
 
