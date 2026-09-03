@@ -35,7 +35,7 @@ Scan, same session).
 
 ## Gap analysis (live UK market check, 2026-08-30)
 
-Reference data in the skill's `references/role-requirements.md` is BLS/CompTIA —
+Reference data in the skill's `.claude/skills/it-job-search/references/role-requirements.md` is BLS/CompTIA —
 **US labour market**, explicitly flagged there as directional-only outside the US.
 Everything below is a live check against the actual UK/London market instead.
 
@@ -115,7 +115,8 @@ Kartik during the session:
 - "Complete the checklist again" — unclear what checklist this refers to.
 - "Add/check certs" — no certifications currently listed on the CV; worth deciding
   whether to pursue CompTIA A+ (maps to entry IT-support titles per
-  `references/role-requirements.md`) once time allows alongside Year 0.
+  `.claude/skills/it-job-search/references/role-requirements.md`) once time allows
+  alongside Year 0.
 - "Add Docker" next to Containerisation — Docker's already listed there, unclear
   what else was meant.
 - Whether "Kubernetes (k3s)" should stay in the Containerisation skills line — scan

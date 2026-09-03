@@ -34,7 +34,7 @@ ruled out a passthrough-related driver clash as the cause.
 2. **`TearFree` left at `auto`.** No override existed in `/etc/X11/xorg.conf.d/` (was empty).
    Added `/etc/X11/xorg.conf.d/20-amdgpu-tearfree.conf`:
 
-   ```
+   ```text
    Section "Device"
        Identifier "AMDgpu"
        Driver "amdgpu"
@@ -51,7 +51,7 @@ ruled out a passthrough-related driver clash as the cause.
 `sudo journalctl -k -b | grep -iE 'amdgpu|drm|gpu'` surfaced a genuine kernel WARNING at boot
 (11:24:04, ~1s after Xorg started probing outputs):
 
-```
+```text
 amdgpu 0000:64:00.0: [drm] REG_WAIT timeout 1us * 100 tries - dcn31_program_compbuf_size line:142
 WARNING: .../dcn31/dcn31_hubbub.c:151 dcn31_program_compbuf_size+0xd0/0x220 [amdgpu]
 ```
@@ -67,11 +67,12 @@ Severity varies by report: some describe it as log noise only, others tie it to 
 session instability during monitor/lid events.
 
 Sources:
-- https://github.com/CachyOS/linux-cachyos/issues/810
-- https://www.mail-archive.com/dri-devel@lists.freedesktop.org/msg528230.html
-- https://www.mail-archive.com/amd-gfx@lists.freedesktop.org/msg122029.html
-- https://forums.linuxmint.com/viewtopic.php?t=442975
-- https://forums.gentoo.org/viewtopic.php?t=1173119
+
+- <https://github.com/CachyOS/linux-cachyos/issues/810>
+- <https://www.mail-archive.com/dri-devel@lists.freedesktop.org/msg528230.html>
+- <https://www.mail-archive.com/amd-gfx@lists.freedesktop.org/msg122029.html>
+- <https://forums.linuxmint.com/viewtopic.php?t=442975>
+- <https://forums.gentoo.org/viewtopic.php?t=1173119>
 
 **Conclusion: this is software, not hardware.** A cable/monitor swap won't fix a kernel driver bug
 in DC hubbub's compressed-buffer-size programming. The `TearFree`/picom fixes above address a
