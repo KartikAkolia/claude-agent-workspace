@@ -1,0 +1,44 @@
+name: Fjord CI
+
+# Backstop for fjord/SPEC.md's Testing & CI section (`astro check` for
+# type/content-schema errors, a build as the doc-render smoke check).
+# Fjord is the one part of this repo that's actual buildable application
+# code rather than documentation or a script -- everything else already has
+# a local-hook + CI-backstop pair (see lint.yml), this gives Fjord the same
+# shape. Path-filtered so unrelated root-repo doc commits don't trigger it.
+on:
+  push:
+    paths:
+      - "fjord/**"
+      - ".github/workflows/fjord-ci.yml"
+  pull_request:
+    paths:
+      - "fjord/**"
+      - ".github/workflows/fjord-ci.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fjord
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fjord/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: astro check
+        run: npm run check
+
+      - name: astro build
+        # Doubles as the doc-render smoke check from fjord/SPEC.md: a bad
+        # frontmatter parse or a broken content-collection glob path fails
+        # the build, not just a silent empty page.
+        run: npm run build

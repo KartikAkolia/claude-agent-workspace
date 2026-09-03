@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Fjord's npm deps (astro, its TypeScript tooling). The other subfolders
+  # with a package.json (website-master, and estuary which isn't even
+  # tracked in this repo) are out of scope: website-master is a read-only
+  # ChrisTitusTech reference clone (see AGENTS.md non-negotiable #1),
+  # estuary is gitignored and lives in its own separate GitHub repo.
+  - package-ecosystem: "npm"
+    directory: "/fjord"
+    schedule:
+      interval: "weekly"
