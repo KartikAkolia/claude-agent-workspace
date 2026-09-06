@@ -18,6 +18,7 @@ Read this before every task. `SPEC.md` is the product contract; this file covers
 - `dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`: ChrisTitusTech's own repos, downloaded as research material for the AGENTS.md convention. Read-only reference. Do not edit by hand; `refresh-reference-clone.sh <owner/repo> <branch> <local-dir>` resyncs one from its upstream tarball when asked.
 - `docs/vscode-integration-plan.md`: the five-phase plan for bringing this setup into VS Code, with a running status log of what's actually done, declined, or on hold.
 - `docs/handoff.md`: continuity note for Cowork sessions. Read this and the files it points to before resuming work after a session gap.
+- `docs/gemini/handoff.md`: gemini-cli's own continuity log for its work in this repo, kept separate from the Cowork/Claude Code log above so each CLI's session history stays in its own voice and thread. `GEMINI.md` at the repo root points gemini-cli at both this and `AGENTS.md` on startup.
 
 ## Sources of Truth
 
