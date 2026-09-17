@@ -8,13 +8,14 @@ A read-only Astro site for browsing and reading this repo's own documentation �
 
 ## Non-Negotiables (rules that override the rest)
 
-1. **Fjord is read-only.** It renders the real files living elsewhere in this repo; it never writes back to them, never edits them, never gets a write-back/editing feature bolted on later without Kartik explicitly asking for one. This is the one deliberate difference from `productivity/dashboard.html`'s editable kanban.
-2. **Never duplicate or copy the source docs into `fjord/`'s own tree.** Content is read live from its real on-disk location (root `*.md`, `docs/`, `productivity/*.md` excluding `dashboard.html` and its tests/backups, `claude-agent-templates/*.md`) via Astro's content-collection `glob()` loader pointed at those paths, per `SPEC.md`'s architecture section. Kartik's explicit requirement (2026-08-29): "docs will stay in root repo."
-3. **The five reference clones (`dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`) are excluded from Fjord's content entirely**, per Kartik's explicit instruction (2026-08-29) and the root `AGENTS.md`'s non-negotiable that they're read-only research material, not this project's own code — don't add them to a content collection even as a "browse-only" convenience without asking first.
-4. **`website-master` is reference-only for Astro setup style** (content collections, static output, component layout, TypeScript, a dev script), not for scope. Do not port its shortcode/taxonomy/legacy-redirect/RSS/YouTube machinery — none of it applies to a personal doc reader. Never hand-edit `website-master/` itself.
-5. **No deployment until Kartik says so.** He's holding that decision (2026-08-29) because he isn't yet sure whether any doc in scope contains sensitive homelab/network detail. Don't add hosting config, a live URL, or a `deploy` script without his explicit go-ahead.
-6. **`productivity/dashboard.html` was retired 2026-09-03** (Phase 4, Kartik's fresh go-ahead at that point, per his earlier 2026-08-29 option (c): no kanban reimplementation), once Fjord's read-only rendering of the workspace's docs — including `TASKS.md`/`ROADMAP.md` — was working and confirmed. Kartik chose archival over deletion (scope: the dashboard bundle only — `dashboard.html`, its tests, `test-helpers/`, the usage guide, `backups/` — not `productivity/CLAUDE.md`/`TASKS.md`, which stayed live), so it now lives at `productivity/dashboard-archive/` rather than being gone outright. See `ROADMAP.md` Phase 4 for the full record.
-7. Ask before a decision only Kartik can make (palette variant, layout direction, when to actually delete `dashboard.html`). Don't guess and proceed on those.
+1. Fjord is read-only. It renders the real files living elsewhere in this repo — never writes back to them, never edits them, no write-back/editing feature without Kartik explicitly asking for one. The one deliberate difference from `productivity/dashboard.html`'s editable kanban.
+2. Never duplicate or copy the source docs into `fjord/`'s own tree. Content is read live from its real on-disk location (root `*.md`, `docs/`, `productivity/*.md` excluding the archived dashboard bundle, `claude-agent-templates/*.md`) via Astro's content-collection `glob()` loader, per `SPEC.md`'s architecture section.
+3. The five reference clones (`dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`) are excluded from Fjord's content entirely, per the root `AGENTS.md`'s non-negotiable that they're read-only research material — don't add them to a content collection even as a "browse-only" convenience without asking first.
+4. `website-master` is reference-only for Astro setup style (content collections, static output, component layout, TypeScript, a dev script), not for scope. Do not port its shortcode/taxonomy/legacy-redirect/RSS/YouTube machinery. Never hand-edit `website-master/` itself.
+5. No deployment until Kartik says so — on hold pending a review of whether any in-scope doc contains sensitive homelab/network detail. Don't add hosting config, a live URL, or a `deploy` script without his explicit go-ahead.
+6. Ask before a decision only Kartik can make (palette variant, layout direction, when to actually delete the archived dashboard). Don't guess and proceed on those.
+
+`productivity/dashboard.html`'s retirement (archived, not deleted, to `productivity/dashboard-archive/`) is recorded in `ROADMAP.md` Phase 4, not repeated here.
 
 ## Repository Map
 
@@ -49,5 +50,5 @@ Matches `SPEC.md`. Every claim about what's built or working is verified by actu
 
 ## Project Learnings
 
-- Kartik delegated the project name to the agent (2026-08-29) — settled on "Fjord": a calm, navigable channel, fits a documentation-reading tool, stays inside the Nord/Nordic naming family without colliding with the "Nord" palette name itself.
-- Kartik wants moodboards to drive the final visual direction before any component code is written — Phase 1, not optional here even though the root instructions called moodboards optional in general.
+- Kartik delegated the project name to the agent — settled on "Fjord": a calm, navigable channel, fits a documentation-reading tool, stays inside the Nord/Nordic naming family without colliding with the "Nord" palette name itself.
+- Kartik wants moodboards to drive the final visual direction before any component code is written — not optional here even though the root instructions call moodboards optional in general.

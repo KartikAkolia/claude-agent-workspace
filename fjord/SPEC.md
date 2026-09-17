@@ -18,8 +18,8 @@ Fjord is a read-only Astro website for Kartik to browse and read this repo's own
 
 **Non-goals:**
 
-- No editing or write-back to source docs. Fjord is read-only; `dashboard.html`'s editable kanban is retired, not reimplemented here or anywhere else, per Kartik's explicit choice (2026-08-29).
-- No deployment/hosting for now. On hold (Kartik, 2026-08-29) pending a review of whether any in-scope doc contains sensitive homelab/network detail. Revisit only when he raises it.
+- No editing or write-back to source docs. Fjord is read-only; `dashboard.html`'s editable kanban is retired, not reimplemented here or anywhere else.
+- No deployment/hosting for now. On hold pending a review of whether any in-scope doc contains sensitive homelab/network detail. Revisit only when Kartik raises it.
 - No content from the five reference clones (`dwm-titus-main/`, `linutil-main/`, `titus-ai-main/`, `website-master/`, `winutil-main/`) — excluded by explicit instruction.
 - No CMS, no server runtime, no database. Static output only.
 - No porting of `website-master`'s blog-specific machinery (shortcodes, taxonomy, legacy URL redirects, RSS/YouTube integration, reCAPTCHA livestream chat) — none of it applies to a personal doc reader.
@@ -28,17 +28,17 @@ Fjord is a read-only Astro website for Kartik to browse and read this repo's own
 ## Architecture
 
 - **Framework**: Astro, static output (`output: "static"`, matching `website-master`), TypeScript.
-- **Content sourcing**: Astro content collections using the `glob()` loader. Verified against Astro's official docs via Context7 (2026-08-29) that `base` accepts any filesystem path, including paths outside the project root — so collections point directly at:
+- **Content sourcing**: Astro content collections using the `glob()` loader; `base` accepts any filesystem path, including paths outside the project root, so collections point directly at:
 
    - repo root: `*.md` (`AGENTS.md`, `SPEC.md`, `ROADMAP.md`, `TASKS.md`, `README.md`, `CLAUDE.md`, `GEMINI.md`)
    - `../docs/*.md`
-   - `../productivity/*.md` — `CLAUDE.md` and `TASKS.md` only; the retired dashboard bundle (`dashboard.html` and everything that supported it) lives one level down in `dashboard-archive/`, archived rather than deleted 2026-09-03 (`ROADMAP.md` Phase 4), so it's excluded by the same flat, non-recursive pattern with no exclude list needed
-   - `../claude-agent-templates/*.md` (verified 2026-08-29: 9 files, all flat — no nested subdirectory currently exists there, correcting this line's earlier assumption)
+   - `../productivity/*.md` — `CLAUDE.md` and `TASKS.md` only; the retired dashboard bundle lives one level down in `dashboard-archive/` (`ROADMAP.md` Phase 4), excluded by the same flat, non-recursive pattern with no exclude list needed
+   - `../claude-agent-templates/*.md` (9 files, all flat, no nested subdirectory)
 
   No transform/copy step is needed — unlike `website-master`'s `scripts/prepare-content.mjs` (which exists for shortcodes, taxonomy slugs, and legacy-URL tables that don't apply here), Astro's built-in markdown renderer (Shiki for code blocks) is sufficient.
 - **Live reload**: Astro's content layer watches each collection's `base` directory in dev mode; edits to any in-scope file elsewhere in the repo trigger HMR without restarting `npm run dev`.
-- **Styling**: Nord palette — Polar Night (`#2E3440`–`#3B4252`), Snow Storm (`#D8DEE9`–`#ECEFF4`), Frost (`#8FBCBB`/`#88C0D0`/`#81A1C1`/`#5E81AC`), Aurora accents (`#BF616A`/`#D08770`/`#EBCB8B`/`#A3BE8C`/`#B48EAD`). **Direction: "Nord Terminal"** (Kartik's pick, 2026-08-29, from `fjord/moodboards/fjord-moodboard-2-nord-terminal.html`) — dark-only, Polar Night (`#2E3440`) background throughout, dense information layout, `JetBrains Mono` for everything (no separate serif/UI-sans pairing), a dwm/i3-style thin top status bar (workspace-tag pills for the four source groups: root/docs/productivity/templates, current group highlighted), a ranger/lf-style multi-pane file browser (source list → file list → preview pane), thin `#434C5E` box-drawing-style borders, Frost cyan (`#88C0D0`) for selection/links, Aurora yellow (`#EBCB8B`) for prompt-style accents, Aurora green (`#A3BE8C`) for status indicators.
-- **Deployment**: none configured. Held open per Kartik's explicit hold (2026-08-29).
+- **Styling**: Nord palette — Polar Night (`#2E3440`–`#3B4252`), Snow Storm (`#D8DEE9`–`#ECEFF4`), Frost (`#8FBCBB`/`#88C0D0`/`#81A1C1`/`#5E81AC`), Aurora accents (`#BF616A`/`#D08770`/`#EBCB8B`/`#A3BE8C`/`#B48EAD`). Direction: "Nord Terminal" (`fjord/moodboards/fjord-moodboard-2-nord-terminal.html`) — dark-only, Polar Night (`#2E3440`) background throughout, dense information layout, `JetBrains Mono` for everything (no separate serif/UI-sans pairing), a dwm/i3-style thin top status bar (workspace-tag pills for the four source groups: root/docs/productivity/templates, current group highlighted), a ranger/lf-style multi-pane file browser (source list → file list → preview pane), thin `#434C5E` box-drawing-style borders, Frost cyan (`#88C0D0`) for selection/links, Aurora yellow (`#EBCB8B`) for prompt-style accents, Aurora green (`#A3BE8C`) for status indicators.
+- **Deployment**: none configured. Held open pending Kartik's review of sensitive-content exposure.
 
 ## Functional Requirements
 
