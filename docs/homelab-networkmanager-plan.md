@@ -63,6 +63,8 @@ DNS (same day): `Wired connection 1` now uses Cloudflare (`ipv4.dns "1.1.1.1 1.0
 
 To keep the ISP's DNS from returning through any other connection (a new NIC, a VPN, or a regenerated "Wired connection"), `/etc/NetworkManager/conf.d/90-global-dns.conf` sets `[global-dns-domain-*] servers=1.1.1.1,1.0.0.1`. NM's global DNS overrides the DNS from every connection profile and DHCP lease. Verified after a `systemctl restart NetworkManager` as a stand-in for a reboot: `resolv.conf` still lists only Cloudflare, NM's `GlobalDnsConfiguration` D-Bus property shows both servers, `enp3s0` kept `.222`, and lookups resolve. No `resolvconf`, `openresolv`, or `isc-dhcp-client` is installed to overwrite `resolv.conf` behind NM's back. To revert, delete that file and run `systemctl reload NetworkManager`.
 
+Bridge (same day): the host's IP now lives on a `br0` bridge rather than directly on `enp3s0`, for bridged KVM guests. `br0` uses DHCP with `enp3s0`'s MAC cloned, so it still gets `.222`. `enp3s0` is a bridge port (`br0-port1`), and `Wired connection 1` is kept as the rollback profile with `autoconnect no`. Details and the rollback command are in `docs/kvm-virtualization-setup.md`'s "Redo after reinstall" section.
+
 ## Sources
 
 - [Debian wiki — NetworkManager](https://wiki.debian.org/NetworkManager) (ifupdown/NetworkManager interaction, `managed=` handover procedure)
