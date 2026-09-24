@@ -36,8 +36,10 @@ Confirmed: `uv --version` → `0.12.5`, `uvx --version` → `0.12.5`, both at `~
 ## 4. Headroom (local compression proxy + memory)
 
 ```sh
-uv tool install headroom-ai
+uv tool install --python 3.13 "headroom-ai[proxy,code,mcp,reports]"
 ```
+
+The extras matter: plain `headroom-ai` installs, but `headroom mcp serve` then fails with `ImportError: MCP SDK not installed` (confirmed on this host 2026-09-24), and the proxy needs the `proxy` extra (see `docs/raspberry-pi-host-setup.md`).
 
 Confirmed: `uv tool list` shows `headroom-ai v0.36.5 - headroom`. Registered as a `stdio` MCP server in `~/.claude.json`'s top-level `mcpServers`:
 

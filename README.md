@@ -7,7 +7,7 @@ Kartik's personal Claude Code / Cowork workspace: shared `AGENTS.md`/`SPEC.md`/`
 ```sh
 curl -fsSL https://claude.ai/install.sh | bash        # Claude Code CLI
 curl -LsSf https://astral.sh/uv/install.sh | sh        # uv, needed by the two local MCP servers
-uv tool install headroom-ai                             # headroom (compression proxy + memory)
+uv tool install --python 3.13 "headroom-ai[proxy,code,mcp,reports]"  # headroom (plain install lacks MCP/proxy)
 sudo apt install shellcheck shfmt devscripts bind9-dnsutils rsync \
   quickshell qt6-declarative-dev-tools cmake ninja-build hugo podman
 gem install --user-install mdl                          # markdown linting (lint-markdown.sh, pre-commit hook)
