@@ -45,6 +45,24 @@ Step 1 briefly brings `enp3s0` down and back up under NM's control. Per the `hom
 
 Current state: `enp3s0` static at `192.168.0.222/24` via NetworkManager, IPv6 disabled on the connection (not kernel-wide), sleep targets masked. `networking.service` (ifupdown) is still enabled but only manages `lo` now — it's not actively conflicting, but wasn't explicitly disabled either since it's harmless as-is.
 
+## Redone after reinstall (2026-09-24)
+
+`dell-optiplex` was reinstalled (Debian 13, kernel `6.12.107+deb13-amd64`, Cinnamon), so the state above is history. On the fresh install, NetworkManager already managed `enp3s0` through its default `Wired connection 1` profile (DHCP; the router still hands out `192.168.0.222`). `networking.service` only brought up `lo`, and `systemd-networkd` was already disabled. `wpa_supplicant` was left enabled, since it's NetworkManager's own Wi-Fi backend rather than a competing daemon.
+
+Changes, run as one root script (log: `/var/tmp/nm-ipv4-20260924.log`; backups with a `.bak-20260924` suffix next to `NetworkManager.conf` and `gai.conf`, plus `/var/tmp/Wired connection 1.nmconnection.bak-20260924`):
+
+- `/etc/NetworkManager/NetworkManager.conf` reduced to `[main] plugins=keyfile`, dropping the `ifupdown` plugin and its `managed=false` section.
+- `systemctl disable --now networking.service`. `lo` stays up without it (systemd configures loopback itself, and NM shows it as externally connected).
+- `nmcli connection modify "Wired connection 1" ipv6.method disabled`, applied with `nmcli device reapply enp3s0` instead of a full reconnect, so there was no new DHCP request and no repeat of the address change described above.
+- `/etc/sysctl.d/90-disable-ipv6.conf` sets `disable_ipv6 = 1` for `all` and `default` and `0` for `lo`, so interfaces NM doesn't manage (bridges, containers) come up without IPv6, while `::1` stays available for local services (CUPS on `[::1]:631`, sshd on `[::]:22`). NM's `ipv6.method` can't be set as a global connection default in `NetworkManager.conf`, so a new NM profile with `ipv6.method=auto` would turn IPv6 back on for its interface. Set `ipv6.method disabled` on any new profile.
+- `/etc/gai.conf` gained the full RFC 6724 precedence table with `::ffff:0:0/96` raised to `100`, so `getaddrinfo` returns IPv4 first. The whole table is restated because any `precedence` line replaces glibc's default table.
+
+Verified: NM `active`/`enabled`; `networking`, `systemd-networkd` `inactive`/`disabled`; `enp3s0` has only `192.168.0.222/24` and no IPv6 address or route; `disable_ipv6` reads `1` for `all`/`default`/`enp3s0` and `0` for `lo`; `getent ahosts google.com` returns only IPv4; ping and HTTPS both work.
+
+DNS (same day): `Wired connection 1` now uses Cloudflare (`ipv4.dns "1.1.1.1 1.0.0.1"`, `ipv4.ignore-auto-dns yes`), applied with `nmcli device reapply`; `/etc/resolv.conf` lists only those two servers. There's no system DNS cache to flush: `systemd-resolved`, `nscd`, `dnsmasq`, and `unbound` aren't running, and NM writes `resolv.conf` directly, so glibc queries the upstream servers on every lookup. Browsers keep their own caches (Brave: `brave://net-internals/#dns` → Clear host cache).
+
+To keep the ISP's DNS from returning through any other connection (a new NIC, a VPN, or a regenerated "Wired connection"), `/etc/NetworkManager/conf.d/90-global-dns.conf` sets `[global-dns-domain-*] servers=1.1.1.1,1.0.0.1`. NM's global DNS overrides the DNS from every connection profile and DHCP lease. Verified after a `systemctl restart NetworkManager` as a stand-in for a reboot: `resolv.conf` still lists only Cloudflare, NM's `GlobalDnsConfiguration` D-Bus property shows both servers, `enp3s0` kept `.222`, and lookups resolve. No `resolvconf`, `openresolv`, or `isc-dhcp-client` is installed to overwrite `resolv.conf` behind NM's back. To revert, delete that file and run `systemctl reload NetworkManager`.
+
 ## Sources
 
 - [Debian wiki — NetworkManager](https://wiki.debian.org/NetworkManager) (ifupdown/NetworkManager interaction, `managed=` handover procedure)
