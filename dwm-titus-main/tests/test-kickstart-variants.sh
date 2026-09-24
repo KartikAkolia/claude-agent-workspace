@@ -6,6 +6,9 @@ repo=$(
 	cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd
 )
 
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
 standard_ks="$repo/dwm-fedora.ks"
 nvidia_ks="$repo/dwm-fedora-nvidia.ks"
 builder="$repo/scripts/build-dwm-fedora-installer-iso.sh"
@@ -45,10 +48,13 @@ required_packages=(
 	file-roller
 	xdg-user-dirs
 	xdg-desktop-portal-gtk
+	xsettingsd
 	gnome-keyring
 	gnome-keyring-pam
 	qt6ct
 	qt5ct
+	adwaita-icon-theme
+	papirus-icon-theme
 	arc-theme
 	adw-gtk3-theme
 	numix-gtk-theme
@@ -56,6 +62,15 @@ required_packages=(
 	yaru-gtk4-theme
 	deepin-gtk-theme
 	bluebird-gtk3-theme
+	PackageKit
+	PackageKit-glib
+	python3-gobject
+	python3-rpm
+	accountsservice
+	cups
+	system-config-printer
+	lxqt-admin
+	dnfdragora
 )
 
 mapfile -t mapped_fedora_packages < <(
@@ -72,18 +87,40 @@ if dwm_packages fedora runtime-required | grep -Fx maim >/dev/null; then
 fi
 dwm_packages fedora screenshot-optional | grep -Fx maim >/dev/null
 dwm_packages fedora x11 | grep -Fx setxkbmap >/dev/null
+dwm_packages fedora x11 | grep -Fx xkbset >/dev/null
 dwm_packages fedora recommended | grep -Fx playerctl >/dev/null
 dwm_packages fedora desktop | grep -Fx quickshell >/dev/null
 dwm_packages fedora desktop | grep -Fx flatpak >/dev/null
 dwm_packages fedora desktop | grep -Fx xdg-desktop-portal-gtk >/dev/null
 dwm_packages fedora desktop | grep -Fx dbus-tools >/dev/null
 dwm_packages fedora desktop | grep -Fx inotify-tools >/dev/null
+dwm_packages fedora desktop | grep -Fx xsettingsd >/dev/null
 if ARCH=x86_64 dwm_packages fedora full | grep -Fx nwg-look >/dev/null; then
 	printf 'Unavailable Fedora package leaked into the image package set: nwg-look\n' >&2
 	exit 1
 fi
 dwm_packages fedora full | grep -Fx gvfs-smb >/dev/null
 dwm_packages fedora full | grep -Fx gnome-keyring-pam >/dev/null
+
+# Interactive defaults must remove the Server root cap as well as /home.
+python3 - "$repo/branding/anaconda/etc/anaconda/conf.d/90-dwm-storage.conf" <<'PYCONFIG'
+import configparser
+import sys
+config = configparser.ConfigParser()
+assert config.read(sys.argv[1])
+assert config['Storage']['file_system_type'] == 'xfs'
+assert config['Storage']['default_scheme'] == 'PLAIN'
+assert config['Storage']['default_partitioning'].strip() == '/ (min 2 GiB)'
+PYCONFIG
+
+# Public profiles require interactive storage review. Only the private
+# factory may configure partitioning and authorize disposable-disk erasure.
+for ks in "$standard_ks" "$nvidia_ks" "$repo/dwm-fedora-image.ks"; do
+	if grep -Eq '^(autopart|clearpart|zerombr|ignoredisk|part|partition|logvol|volgroup|reqpart)([[:space:]]|$)' "$ks"; then
+		printf 'Public Kickstart overrides interactive disk selection or shared root layout: %s\n' "$ks" >&2
+		exit 1
+	fi
+done
 
 for ks in "$standard_ks" "$nvidia_ks"; do
 	if grep -Fxq nwg-look "$ks"; then
@@ -106,14 +143,41 @@ for ks in "$standard_ks" "$nvidia_ks"; do
 		exit 1
 	fi
 	grep -Fq "url --metalink=\"https://mirrors.fedoraproject.org/metalink?repo=fedora-\$releasever&arch=\$basearch\"" "$ks"
+	# Execute the actual post-script cleanup prefix in a disposable directory.
+	# Replace its sudoers path before execution; never touch host authorization.
+	awk '
+		/^%post --erroronfail/ { active=1; next }
+		active && /^target_user=/ { exit }
+		active && /^install_sudoers=/ { print "install_sudoers=$DWM_TEST_SUDOERS"; next }
+		active { print }
+	' "$ks" >"$work/post-prefix"
+	for failure in exit signal; do
+		cp "$work/post-prefix" "$work/post-failure"
+		cat >>"$work/post-failure" <<'SH'
+printf 'fixture authorization\n' >"$install_sudoers"
+if [ "$DWM_TEST_FAILURE" = signal ]; then
+	kill -TERM "$$"
+else
+	exit 73
+fi
+SH
+		status=0
+		DWM_TEST_SUDOERS="$work/sudoers" DWM_TEST_FAILURE=$failure \
+			sh "$work/post-failure" || status=$?
+		expected_status=73
+		[[ $failure != signal ]] || expected_status=1
+		[[ $status == "$expected_status" && ! -e $work/sudoers ]]
+	done
+
 	grep -Fq 'firstboot --disable' "$ks"
 	grep -Fq 'selinux --disabled' "$ks"
-	grep -Fq './install.sh --non-interactive --profile core' "$ks"
+	grep -Fq './install.sh --non-interactive --profile recommended' "$ks"
 	if grep -Fq -- '--install-herdr' "$ks"; then
 		printf 'Herdr must not be installed by default in %s\n' "$ks" >&2
 		exit 1
 	fi
-	grep -Fq 'scripts/install-gearlever' "$ks"
+	# shellcheck disable=SC2016 # Match the literal deferred expansion in Kickstart.
+	grep -Fq 'export DBUS_SYSTEM_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS; exec ./install.sh' "$ks"
 	grep -Fq '%include /tmp/dwm-titus-gaming-repo' "$ks"
 	grep -Fq '%include /tmp/dwm-titus-gaming-packages' "$ks"
 	# shellcheck disable=SC2016

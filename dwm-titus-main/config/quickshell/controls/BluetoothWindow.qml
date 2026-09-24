@@ -10,8 +10,8 @@ ClickAwayPopup {
     required property var bluetoothModel
     required property var panelWindow
 
-    readonly property int cardWidth: 360
-    readonly property int cardHeight: 420
+    readonly property int cardWidth: Theme.scaledSize(360)
+    readonly property int cardHeight: Theme.scaledSize(420)
 
     visible: panelWindow !== null && panelWindow.screen !== null && bluetoothModel.visible
     targetWindow: panelWindow
@@ -58,6 +58,8 @@ ClickAwayPopup {
                     checked: root.bluetoothModel.powered
                     busy: root.bluetoothModel.busy
                     enabled: root.bluetoothModel.available && root.bluetoothModel.actionsAvailable
+                    accessibleName: "Bluetooth power"
+                    accessibleDescription: "Turn the Bluetooth adapter on or off"
                     onToggled: root.bluetoothModel.action("bluetooth-power", [checked ? "off" : "on"])
                 }
             }
@@ -86,7 +88,7 @@ ClickAwayPopup {
 
                     required property var modelData
                     width: ListView.view.width
-                    height: 58
+                    height: Theme.scaledSize(58)
                     radius: Theme.smallRadius
                     color: deviceMouse.containsMouse ? Theme.controlHoverFill : Theme.controlNormalFill
                     border.color: deviceMouse.containsMouse ? Theme.controlHoverBorder : Theme.controlNormalBorder
@@ -101,7 +103,7 @@ ClickAwayPopup {
                             UiText {
                                 Layout.fillWidth: true
                                 text: deviceRow.modelData.name.length > 0 ? deviceRow.modelData.name : deviceRow.modelData.address
-                                color: Theme.textStrong
+                                color: Theme.readableText(Theme.textStrong, String(deviceRow.color))
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
@@ -110,7 +112,7 @@ ClickAwayPopup {
                                 Layout.fillWidth: true
                                 text: deviceRow.modelData.connected ? "Connected"
                                     : deviceRow.modelData.paired ? "Paired" : deviceRow.modelData.address
-                                color: Theme.menuMutedText
+                                color: Theme.readableText(Theme.menuMutedText, String(deviceRow.color))
                                 font.pixelSize: Theme.fontCaptionSize
                                 elide: Text.ElideRight
                             }

@@ -42,7 +42,7 @@ Flickable {
 					font.family: Theme.fontFamily
 					font.pixelSize: Theme.bodyFontSize
 				}
-                ShellButton { label: "Keep"; onActivated: root.settingsModel.keepPreview("") }
+                ShellButton { label: "Keep"; onActivated: root.settingsModel.keepPreview() }
                 ShellButton { label: "Revert"; danger: true; onActivated: root.settingsModel.revertPreview() }
             }
         }
@@ -75,6 +75,15 @@ Flickable {
                     anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                     anchors.leftMargin: 16; anchors.rightMargin: 10; anchors.topMargin: 10
                     Text { text: deviceCard.modelData.name + " (" + deviceCard.modelData.kind + ")"; color: Theme.textStrong; font.family: Theme.fontFamily; font.pixelSize: Theme.bodyFontSize; font.bold: true }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: deviceCard.modelData.kind === "accessibility"
+                        text: "Session-wide XKB controls use a 15-second preview. Keep the change to restore it at the next login."
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.smallFontSize
+                        wrapMode: Text.WordWrap
+                    }
                     Repeater {
                         model: deviceCard.settings
                         delegate: RowLayout {
@@ -84,10 +93,19 @@ Flickable {
                             property string editValue: modelData.value
                             onModelDataChanged: editValue = modelData.value
 
-                            Text { Layout.preferredWidth: 150; text: settingRow.modelData.label; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.bodyFontSize }
+                            Text {
+                                Layout.preferredWidth: 150
+                                Layout.maximumWidth: 150
+                                text: settingRow.modelData.label
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.bodyFontSize
+                                wrapMode: Text.WordWrap
+                            }
                             ShellButton {
                                 visible: settingRow.modelData.type === "boolean"
                                 label: settingRow.modelData.value === "1" ? "On" : "Off"
+                                accessibleDescription: settingRow.modelData.label + ". Starts a timed preview."
                                 enabled: !root.settingsModel.previewOperationLocked
                                 onActivated: root.settingsModel.previewInput(deviceCard.modelData.key, settingRow.modelData.id, settingRow.modelData.value === "1" ? "0" : "1")
                             }
@@ -99,8 +117,8 @@ Flickable {
                                 color: Theme.controlNormalFill; border.color: Theme.controlNormalBorder; radius: Theme.controlRadius
                                 TextInput { id: settingInput; anchors.fill: parent; anchors.margins: 7; text: settingRow.editValue; color: Theme.textStrong; font.family: Theme.fontFamily; font.pixelSize: Theme.inputFontSize; onTextEdited: settingRow.editValue = text }
                             }
-                            ShellButton { visible: settingRow.modelData.type !== "boolean"; label: "Preview"; enabled: !root.settingsModel.previewOperationLocked; onActivated: root.settingsModel.previewInput(deviceCard.modelData.key, settingRow.modelData.id, settingRow.editValue) }
-                            ShellButton { label: "Reset"; enabled: !root.settingsModel.previewOperationLocked; onActivated: root.settingsModel.resetInput(deviceCard.modelData.key, settingRow.modelData.id) }
+                            ShellButton { visible: settingRow.modelData.type !== "boolean"; label: "Preview"; accessibleDescription: settingRow.modelData.label; enabled: !root.settingsModel.previewOperationLocked; onActivated: root.settingsModel.previewInput(deviceCard.modelData.key, settingRow.modelData.id, settingRow.editValue) }
+                            ShellButton { label: "Reset"; accessibleDescription: settingRow.modelData.label; enabled: !root.settingsModel.previewOperationLocked; onActivated: root.settingsModel.resetInput(deviceCard.modelData.key, settingRow.modelData.id) }
                         }
                     }
                     Repeater {

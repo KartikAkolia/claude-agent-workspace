@@ -6,7 +6,546 @@ versions from `config.mk`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep light-preset hover surfaces light and hovered/selected shell labels
+  readable (issue #349). Install offline GTK 2/3/4 themes and Qt palettes for
+  all 15 presets, including Dracula, with update verification and backup coverage.
+
+- Keep Quickshell linting compatible with Fedora 44 Qt tooling, with typed
+  regional controls and provider monitors, an unambiguous running-app state
+  property, and narrowly scoped exceptions for missing upstream enum metadata.
+
+## [0.7.1] - 2026-09-19
+
+### Fixed
+
+- Prepare Flatpak and verify the official Flathub remote before installing
+  Flatpak applications, using the target user for existing-system installs and
+  the system scope for factory images. Stop app installation on setup failures,
+  conflicting remote URLs, or disabled remotes (issue #332).
+- Set the installer build version to 0.7.1.
+
+- Default both Fedora image variants to regular partitions with `/home` sharing
+  the root filesystem, retaining firmware-specific boot partitions and explicit
+  installation-drive selection and storage confirmation (issue #330).
+- Keep Settings panes in a stable loading surface while their initial reads
+  complete, including Appearance capabilities and personalization state. Reveal
+  populated controls together and preserve them during later refreshes (#315).
+
+### Changed
+
+- Shrink visible tiled windows by 15% when `Super+F` enters floating layout.
+  Repeated presses and individually floated windows keep their geometry;
+  `Super+T` retiles the layout.
+
+- Shrink explicitly toggled tiled windows by 15% around their current center
+  when entering floating mode, respecting application size hints. Toggle again
+  to retile; mouse dragging and resizing retain their existing behavior.
+
+- Let authorized Desktop updates replace changed system-file contents, including
+  dwm, commands, and privileged helpers. Keep destination validation, payload
+  verification, backups, and rollback. Older hash-restricted updaters need one
+  source installation to adopt this behavior.
+
+- Load Appearance wallpaper choices using filenames and metadata, without
+  decoding the image collection during status or readiness checks.
+
+- Simplify Appearance to one desktop font and text-size control shared with the
+  shell. Hide duplicate GTK/Qt selectors, the keyboard/pointer access summary,
+  and application status cards. Keep errors and recovery actions visible.
+
+- Reduce hosted CI to one Fedora build and desktop smoke job. Check managed
+  Quickshell startup, its panel, launcher keyboard interaction, and application
+  launch. Skip documentation-only changes and keep extended validation local.
+
 ### Added
+
+- Add Desktop updates at the top of System Settings, with upstream and installed
+  file checks, confirmed installation, persistent progress, and recovery copies.
+  Sandbox mutable source commands away from host authorization services.
+  Keep proxy credentials out of process arguments, reject special files before
+  staging, and exclude concurrent source installation through both file phases.
+  Build source updates without elevation and restrict authorized system-file
+  replacement to the installed manifest. Preserve personal configuration and
+  distinguish installed updates from changes requiring a new desktop session.
+  Permit approved replacement contents at the installed system destinations.
+
+### Fixed
+
+- Prevent the XSETTINGS daemon from retaining installation locks after theme
+  convergence, which blocked subsequent local desktop updates.
+
+- Recover the desktop typography subscription after it exits, clamp external
+  system text scales without retaining stale ownership, and wrap health summary
+  tiles to fit scaled labels and the available screen width.
+
+- Speed up random wallpaper changes by choosing filenames before decoding,
+  checking only the images needed for each monitor and retrying corrupt files.
+
+- Install Celluloid, mpv, and sxiv in every Fedora installer profile and both
+  ISO variants. Seed fresh-account audio/video defaults from Celluloid and
+  image defaults from sxiv, preserving existing application preferences (#308).
+
+- Keep the top bar sharp when panel menus open by placing their transparent
+  click-away surface below the bar.
+
+- Add Close to the update log window and remove the redundant Check status
+  action from automatically refreshed update progress.
+
+- Simplify the desktop update card to Check again and Update desktop. Open
+  progress automatically after starting an update and reopen it from the panel.
+
+- Keep desktop update progress in a separate window that survives shell restarts,
+  with elapsed time, a log viewer, completion notifications, and a panel shortcut
+  for reopening hidden progress.
+
+- Use one administrator approval for each desktop update or explicit recovery.
+  Retain a private, transaction-bound helper through all privileged phases,
+  without saving passwords or granting authorization to unrelated commands.
+
+- Reveal desktop update authorization by closing Settings when a password
+  request starts. Keep Check status and the log location available during an
+  update, show recovery progress, and stop repeated authorization requests
+  after a timeout while retaining recovery records.
+
+- Show menu-hidden image viewers such as sxiv and Feh in Settings MIME defaults,
+  and allow selecting them while continuing to exclude disabled or unavailable
+  handlers. Preserve application launcher and default-role visibility filtering.
+
+- Keep imported Picom includes available after failed activation, allow imports
+  into explicitly selected standard user roots, and bound unused import recovery
+  files. Allow a brief X11 selection-release grace before starting Picom while
+  keeping stop independent of X11 access. Include xsettingsd in CI validation.
+
+- Preserve pending Picom edit revisions, import read-only includes from existing
+  user configurations, and recover include watches after invalid edits. Limit
+  failed-launch cleanup to its own processes and attempt compositor recovery
+  before reporting rollback conflicts, preserving relative configuration paths.
+
+### Changed
+
+- Replace unstable Picom Appearance checks with global opacity sliders,
+  configuration watching, and automatic GPU-aware backend selection with manual
+  overrides. Startup and restart now share the same display-scoped policy (#309).
+
+- Add Self-Heal to Quick Actions for launching a configured workstation repair
+  script in a terminal with visible progress and authorization prompts (#306).
+- Simplify the Power dropdown to Reboot, Logout, Lock, Suspend, and Shutdown
+  without explanatory row text.
+- Build zstd compressed filesystem candidates with recorded compression costs,
+  keep xz input compatibility, and default offline media to normal installation.
+- Seed fresh image accounts with a themed Starship prompt, Brave Origin and
+  sxiv image associations; include verified Herdr for offline use.
+- Use verified Cloudflare-hosted compressed ISOs for the primary download and
+  installation guides, with checksums, offline setup steps and hardware limits.
+
+### Fixed
+
+- Preserve per-screen Picom isolation, apply modern opacity defaults to dialogs,
+  retain ten recovery backups, and recover cleanly from concurrent config removal
+  and transient Appearance errors. Keep native relative shader and nested include
+  lookup behavior during edits.
+
+- Make Settings fullscreen like System Health (#302), stop Appearance overscroll
+  bounce (#303), refresh running X11 clients when changing cursor themes (#304),
+  and hide the redundant Blueman tray icon (#305).
+- Require a modern fixed PackageKit in captured images while preserving the
+  existing unprivileged update security gate and explaining backport recovery.
+- Make the image's sxiv desktop entry discoverable in application Defaults.
+- Exclude `.env`, `.env.*` and `.envrc` at every depth from the ISO source
+  payload, independently of Git ignore rules.
+
+### Added
+
+- Add a compressed filesystem image build path with local Anaconda installation,
+  separate standard/NVIDIA manifests, offline user setup and build-time checks
+  for the desktop package contract, including maim and clipboard dependencies.
+
+## [0.7.0] - 2026-09-10
+
+### Changed
+
+- Keep Settings within the focused screen when opened through IPC, including
+  smaller displays. Refresh generated user autostart entries before starting
+  the graphical session so newly installed exclusions take effect.
+- Document source/configuration backup, interrupted-update retry and restoration,
+  including custom XDG locations and symlink targets.
+
+- Complete Phase 7 software/image qualification with signed Fedora 44 source verification
+  and an explicit VM/hardware evidence matrix, existing-system recovery and
+  integrated desktop validation. Record failed QEMU S3 resume and untested
+  physical hardware without claiming driver or device qualification. Restore the rebuilt installer
+  media checksum so the default media-test boot entry can continue, and patch
+  both BIOS and UEFI menus so either firmware path loads the desktop Kickstart.
+- Provision images with the recommended desktop profile so Meslo icons and
+  Gear Lever are installed. Isolate provisioning D-Bus from the installer's
+  AccountsService, and clean temporary sudoers authorization on post failure
+  or interruption.
+
+- Wait for acknowledged notification-policy persistence in the native restart
+  test, with delayed-write coverage to prevent timing-dependent CI failures.
+
+- Create Settings panes on first visit and retain them for subsequent navigation;
+  avoid repeating section discovery while typing a search for the same section.
+- Pass local validation evidence into review and add a focused native Settings
+  responsiveness gate to shorten fix/review iterations before Phase 7.
+
+- Replace raw System update logs and audit hashes with current-package progress,
+  separate overall progress, and concise verified completion messages.
+
+- Keep seeded autostart exclusions valid for desktop entries with OnlyShowIn,
+  preserving other desktop sessions without adding conflicting NotShowIn keys.
+- Resolve update recovery session evidence for managed user-service launches
+  through logind's verified active local X11 display session.
+- Wrap long Input setting labels and improve Settings search-prompt contrast.
+
+- Brand the Fedora Anaconda installer with a dark theme and centered CTT logo.
+  ISO builds accept `--version X.Y.Z` to generate a sidebar badge in staging
+  without modifying the checkout; build dependencies include Pillow and Noto.
+
+- Add explicit Docked and Undocked automatic display layouts to Settings,
+  including saved previews, detected/applied status, draft editing, confirmed
+  saves and backups. Use optional autorandr login/hotplug integration without
+  persisting session-specific display controller assignments.
+
+- Replace display X/Y inputs with Left of, Right of, Above, and Below
+  placement controls and a numbered layout preview. Preserve timed rollback
+  and existing saved profiles; ignore dock RandR timing rows during discovery.
+
+- Complete Phase 6 system-management qualification with Fedora 44, nested-X11,
+  signed-package guest, graphical authorization and installed-runtime evidence.
+  Record recovery and hardware limitations and queue Phase 7 image/release work.
+
+- Show system information, mounted filesystem usage, security status, and
+  diagnostics in System Settings. Preserve unknown and stale states, navigate
+  to the existing Health scan, and explain scoped recovery and reset ownership.
+
+- Activate cumulative information, storage, security, and diagnostics records
+  with strict provider-scoped validation. Pane-scoped mount and firewalld
+  subscriptions use bounded reconciliation, while required recovery skips
+  optional probes and diagnostics remain available independently of admission.
+
+- Assemble internal system information, filesystem, security, and diagnostics
+  records with isolated failures and complete filesystem-list bounds.
+
+- Show unknown automatic-lock status in Power Settings and Control Center when
+  live evidence is partial or unavailable, instead of displaying saved fallback
+  values as enabled or disabled.
+
+- Add a fixed read-only mount-event helper with acknowledged baseline readiness,
+  bounded event records, and owned-child cleanup for Settings storage monitoring.
+
+- Reuse the power helper's automatic screen-lock evidence through a bounded
+  internal information reader. Preserve unknown and unavailable states without
+  adding a locking policy change or a second locker probe.
+
+- Add internal root block-encryption reporting with capped topology validation,
+  conservative unknown states, and bounded read-only process cleanup.
+
+- Add internal bounded SELinux, Secure Boot, and firewalld status readers with
+  source-specific unknown and denied states. These read-only preparations do
+  not add system configuration actions, public protocol records, or controls.
+
+- Add an internal fixed-command filesystem inventory with capped JSON, stable
+  mount identities, exact byte counts, partial-result handling, and bounded
+  owned-process cleanup.
+
+- Add internal hostname1 hardware vendor/model reads with one bounded deadline,
+  independent property failures, and late-reply suppression. This preparation
+  does not activate a new protocol minor or Settings control.
+
+- Add internal bounded OS, kernel, CPU, memory, swap, and uptime readers with
+  per-field failure isolation and checked byte counters. This preparatory
+  boundary does not activate a new protocol minor, Settings UI, or polling loop.
+
+- Sample network-time synchronization every 30 seconds while System Settings
+  is open and after a verified NTP result. Serialize reads with recovery,
+  preserve matching prompts and keyboard focus, and retain the last reported
+  value with scoped retry guidance when a sample fails.
+
+- Reconcile time-service arrivals through bounded time-only reads. Preserve
+  unchanged regional selections and matching previews, pause time actions until
+  reconciliation finishes, and retain explicit retry guidance after churn or
+  read failure without repeatedly rediscovering package state.
+
+- Extend the finite QML regional reader to validate scoped time observations,
+  with bounded output, deadlines, and cancellation cleanup. Settings scheduling
+  and confirmation behavior are unchanged at this preparatory boundary.
+
+- Add read-only time discovery interfaces for scoped reconciliation: a bounded
+  time-status result and a passive monitor that distinguishes service arrivals
+  from property changes. Existing Settings activation is unchanged.
+
+- Stop native regional observation cooperatively on TERM, INT, or HUP. Retain
+  durable interrupted recovery for sent changes without claiming cancellation
+  or waiting on another service read after an explicit local stop.
+
+- Add a finite, read-only `ntp-sample` helper command with versioned bounded
+  output, scoped failures, and no journal, package discovery, or polling loop.
+
+- Share the panel's minute-level clock with System Settings and refresh both
+  displays after verified timezone discovery, retaining the same instant across
+  timezone changes without an extra poller or shell restart.
+
+- Expose searchable timezone and system-locale choices plus fixed network-time
+  controls in System Settings. Require fresh full previews and explicit
+  confirmation, explain the sent-action cancellation limit, and preserve
+  keyboard access, read errors, and verified operation recovery.
+
+- Coordinate internal regional choices, previews, and confirmations with root
+  snapshot recovery. Reject stale or competing preparations, reap optional reads
+  before recovery, and retain sent operations across closure.
+
+- Expose confirmed account, password, printer, and software-source tool entries
+  with scoped availability, readable inventories, and keyboard-accessible
+  confirmations. Native launches no longer show update-only cancellation text.
+
+- Add internal confirmation guards for the four fixed administration tools,
+  with fresh provider evidence, update-workflow exclusion, and reentrant
+  dispatch checks. Visible delegated controls remain pending.
+
+- Install snapshot capture cleanup handlers before temporary-file allocation,
+  and prevent helper launch when cancellation arrives during setup.
+
+- Add a standalone read-only regional preflight helper owner with fixed requests,
+  bounded deadlines, close cleanup, and stale-callback rejection.
+
+- Validate bounded regional choice and confirmation-preview streams in a
+  standalone parser, preserving complete locale details and typed read errors.
+  Visible confirmation remains pending.
+
+- Route fixed regional and delegated origins through the root operation owner
+  with strict arguments, independent native journal admission, and scoped
+  discovery invalidation. Visible native action controls remain pending.
+
+- Coordinate update, time, locale, account, and printer subscriptions through
+  one cumulative snapshot reader. Preserve per-provider freshness and readable
+  partial state, and stop optional monitoring when System Settings closes.
+
+- Share the bounded update-monitor lifecycle with fixed time, locale, account,
+  and printer stream adapters. Preserve update behavior and reject stale
+  replacement readiness; native Settings activation remains pending.
+
+- Add complete cumulative regional, account, printer, and software-source
+  discovery with a backward-compatible Settings parser. Preserve readable
+  state when a service or tool is missing, independently gate native admission,
+  and enforce complete bounded lists. New Settings action controls remain pending.
+
+- Add fixed read-only printer and firewall unit event monitors with private
+  subscription ownership, canonical-alias discovery, bounded reconciliation,
+  and no idle polling or service activation. Settings integration remains pending.
+
+- Add a fixed read-only account event monitor that covers candidate changes
+  before enumeration and filtering. Preserve bounded account inventories,
+  authenticated senders, and a monitor without idle polling; Settings activation
+  remains pending.
+
+- Add fixed read-only time and locale event monitors with acknowledged setup,
+  bounded output, and quiet handling of normally idle services. Add an internal
+  two-property NTP status reader; visible Settings monitoring and sampling
+  remain pending integration.
+
+- Add fixed account, password, printer, and software-source CLI entry points.
+  Resolve trusted tools, keep password handling in the configured supported
+  terminal, and record only accepted launches with durable recovery. Missing
+  tools and unsupported terminal forms remain capability-local. Launched tools
+  cannot inherit the operation journal or output; Settings origins remain
+  disabled pending discovery and confirmation integration.
+
+- Enable the three generation-confirmed regional CLI commands with durable
+  operation ownership, verified results, retained replay, and acknowledgment.
+  Preserve recovery after uncertain writes or lost output; ambiguous sent
+  changes are never retried or reclassified by later state. Settings origins
+  remain disabled pending their confirmation and display workflow. Tests use
+  private services and do not change host settings or log out the user.
+
+- Reject locale confirmations that the platform cannot apply while preserving
+  an explicit LANGUAGE override. Add a preparatory fixed regional service client
+  with fresh confirmation checks, authorization hooks, monitored conflicts, and
+  bounded verification. The fixed CLI now has durable owner integration;
+  Settings origins remain disabled. Tests change only a private bus.
+
+- Restore exact regional and delegated operation observers from validated
+  journal snapshots. Watch durable progress and owner exit without repeating
+  the action; stalled or closed control-output consumers preserve recovery.
+  Isolate operation and update-event writers from inherited file-status flags,
+  preserving concurrent parent output and behavior after forced termination.
+  Originating Settings action entry points remain disabled.
+
+- Preserve appearance inventory streams when a producer exits before the parent
+  captures its identity. Keep buffered output and failure status instead of
+  crashing the asset watcher and leaving wallpaper preview state stale.
+
+- Offer confirmed update actions only after complete idle recovery and the
+  PackageKit security check. Installation also requires a supported dependency
+  preview; failures preserve readable inventory and explicit refresh guidance.
+  Verify the backend with signed disposable Fedora 44 guest packages, including
+  dependency changes, stale confirmation rejection, denial, and retained replay.
+
+- Add visible System Settings confirmation for metadata refresh and update
+  installation, with complete dependency-change previews, fresh-state guards,
+  verified progress/audit logs, and exact-ID cancellation. Keyboard navigation
+  keeps focused controls visible and supports the full bounded preview. Closing
+  Settings keeps the operation owner alive; passive discovery never starts it.
+
+- Add root-owned update start/cancel lifecycle and bounded verified progress
+  logs. Cancellation remains an exact-ID request, never a fabricated result;
+  interrupted origins recover by observation.
+
+- Preserve Fedora DNF5 dependency previews when a requested update is reported
+  as an install. Keep the actual package actions visible and retain strict
+  missing, duplicate, and unexpected-update checks.
+
+- Preserve a pending Input discovery refresh when a preview finishes during an
+  earlier read, so kept accessibility settings do not remain stale in Settings.
+
+- Accept Fedora PackageKit's actual root-level transaction object IDs in the
+  operation journal. The previous namespaced-path assumption rejected real
+  transactions.
+
+- Show the Phase 6 Fedora update snapshot in a dedicated System
+  Settings pane with provider state, update and plan details, diagnostics,
+  restart guidance, recovery ownership, and existing administration boundaries.
+
+- Begin Phase 6 with a complete system-management capability and privilege
+  inventory. Select PackageKit, systemd regional services, AccountsService,
+  CUPS, and fixed Fedora tools as bounded owners; define provider, audit,
+  cancellation, denial, recovery, and high-risk delegation contracts before
+  adding runtime mutations. Recommended/full installs and Fedora images include
+  the required packages, including the Python RPM binding; existing source
+  installs add them by rerunning the matching installer profile.
+
+- Complete Phase 5 personalization and accessibility qualification on Fedora 44
+  X11. The combined clean build, managed suite, QML and shell checks, nested-X11
+  workflows, install parity, live two-monitor panels, reversible theme and
+  AccessX changes, common-size Settings rendering, and closed-idle samples pass;
+  unsupported and deferred paths remain explicit in the closeout evidence.
+
+- Replace the combined display mode button in Settings with an accessible
+  resolution dropdown backed by each output's supported RandR sizes. Keep
+  refresh-rate selection separate and route both choices through the existing
+  display preview and rollback workflow.
+
+- Rebuild the published documentation as a themed Astro site while preserving
+  the existing custom domain and public page URLs. Add responsive navigation,
+  light and dark themes, clearer documentation layouts, and a visual project
+  development overview grounded in the complete commit history.
+
+- Compact the Control Center and Settings detail pane by removing redundant
+  headings and duplicate power-status lines, tightening margins, gaps, and
+  display and capability cards, and using dense text-scale-aware rows while
+  preserving the existing navigation, context, and controls.
+
+- Close the optional Phase 5 UI-5 decision boundary without runtime changes.
+  Clipboard history and reminders are deferred pending explicit privacy,
+  lifecycle, and recovery contracts; emoji/symbol and generic image pickers are
+  rejected because no current product workflow requires them.
+
+### Added
+
+- Add bounded read-only regional choice and confirmation-preview commands.
+  Bind selected timezone, NTP, or locale values to fresh configuration with a
+  generation token and preserve complete locale override details. Regional
+  mutation commands and Settings controls remain disabled pending lifecycle
+  integration.
+
+- Monitor update changes while the System Settings section is open. Coalesce
+  bursts into an initial read plus at most one settling read, preserve readable
+  status with reload guidance when state keeps changing or monitoring fails,
+  and stop optional discovery on closure without losing operation recovery.
+
+- Add a read-only PackageKit change monitor with fixed global subscriptions,
+  bounded setup, and explicit readiness. Private-bus tests verify signal
+  filtering, daemon replacement, closure, and lost output.
+
+- Restore journaled system operations in the shell root and keep their progress
+  visible across Settings closure. Verify complete terminal results before exact
+  acknowledgment; retain guidance after bounded recovery or acknowledgment
+  failure.
+
+- Add a bounded Quickshell operation-stream parser with strict identity,
+  lifecycle, audit, UTF-8, and exit-status checks. Native nested-X11 fixtures
+  verify live progress and failed-result streams.
+
+- Add explicit metadata-refresh and generation-confirmed install CLI commands
+  backed by durable PackageKit execution and exact terminal results. Rejected
+  requests do not fabricate transactions, and uncertain admission or observation
+  retains recovery guidance.
+
+- Add exact-operation PackageKit cancellation with bounded peer, ownership,
+  and cancelability checks. Stale requests leave the journal unchanged, accepted
+  requests remain observable until the real terminal result, and lost replies
+  retain recovery guidance.
+
+- Add a pane-scoped Quickshell system-management model that strictly consumes
+  the bounded 1.0 snapshot protocol, isolates malformed provider state, rejects
+  ambiguous streams, coalesces user refreshes, and stops its read process when
+  the System section or Settings closes without exposing update mutations.
+
+- Add the Phase 6 system-management provider's first bounded PackageKit
+  snapshot. It reports sanitized update inventory, refresh age, restart scope,
+  dependency-preview records, and deterministic confirmation generations while
+  separating passive discovery from confirmed managed operations.
+
+- Add persistent notification policy controls to Settings Appearance. Do Not
+  Disturb suppresses low- and normal-urgency popups while retaining notification
+  history, critical notifications bypass suppression, and a bounded duration
+  selector controls ordinary popups. Capability discovery verifies that the
+  managed Quickshell process and configuration own the session notification
+  D-Bus name, while atomic save acknowledgement keeps failed persistence
+  visible and disables unsafe follow-up mutations.
+
+- Add session-wide XKB accessibility shortcuts, sticky keys, slow keys, bounce
+  keys, and mouse keys to Input Settings. Fixed `xkbset` actions reuse the
+  existing timed preview, automatic rollback, persistence, session-start replay,
+  and reset workflow, while missing XKB support degrades only the accessibility
+  group.
+
+- Add keyboard-focusable Settings controls for the managed-shell high-contrast
+  and reduced-motion policy, including labeled accessibility semantics, reset,
+  provider-scoped failure detail, capability discovery, and nested-X11
+  persistence coverage.
+
+- Add versioned, user-owned accessibility policy state for managed-shell high
+  contrast and reduced motion. The root-scoped event-driven model applies
+  stronger semantic borders and zero-duration managed animations without
+  polling, while safe defaults, strict parsing, atomic writes, reset, and
+  unsafe-path rejection keep malformed or unavailable state isolated.
+
+- Group the existing bounded application text-scale choices under a dedicated
+  Settings Accessibility section with keyboard-focusable apply and reset
+  controls, wrapping actions for compact display sizes, and capability-scoped
+  explanations for contrast, reduced motion, notification policy, and input
+  features that are not yet managed. Event-driven personalization changes
+  coalesce a fresh strict capability snapshot so recovery cannot leave the
+  text-scale controls incorrectly disabled.
+
+- Replace the generic Phase 5 accessibility placeholder with distinct Settings
+  capability records for text scaling, high contrast, reduced motion,
+  notification policy, and keyboard or pointer access. Text scaling consumes
+  only a complete versioned personalization response, and unavailable or
+  malformed providers degrade independently without adding polling or mutation.
+
+- Persist workspace, volume, Bluetooth, network, and power panel visibility in
+  one versioned user-owned state file shared by every monitor, Control Center,
+  and Settings. An absent file migrates from the prior implicit all-on state;
+  malformed, incomplete, unsafe, or unsupported state falls back all-on
+  without preventing shell startup. Fixed atomic set/reset actions preserve
+  file mode and refuse concurrent or unsafe replacements.
+
+- Add Settings Appearance controls for desktop font and text scale, cursor and
+  icon themes, GTK themes, and Qt platform themes. The root Appearance model
+  consumes the existing pane-scoped bounded inventory and the versioned
+  personalization status/action protocol without adding a provider or poller.
+  A pane-scoped process-lifecycle watcher refreshes managed X11 text-scale
+  state when its active or stale XSETTINGS owner exits. Each capability exposes
+  its effective value and saved follow or override mode, apply and reset actions are globally
+  serialized with theme, wallpaper, and shell-font changes, and optional
+  GTK/Qt advanced editors are shown only when an allowlisted tool is installed.
+  A malformed project-owned override file can be repaired transactionally
+  without rewriting current desktop settings or unrelated integration files,
+  while reserved future protocol state is preserved for a compatible version.
 
 - Add managed-shell font family and text-scale controls through the versioned
   `dwm-settings-font` user-session helper. Settings can preview a validated
@@ -15,6 +554,18 @@ versions from `config.mk`.
   shell default. Atomic mode-preserving state, an independent watchdog,
   hash-guarded external-change handling, root-scoped event-driven updates, and
   a fixed Nerd Font icon family keep the shell usable during every transition.
+
+- Add a bounded personalization mutation backend for desktop font, text scale,
+  cursor, icon, GTK, and Qt choices. Overrides and explicit theme-follow or
+  system-follow resets are consumed by the existing theme application path,
+  published through its hash-guarded transaction and durable recovery state,
+  and retained across later theme changes and fresh sessions. Managed DWM,
+  Quickshell, and Control Center launch paths refresh the generated toolkit
+  environment before starting applications. Plain Xorg sessions publish text
+  scale through a scoped `xsettingsd` instance that yields to any existing
+  XSETTINGS owner and verifies the live fixed-point DPI after every reload.
+  DWM resolves the refreshed launcher beside its running executable so custom
+  install prefixes cannot go stale between build and installation.
 
 - Add versioned user-session wallpaper state through `dwm-settings-wallpaper`,
   with persisted Feh fit modes, bounded preview and automatic rollback,
@@ -95,6 +646,11 @@ versions from `config.mk`.
 
 ### Changed
 
+- Increase the Settings window to 1180x760 and tighten its navigation rows,
+  pane margins, capability cards, and display controls so more options remain
+  visible without reducing the configured text scale. Clamp the enlarged
+  window to the active screen on smaller outputs.
+
 - Make DWM's hot-reloaded TOML paths honor `XDG_CONFIG_HOME` and
   `XDG_DATA_HOME`, matching the managed shell and appearance provider.
 
@@ -143,6 +699,28 @@ versions from `config.mk`.
   unsupported installer cannot perform package or system mutations.
 
 ### Fixed
+
+- Avoid a false dwm restart requirement after reinstalling an identical binary.
+  Live parity compares the running executable bytes even when its old inode
+  has been unlinked; changed or unreadable executables still require a restart.
+  Package-profile validation also drains matched output to avoid false SIGPIPE
+  failures under pipefail.
+
+- Keep visible floating windows above the tiled stack when focus changes while
+  retaining focus-based ordering within the floating layer and the existing
+  fullscreen and shell-surface priorities.
+
+- Stop automatic theme-preview status retries after their bounded failure
+  budget is exhausted. Reopening Appearance or using its refresh action still
+  performs one explicit retry, and successful preview lifecycle actions re-arm
+  automatic status observation.
+
+- Prefer an installed ChatGPT desktop application for `Super`+`A` and hide its
+  duplicate ChatGPT web entry from the managed application launcher, while
+  retaining the web app as the fallback when no native desktop entry exists.
+  Existing systems with the former stock web binding now receive the same
+  native-first behavior through `webapp-launch`, without editing user-owned
+  hotkey files.
 
 - Keep the managed Quickshell recovery scoped to the exact configuration and
   display, validate fixed PID/start-time cohorts before signals, and bound
@@ -260,8 +838,8 @@ versions from `config.mk`.
   panel-triggered popups anchored to the monitor where they were opened.
 - Power actions now use the same compact menu header, flat rows, spacing, and
   confirmation layout as the Control Center.
-- Documentation is built and tested from `docs/src/`; generated mdBook output
-  is no longer version controlled.
+- Documentation is built and tested from `docs/src/` with Astro; generated
+  documentation output is no longer version controlled.
 - Release guidance requires validated, committed source and explicit platform
   coverage.
 
@@ -292,5 +870,6 @@ versions from `config.mk`.
 - Prevent nested dwm/Xvfb instances from terminating the active graphical login
   by verifying the logind display and isolating `XDG_DATA_HOME` in runtime tests.
 
-[Unreleased]: https://github.com/ChrisTitusTech/dwm-titus/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/ChrisTitusTech/dwm-titus/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ChrisTitusTech/dwm-titus/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/ChrisTitusTech/dwm-titus/compare/v0.5.2...v0.6.1

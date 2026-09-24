@@ -7,12 +7,32 @@ contracts for the unified Settings application, including the Phase 2 display
 and input providers. `SPEC.md` remains the product contract, and
 `docs/SETTINGS-CAPABILITIES.md` records the provider inventory.
 
+Phase 6 system-management provider, ownership, audit, cancellation, and
+delegation decisions are defined in `P6-SYSTEM-MANAGEMENT.md`. That
+contract does not widen the project-owned privileged helper allowlist.
+
 ## Application Contract
 
 The Settings application is one Quickshell `FloatingWindow` titled
 `dwm settings`. It is part of the managed Quickshell process and is opened from
 Control Center -> Settings, through the `settings` IPC target, or
-with `dwm-settings`.
+with `dwm-settings`. It fills the selected monitor like System Health. Appearance
+scrolls vertically without overscroll bounce. Cursor choices are published through
+XSETTINGS and replace named cursors held by existing X11 clients immediately;
+applications drawing their own custom pointer images retain those images.
+
+The managed panel hides Blueman's redundant tray item while keeping the Bluetooth
+widget and other tray applications available. Installation preserves user-owned
+dwm configuration files and replaces the managed Quickshell directory.
+
+Control Center -> Quick Actions -> Self-Heal runs the workstation's self-heal
+script in a terminal, where its progress, results, and any authorization prompts
+remain visible. Install an executable `dwm-self-heal` on PATH, or put the absolute
+path of the existing script in
+`${XDG_CONFIG_HOME:-$HOME/.config}/dwm-titus/self-heal.path` (one path, no shell
+arguments). `DWM_SELF_HEAL_SCRIPT` can override that path for the shell session.
+The action reports an unavailable script without changing the system; it does
+not download a script or elevate the Quickshell process.
 
 ### Navigation and Search
 
@@ -33,6 +53,26 @@ Phase 1 is intentionally read-only. Capability cards report the operation
 class, provider, state, and recovery detail. Unsupported and restricted cards
 stay visible when their explanation helps the user; a missing provider never
 prevents another section from opening.
+
+Autostart overrides keep `OnlyShowIn` and `NotShowIn` mutually exclusive.
+When a vendor entry has `OnlyShowIn`, installation removes only the `X-DWM`
+and `dwm` tokens instead of adding `NotShowIn`; other desktop choices remain
+intact. Existing user overrides are preserved and require an explicit repair
+if an older installation produced conflicting keys.
+
+Update recovery normally reads the calling process's logind session. A helper
+launched by the managed user service may have no session scope; in that case
+it uses logind's primary display only after verifying the session belongs to
+the current user and is active, local, and X11. Missing, changing, or invalid
+session evidence retains restart guidance and blocks update actions.
+
+System updates show the current package (or repository during metadata refresh),
+its reported progress, and a separate overall transaction percentage. Missing
+item percentages use an activity indicator, never the overall percentage as a
+package estimate. Raw operation logs and audit hashes remain internal; the page
+shows concise verified completion, errors, cancellation, and recovery guidance.
+After a helper restart, recovery may have only overall progress until new item
+evidence is available. Opening Settings does not install updates.
 
 ## Helper Protocol
 
@@ -227,6 +267,60 @@ Input persistence requires a udev serial, physical path, or stable physical
 sysfs identity. A device without one remains configurable for the current
 session, but Settings reports persistence as unsupported and does not save an
 event-node-based identity.
+
+The Displays page numbers every connected monitor card and shows enabled
+monitors in a proportional layout preview. Select a reference monitor in a
+card, then choose **Left of**, **Right of**, **Above**, or **Below**. Horizontal
+placements align top edges; vertical placements align left edges. Each action
+moves that monitor and normalizes the active layout origin. Other monitors
+retain their relative positions. Resolution and rotation determine tile size;
+after changing either, use a placement button again to align the edges.
+Discovery appends `mode-size` records (output, mode name, rate, pixel width,
+pixel height) so custom RandR names such as `native` remain positionable.
+Older discovery responses fall back to conventional mode names or the active
+output geometry where available.
+Disabled monitors keep their numbered cards but do not appear in the preview
+or reference selector. The highlighted button reflects the current geometry.
+Apply changes starts the existing 15-second confirmation; the diagram itself
+does not change the live layout. Existing saved coordinate profiles still load.
+The separate **Automatic layouts** cards manage autorandr's `mobile` (Undocked)
+and `docked` profiles. They show saved monitor geometry and modes, detected
+hardware matches, currently applied matches, and the default fallback. A
+custom live layout may match the hardware without matching the saved settings.
+**Edit saved** copies a profile into the pending editor, without applying it;
+**Create draft** seeds built-in-only Undocked or the current Docked draft.
+**Save draft as ...** requires confirmation and does not apply the draft.
+Use **Apply changes** and **Keep changes** to test it first. Saved enabled
+monitors must be connected to edit, and all selected modes must be available
+on the currently connected hardware before saving.
+
+The optional Fedora `autorandr` package supplies login and DRM hotplug hooks.
+Without it, automatic-profile controls explain that dependency while normal
+display controls remain usable. Saving Undocked sets `default -> mobile` and
+stores only the built-in monitor identity; Docked stores the connected monitor
+identity set. Unrecognized hardware uses the default fallback. Existing XDG
+autostart disablement is respected; Settings does not enable system services.
+Profile replacements preserve hooks and create backups under
+`~/.config/dwm-titus/display-profile-backups/` (respecting `XDG_CONFIG_HOME`).
+An existing `~/.autorandr` directory takes precedence, matching autorandr;
+its backups are stored in `~/dwm-titus/display-profile-backups/`.
+Confirmed saves merge `set,crtc` into autorandr's `skip-options`, preserving
+other settings and backing up the original settings file. This prevents
+session-specific assignments and properties from invalidating layout matches.
+Saved configs omit CRTC numbers and output properties because those are not
+portable between X sessions. Unsupported existing profile options are reported
+instead of silently removed. The one Docked slot matches one connected monitor
+set; advanced multi-dock and transformed profiles remain managed in autorandr.
+Named dwm-titus layouts and privileged **Use at next login** remain separate
+from these automatic, per-user layouts.
+
+![Separate saved dock and built-in layouts with a live draft](evidence/display-dock-profiles.png)
+
+![Numbered display placement preview](evidence/display-relative-layout.png)
+
+The screenshot uses a nested X11 fixture with the built-in monitor disabled
+and two dock monitors enabled. All four buttons were exercised in that
+fixture and their resulting coordinates checked through the Settings model.
 
 Persistent display installation requires a second UI confirmation and
 `pkexec`. The helper must be exactly under an installed project libexec path,

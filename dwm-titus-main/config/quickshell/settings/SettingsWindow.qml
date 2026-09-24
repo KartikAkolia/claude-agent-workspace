@@ -17,12 +17,19 @@ FloatingWindow {
     required property var defaultsModel
     required property var autostartModel
     required property var appearanceModel
+    required property var accessibilityModel
+    required property var notificationModel
+    required property var panelSettingsModel
+    required property var systemManagementModel
+    property var desktopUpdateModel: null
+    required property var clock
 
     title: "dwm settings"
     visible: settingsModel.visible
     screen: settingsModel.targetScreen
-    implicitWidth: 980
-    implicitHeight: 620
+    fullscreen: true
+    implicitWidth: root.screen ? root.screen.width : 1180
+    implicitHeight: root.screen ? root.screen.height : 760
     color: Theme.transparent
 
     function statusColor(status) {
@@ -47,6 +54,7 @@ FloatingWindow {
 
     ShellSurface {
         anchors.fill: parent
+        radius: 0
         margin: Theme.largeSurfaceMargin
 
         Item {
@@ -62,7 +70,7 @@ FloatingWindow {
 
             ColumnLayout {
                 anchors.fill: parent
-                spacing: Theme.sectionSpacing
+                spacing: Theme.spacingXl
 
                 LargeSurfaceHeader {
                     Layout.fillWidth: true
@@ -143,7 +151,7 @@ FloatingWindow {
                         anchors.verticalCenter: parent.verticalCenter
                         visible: settingsSearch.text.length === 0
                         text: "Search settings sections"
-                        color: Theme.placeholder
+                        color: Theme.menuMutedText
                         font.pixelSize: Theme.inputFontSize
                     }
 
@@ -163,10 +171,10 @@ FloatingWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    spacing: Theme.sectionSpacing
+                    spacing: Theme.spacingXl
 
                     Rectangle {
-                        Layout.preferredWidth: Theme.largeSurfaceNavWidth
+                        Layout.preferredWidth: 232
                         Layout.fillHeight: true
                         color: Theme.menuBackground
                         border.color: Theme.popupBorder
@@ -175,8 +183,8 @@ FloatingWindow {
 
                         ColumnLayout {
                             anchors.fill: parent
-                            anchors.margins: Theme.spacingXl
-                            spacing: Theme.spacingLg
+                            anchors.margins: Theme.spacingLg
+                            spacing: Theme.spacingMd
 
                             SectionLabel {
                                 label: "Sections"
@@ -188,7 +196,7 @@ FloatingWindow {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 clip: true
-                                spacing: Theme.spacingSm
+                                spacing: Theme.spacingXxs
                                 model: root.settingsModel.filteredSections
 
                                 delegate: Rectangle {
@@ -199,7 +207,7 @@ FloatingWindow {
                                     readonly property bool selected: root.settingsModel.selectedSectionId === modelData.id
 
                                     width: sectionList.width
-                                    height: 52
+                                    height: Theme.scaledSize(44)
                                     color: selected ? Theme.menuSelectedBackground
                                         : sectionMouse.containsMouse ? Theme.menuHoverBackground : Theme.transparent
                                     border.color: selected ? Theme.controlSelectedBorder : Theme.transparent
@@ -218,13 +226,13 @@ FloatingWindow {
 
                                     RowLayout {
                                         anchors.fill: parent
-                                        anchors.leftMargin: 12
-                                        anchors.rightMargin: 10
-                                        spacing: Theme.spacingLg
+                                        anchors.leftMargin: 10
+                                        anchors.rightMargin: 8
+                                        spacing: Theme.spacingMd
 
                                         UiText {
                                             text: String(sectionButton.index + 1).padStart(2, "0")
-                                            color: sectionButton.selected ? Theme.menuActionText : Theme.menuMutedText
+                                            color: sectionButton.selected ? Theme.menuSelectedText : sectionMouse.containsMouse ? Theme.menuHoverText : Theme.menuMutedText
                                             font.pixelSize: Theme.fontCaptionSize
                                             font.bold: true
                                         }
@@ -236,7 +244,7 @@ FloatingWindow {
                                             UiText {
                                                 Layout.fillWidth: true
                                                 text: sectionButton.modelData.label
-                                                color: sectionButton.selected ? Theme.menuSelectedText : Theme.menuText
+                                                color: sectionButton.selected ? Theme.menuSelectedText : sectionMouse.containsMouse ? Theme.menuHoverText : Theme.menuText
                                                 font.pixelSize: Theme.fontBodySize
                                                 font.bold: sectionButton.selected
                                                 elide: Text.ElideRight
@@ -245,7 +253,7 @@ FloatingWindow {
                                             UiText {
                                                 Layout.fillWidth: true
                                                 text: sectionButton.modelData.description
-                                                color: Theme.menuMutedText
+                                                color: sectionButton.selected ? Theme.menuSelectedText : sectionMouse.containsMouse ? Theme.menuHoverText : Theme.menuMutedText
                                                 font.pixelSize: Theme.fontCaptionSize
                                                 elide: Text.ElideRight
                                             }
@@ -254,7 +262,7 @@ FloatingWindow {
                                         UiText {
                                             visible: sectionButton.selected
                                             text: ">"
-                                            color: Theme.menuActionText
+                                            color: Theme.menuSelectedText
                                             font.bold: true
                                         }
                                     }
@@ -288,20 +296,19 @@ FloatingWindow {
                         radius: Theme.largeSurfaceCardRadius
 
                         ColumnLayout {
+                            id: sectionContent
+
                             anchors.fill: parent
-                            anchors.margins: Theme.spacingHuge
-                            spacing: Theme.sectionSpacing
+                            anchors.margins: Theme.spacingLg
+                            spacing: Theme.spacingMd
 
-                            ColumnLayout {
+                            RowLayout {
+                                id: sectionHeader
+
                                 Layout.fillWidth: true
-                                spacing: Theme.spacingXxs
-
-                                SectionLabel {
-                                    label: root.settingsModel.selectedSectionId
-                                }
+                                spacing: Theme.spacingLg
 
                                 UiText {
-                                    Layout.fillWidth: true
                                     text: root.settingsModel.selectedSection().label
                                     color: Theme.popupText
                                     font.pixelSize: Theme.fontTitleSize
@@ -313,7 +320,7 @@ FloatingWindow {
                                     Layout.fillWidth: true
                                     text: root.settingsModel.selectedSection().description
                                     color: Theme.menuMutedText
-                                    font.pixelSize: Theme.fontBodySize
+                                    font.pixelSize: Theme.fontBodySmallSize
                                     elide: Text.ElideRight
                                 }
                             }
@@ -324,66 +331,121 @@ FloatingWindow {
                                 color: Theme.popupBorder
                             }
 
-                            DisplaySettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "displays"
-                                settingsModel: root.settingsModel
+                                selected: root.settingsModel.selectedSectionId === "displays"
+                                dataLoading: root.settingsModel.displayState === "loading" || root.settingsModel.displayRefreshPending || root.settingsModel.automaticDisplayBusy || root.settingsModel.automaticDisplayRefreshPending || root.settingsModel.displayActionBusy
+                                windowVisible: root.visible
+                                sourceComponent: DisplaySettingsPane {
+                                    settingsModel: root.settingsModel
+                                }
                             }
 
-                            InputSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "input"
-                                settingsModel: root.settingsModel
+                                selected: root.settingsModel.selectedSectionId === "input"
+                                dataLoading: root.settingsModel.inputState === "loading" || root.settingsModel.inputRefreshPending || root.settingsModel.inputActionBusy
+                                windowVisible: root.visible
+                                sourceComponent: InputSettingsPane {
+                                    settingsModel: root.settingsModel
+                                }
                             }
 
-                            NetworkSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "network"
-                                networkModel: root.networkModel
+                                selected: root.settingsModel.selectedSectionId === "network"
+                                dataLoading: root.networkModel.initialLoading
+                                windowVisible: root.visible
+                                sourceComponent: NetworkSettingsPane {
+                                    networkModel: root.networkModel
+                                }
                             }
 
-                            BluetoothSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "bluetooth"
-                                bluetoothModel: root.bluetoothModel
+                                selected: root.settingsModel.selectedSectionId === "bluetooth"
+                                dataLoading: root.bluetoothModel.initialLoading
+                                windowVisible: root.visible
+                                sourceComponent: BluetoothSettingsPane {
+                                    bluetoothModel: root.bluetoothModel
+                                }
                             }
 
-                            AudioSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "audio"
-                                controlsModel: root.controlsModel
+                                selected: root.settingsModel.selectedSectionId === "audio"
+                                dataLoading: root.controlsModel.initialLoading
+                                windowVisible: root.visible
+                                sourceComponent: AudioSettingsPane {
+                                    controlsModel: root.controlsModel
+                                }
                             }
 
-                            PowerSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "power"
-                                powerModel: root.powerModel
-                                powerMenuModel: root.powerMenuModel
+                                selected: root.settingsModel.selectedSectionId === "power"
+                                dataLoading: root.powerModel.initialLoading
+                                windowVisible: root.visible
+                                sourceComponent: PowerSettingsPane {
+                                    powerModel: root.powerModel
+                                    powerMenuModel: root.powerMenuModel
+                                }
                             }
 
-                            DefaultsSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "defaults"
-                                defaultsModel: root.defaultsModel
-                                autostartModel: root.autostartModel
+                                selected: root.settingsModel.selectedSectionId === "defaults"
+                                dataLoading: root.defaultsModel.initialLoading || root.autostartModel.initialLoading
+                                windowVisible: root.visible
+                                sourceComponent: DefaultsSettingsPane {
+                                    defaultsModel: root.defaultsModel
+                                    autostartModel: root.autostartModel
+                                }
                             }
 
-                            AppearanceSettingsPane {
+                            DeferredSettingsPane {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                visible: root.settingsModel.selectedSectionId === "appearance"
-                                appearanceModel: root.appearanceModel
-                                capabilities: root.settingsModel.capabilitiesForSection("appearance")
-                                    .filter(function(capability) {
-                                        return capability.id !== "themes" && capability.id !== "wallpaper";
-                                    })
+                                selected: root.settingsModel.selectedSectionId === "appearance"
+                                dataLoading: root.appearanceModel.initialLoading || root.accessibilityModel.initialLoading
+                                    || root.panelSettingsModel.initialLoading || root.notificationModel.initialLoading || root.settingsModel.busy
+                                    || root.settingsModel.capabilityRefreshPending
+                                windowVisible: root.visible
+                                sourceComponent: AppearanceSettingsPane {
+                                    appearanceModel: root.appearanceModel
+                                    accessibilityModel: root.accessibilityModel
+                                    notificationModel: root.notificationModel
+                                    panelSettingsModel: root.panelSettingsModel
+                                    textScaleCapability: root.settingsModel.capabilityById(
+                                        "accessibility-text-scale")
+                                    notificationCapability: root.settingsModel.capabilityById(
+                                        "accessibility-notifications")
+                                    capabilities: root.settingsModel.capabilitiesForSection("appearance")
+                                        .filter(function(capability) {
+                                            return capability.id !== "themes" && capability.id !== "wallpaper";
+                                        })
+                                }
+                            }
+
+                            DeferredSettingsPane {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                selected: root.settingsModel.selectedSectionId === "system"
+                                dataLoading: root.systemManagementModel.initialLoading || (root.desktopUpdateModel && root.desktopUpdateModel.initialLoading)
+                                windowVisible: root.visible
+                                sourceComponent: SystemSettingsPane {
+                                    desktopUpdateModel: root.desktopUpdateModel
+                                    clockText: root.clock.settingsText
+                                    systemManagementModel: root.systemManagementModel
+                                    capabilities: root.settingsModel.capabilitiesForSection("system")
+                                }
                             }
 
                             ListView {
@@ -399,8 +461,9 @@ FloatingWindow {
                                     && root.settingsModel.selectedSectionId !== "power"
                                     && root.settingsModel.selectedSectionId !== "defaults"
                                     && root.settingsModel.selectedSectionId !== "appearance"
+                                    && root.settingsModel.selectedSectionId !== "system"
                                 clip: true
-                                spacing: Theme.spacingLg
+                                spacing: Theme.spacingSm
                                 model: root.settingsModel.capabilitiesForSection(root.settingsModel.selectedSectionId)
 
                                 delegate: Rectangle {
@@ -410,7 +473,7 @@ FloatingWindow {
                                     readonly property color stateColor: root.statusColor(modelData.status)
 
                                     width: capabilityList.width
-                                    height: Math.max(92, cardColumn.implicitHeight + 24)
+                                    height: Math.max(68, cardColumn.implicitHeight + 12)
                                     color: Theme.controlNormalFill
                                     border.color: Theme.controlNormalBorder
                                     border.width: Theme.controlBorderWidth
@@ -429,11 +492,11 @@ FloatingWindow {
                                         id: cardColumn
 
                                         anchors.fill: parent
-                                        anchors.leftMargin: 16
-                                        anchors.rightMargin: 12
-                                        anchors.topMargin: 12
-                                        anchors.bottomMargin: 12
-                                        spacing: Theme.spacingSm
+                                        anchors.leftMargin: 12
+                                        anchors.rightMargin: 10
+                                        anchors.topMargin: 6
+                                        anchors.bottomMargin: 6
+                                        spacing: Theme.spacingXs
 
                                         RowLayout {
                                             Layout.fillWidth: true
@@ -506,6 +569,7 @@ FloatingWindow {
 
                             UiText {
                                 Layout.fillWidth: true
+                                Layout.preferredHeight: Math.ceil(Theme.fontBodySmallSize * 1.5)
                                 text: root.settingsModel.message
                                 color: root.settingsModel.discoveryState === "failure" ? Theme.danger : Theme.menuMutedText
                                 font.pixelSize: Theme.fontBodySmallSize

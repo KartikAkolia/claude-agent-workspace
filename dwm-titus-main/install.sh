@@ -578,12 +578,14 @@ info "Installing required build and runtime dependencies..."
 dwm_install_package_profile build
 dwm_install_package_profile x11
 dwm_install_package_profile runtime-required
+dwm_install_package_profile media
 ok "Required build and runtime dependencies installed."
 
 # ── Recommended desktop dependencies ─────────────────────
 if install_recommended_profile; then
 	info "Installing recommended desktop dependencies..."
 	dwm_install_package_profile desktop
+	dwm_install_package_profile system-management
 	if ! env -u DWM_TEST_MODE -u DWM_TEST_QUICKSHELL_VERSION \
 		"$REPO_DIR/scripts/dwm-quickshell-version-check"; then
 		err "The installed Quickshell build is incompatible with dwm-titus."
@@ -598,12 +600,6 @@ if install_recommended_profile; then
 	fi
 	install_nordic_gtk_theme || true
 	dwm_install_package_profile fonts
-	info "Setting up Gear Lever for AppImage management..."
-	if "$REPO_DIR/scripts/install-gearlever"; then
-		ok "Gear Lever is installed."
-	else
-		warn "Gear Lever setup failed; retry with scripts/install-gearlever when Flathub is reachable."
-	fi
 	ok "Recommended desktop dependencies installed."
 else
 	warn "Skipping recommended desktop dependencies for core profile."
@@ -741,15 +737,24 @@ fi
 cd "$REPO_DIR"
 make clean
 make
-sudo make install-system \
-	USER_HOME="$HOME" \
-	OWNER="$(id -un)" \
-	DATADIR="/usr/share"
-make install-user \
+sudo make install \
+	DATADIR="/usr/share" \
+	USER_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
 	USER_HOME="$HOME" \
 	OWNER="$(id -un)" \
 	XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
-	XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+	XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" \
+	XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+# Seed before Gear Lever creates its AppImage MIME preference file.
+bash "$REPO_DIR/scripts/seed-default-apps.sh"
+if install_recommended_profile; then
+	info "Setting up Gear Lever for AppImage management..."
+	if "$REPO_DIR/scripts/install-gearlever"; then
+		ok "Gear Lever is installed."
+	else
+		warn "Gear Lever setup failed; retry with scripts/install-gearlever when Flathub is reachable."
+	fi
+fi
 configure_displays_after_install
 
 # ── Done ─────────────────────────────────────────────────
@@ -771,5 +776,5 @@ echo "  SUPER+/   keybind viewer     SUPER+X  terminal"
 echo "  SUPER+F1  control center     SUPER+R  app launcher"
 echo "  SUPER+Q   close window"
 echo ""
-echo "  Full reference: docs/src/keybinds.md or SUPER+/ in dwm"
+echo "  Full reference: https://dwm.christitus.com/keybinds.html or SUPER+/ in dwm"
 echo ""

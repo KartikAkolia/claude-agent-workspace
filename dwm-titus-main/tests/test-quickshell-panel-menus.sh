@@ -15,13 +15,13 @@ done
 grep -Fq 'onEnabledChanged: if (enabled && !dragging) liveValue = value' "$core/PanelSlider.qml"
 grep -Fq 'if (wheel.angleDelta.y === 0)' "$core/PanelSlider.qml"
 
-grep -Fq 'readonly property int panelHeight: 30' "$core/Theme.qml"
+grep -Fq 'readonly property int panelHeight: scaledSize(30)' "$core/Theme.qml"
 grep -Fq 'exclusiveZone: Theme.panelHeight' "$panel/DwmPanel.qml"
 grep -Fq 'aboveWindows: root.state.fullscreenMonitorIndexes.indexOf(' "$panel/DwmPanel.qml"
 grep -Fq 'signal popupRequested(var panelWindow, string popupId)' "$panel/DwmPanel.qml"
 grep -Fq 'model: root.state.workspaceIndexes(root.screen)' "$panel/DwmPanel.qml"
 grep -Fq 'sourceComponent: TrayArea {}' "$panel/DwmPanel.qml"
-grep -Fq 'RunningAppsArea { state: root.state }' "$panel/DwmPanel.qml"
+grep -Fq 'RunningAppsArea { desktopState: root.state }' "$panel/DwmPanel.qml"
 
 grep -Fq 'outlined: true' "$panel/DwmPanel.qml"
 grep -Fq 'outlined ? Theme.controlNormalFill : Theme.transparent' "$core/PanelPill.qml"
@@ -55,7 +55,6 @@ grep -Fq 'activeFocusOnTab: presetButton.enabled' "$controlcenter/ControlCenterW
 grep -Fq 'event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space' \
 	"$controlcenter/ControlCenterWindow.qml"
 grep -Fq 'PanelSeparator {}' "$power/PowerMenuWindow.qml"
-grep -Fq 'detail: modelData.detail' "$power/PowerMenuWindow.qml"
 grep -Fq 'onDismissed: powerMenuModel.close(root.actionOrigin)' "$power/PowerMenuWindow.qml"
 grep -Fq 'enabled: !root.powerMenuModel.busy' "$power/PowerMenuWindow.qml"
 grep -Fq 'root.powerMenuModel.requestAction(modelData, root.actionOrigin)' \

@@ -28,12 +28,14 @@ PanelWindow {
         return "󰂎";
     }
 
+    property var desktopUpdateModel: null
     required property var state
     required property var clock
     required property var networkModel
     required property var controlsModel
     required property var bluetoothModel
     required property var controlCenterModel
+    required property var panelSettingsModel
     required property var powerModel
     required property var powerMenuModel
     required property bool primaryPanel
@@ -66,6 +68,11 @@ PanelWindow {
 
         PillShadow { cornerRadius: island.radius }
 
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.popupRequested(root, "")
+        }
+
         RowLayout {
             anchors.fill: parent
             anchors.leftMargin: Theme.panelGap
@@ -93,7 +100,7 @@ PanelWindow {
                     }
 
                     PanelPill {
-                        visible: root.controlCenterModel.showWorkspaceWidget
+                        visible: root.panelSettingsModel.widgetEnabled("workspaces")
                         Layout.preferredWidth: workspaceRow.implicitWidth + 8
                         Layout.preferredHeight: Theme.pillHeight
 
@@ -147,7 +154,7 @@ PanelWindow {
                     id: clockLabel
 
                     anchors.centerIn: parent
-                    text: Qt.formatDateTime(root.clock.date, "ddd dd MMM - HH:mm")
+                    text: root.clock.panelText
                     color: Theme.textStrong
                     font.bold: true
                 }
@@ -182,7 +189,19 @@ PanelWindow {
                         }
                     }
 
-                    RunningAppsArea { state: root.state }
+                    ShellButton {
+                        objectName: "desktopUpdateIndicator"
+                        visible: root.desktopUpdateModel !== null && (root.desktopUpdateModel.active
+                            || ["failed", "interrupted", "restart-required"].indexOf(root.desktopUpdateModel.status.state) >= 0
+                            || (root.desktopUpdateModel.status.state === "current" && !!root.desktopUpdateModel.status.operation))
+                        label: !root.desktopUpdateModel ? "" : root.desktopUpdateModel.active ? "Updating..."
+                            : root.desktopUpdateModel.status.state === "current" ? "Updated"
+                            : root.desktopUpdateModel.status.state === "restart-required" ? "Logout required" : "Update needs attention"
+                        enabled: root.desktopUpdateModel !== null && !root.desktopUpdateModel.progressPending
+                        onActivated: root.desktopUpdateModel.showProgress()
+                    }
+
+                    RunningAppsArea { desktopState: root.state }
 
                     Loader {
                         active: root.primaryPanel
@@ -204,7 +223,7 @@ PanelWindow {
                             IconText {
                                 text: root.batteryIcon(root.powerModel.batteryPercent, root.powerModel.batteryStatus)
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.1)
+                                font.pixelSize: Theme.scaledFontSize(14 * 1.1, 8)
                             }
 
                             UiText {
@@ -222,7 +241,7 @@ PanelWindow {
                     }
 
                     PanelPill {
-                        visible: root.controlCenterModel.showBluetoothWidget
+                        visible: root.panelSettingsModel.widgetEnabled("bluetooth")
                         Layout.preferredWidth: bluetoothRow.implicitWidth + Theme.compactWidgetHorizontalPadding * 2
                         Layout.preferredHeight: Theme.compactWidgetSize
                         active: root.bluetoothModel.visible
@@ -236,7 +255,7 @@ PanelWindow {
                             IconText {
                                 text: "󰂯"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 0.9)
+                                font.pixelSize: Theme.scaledFontSize(14 * 0.9, 8)
                             }
                         }
 
@@ -253,7 +272,7 @@ PanelWindow {
                     }
 
                     PanelPill {
-                        visible: root.controlCenterModel.showNetworkWidget
+                        visible: root.panelSettingsModel.widgetEnabled("network")
                         Layout.preferredWidth: networkRow.implicitWidth + Theme.networkWidgetHorizontalPadding * 2
                         Layout.preferredHeight: Theme.compactWidgetSize
                         active: root.networkModel.visible
@@ -268,7 +287,7 @@ PanelWindow {
                                 text: root.networkModel.statusText.indexOf("offline") >= 0
                                     || root.networkModel.statusText.indexOf("unavailable") >= 0 ? "󰤭" : "󰤨"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.2)
+                                font.pixelSize: Theme.scaledFontSize(14 * 1.2, 8)
                             }
                         }
 
@@ -285,7 +304,7 @@ PanelWindow {
                     }
 
                     PanelPill {
-                        visible: root.controlCenterModel.showVolumeWidget
+                        visible: root.panelSettingsModel.widgetEnabled("volume")
                         Layout.preferredWidth: volumeRow.implicitWidth + Theme.compactWidgetHorizontalPadding * 2
                         Layout.preferredHeight: Theme.compactWidgetSize
                         active: root.controlsModel.visible
@@ -299,7 +318,7 @@ PanelWindow {
                             IconText {
                                 text: root.controlsModel.volumeMuted ? "󰝟" : "󰕾"
                                 color: Theme.textStrong
-                                font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.5)
+                                font.pixelSize: Theme.scaledFontSize(14 * 1.5, 8)
                             }
 
                             UiText {
@@ -331,7 +350,7 @@ PanelWindow {
                     }
 
                     PanelPill {
-                        visible: root.controlCenterModel.showPowerWidget
+                        visible: root.panelSettingsModel.widgetEnabled("power")
                         Layout.preferredWidth: Theme.pillHeight
                         Layout.preferredHeight: Theme.pillHeight
                         active: root.powerMenuModel.visible
@@ -341,7 +360,7 @@ PanelWindow {
                             anchors.centerIn: parent
                             text: "󰐥"
                             color: Theme.textStrong
-                            font.pixelSize: Math.round((Theme.panelIconFontSize + 1) * 1.08)
+                            font.pixelSize: Theme.scaledFontSize(14 * 1.08, 8)
                         }
 
                         MouseArea {

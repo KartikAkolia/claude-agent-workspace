@@ -12,10 +12,10 @@ Rectangle {
     signal expired
 
     Layout.fillWidth: true
-    Layout.preferredHeight: Math.max(82, content.implicitHeight + 28)
+    Layout.preferredHeight: Math.max(Theme.scaledSize(82), content.implicitHeight + Theme.scaledSize(28))
 
     opacity: 1.0
-    radius: Theme.largeSurfaceCardRadius
+    radius: Theme.popupRadius
     color: item.urgency === NotificationUrgency.Critical ? Theme.dangerSurface : Theme.surface
     border.color: item.urgency === NotificationUrgency.Critical ? Theme.danger : Theme.popupBorder
     border.width: Theme.controlBorderWidth
@@ -31,7 +31,7 @@ Rectangle {
         id: content
 
         anchors.fill: parent
-        anchors.margins: 14
+        anchors.margins: Theme.scaledSize(14)
         spacing: Theme.spacingXxl
 
         Rectangle {

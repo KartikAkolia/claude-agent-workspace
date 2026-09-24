@@ -94,7 +94,13 @@ binary_target=$prefix/bin/dwm
 man_target=$manprefix/man1/dwm.1
 xsession_target=$xsessions_dir/dwm.desktop
 display_root_helper_target=$prefix/libexec/dwm-titus/dwm-settings-display-root
+desktop_root_helper_target=$prefix/libexec/dwm-titus/dwm-desktop-update-root
 make_command=${MAKE:-make}
+os_release_file=/etc/os-release
+if [ "${DWM_DEV_SYNC_TEST_MODE:-0}" = 1 ] &&
+	[ -n "${DWM_DEV_SYNC_OS_RELEASE:-}" ]; then
+	os_release_file=$DWM_DEV_SYNC_OS_RELEASE
+fi
 
 validate_live_root USER_HOME "$user_home"
 validate_live_root PREFIX "$prefix"
@@ -117,6 +123,7 @@ install_sources_file=$work/install-sources
 expected_man=$work/dwm.1
 expected_xsession=$work/dwm.desktop
 expected_display_root_helper=$work/dwm-settings-display-root
+expected_desktop_root_helper=$work/dwm-desktop-update-root
 tree_diff=$work/tree.diff
 
 prepare_expected_files() {
@@ -133,6 +140,79 @@ prepare_expected_files() {
 	sed "s|@PREFIX@|$prefix|g" "$repo_dir/dwm.desktop" >"$expected_xsession"
 	sed "s|@PREFIX@|$prefix|g" "$repo_dir/scripts/dwm-settings-display-root" \
 		>"$expected_display_root_helper"
+	sed "s|@PREFIX@|$prefix|g" "$repo_dir/scripts/dwm-desktop-update-root" \
+		>"$expected_desktop_root_helper"
+}
+
+source_update_dependencies_ready() {
+	if [ "${DWM_DEV_SYNC_TEST_MODE:-0}" = 1 ] &&
+		[ -n "${DWM_DEV_SYNC_SOURCE_UPDATE_READY:-}" ]; then
+		case $DWM_DEV_SYNC_SOURCE_UPDATE_READY in
+		1) return 0 ;;
+		0) return 1 ;;
+		*) die "invalid DWM_DEV_SYNC_SOURCE_UPDATE_READY value" ;;
+		esac
+	fi
+	command -v xsettingsd >/dev/null 2>&1 &&
+		command -v dump_xsettings >/dev/null 2>&1 &&
+		command -v xkbset >/dev/null 2>&1 &&
+		command -v bwrap >/dev/null 2>&1 &&
+		/usr/bin/python3 -c 'import ctypes; ctypes.CDLL("libseccomp.so.2")' >/dev/null 2>&1
+}
+
+source_update_dependencies_needed() {
+	if [ "${DWM_DEV_SYNC_TEST_MODE:-0}" = 1 ] &&
+		[ -n "${DWM_DEV_SYNC_DESKTOP_FEATURE:-}" ]; then
+		case $DWM_DEV_SYNC_DESKTOP_FEATURE in
+		1) return 0 ;;
+		0) return 1 ;;
+		*) die "invalid DWM_DEV_SYNC_DESKTOP_FEATURE value" ;;
+		esac
+	fi
+	command -v quickshell >/dev/null 2>&1
+}
+
+require_fedora_for_package_changes() {
+	distro_id=$(awk -F= '
+		$1 == "ID" {
+			value = $2
+			gsub(/^[[:space:]"'\'' ]+|[[:space:]"'\'' ]+$/, "", value)
+			print value
+			exit
+		}
+	' "$os_release_file" 2>/dev/null) ||
+		die "cannot read $os_release_file before installing source-update dependencies"
+	[ "$distro_id" = fedora ] ||
+		die "unsupported distribution for source-update dependencies: ${distro_id:-unknown}"
+}
+
+reconcile_source_update_dependencies() {
+	packages_file=$work/source-update-packages
+	if ! source_update_dependencies_needed; then
+		return 0
+	fi
+	if source_update_dependencies_ready; then
+		return 0
+	fi
+	if [ "$check_only" -eq 1 ]; then
+		die "source-update dependencies are missing; run this command without --check to install them"
+	fi
+	command -v sudo >/dev/null 2>&1 ||
+		die "sudo is required to install source-update dependencies"
+	command -v dnf >/dev/null 2>&1 ||
+		die "dnf is required to install source-update dependencies"
+	require_fedora_for_package_changes
+	"$repo_dir/scripts/dwm-packages.sh" fedora source-update >"$packages_file" ||
+		die "could not resolve source-update dependencies"
+	set --
+	while IFS= read -r package; do
+		[ -n "$package" ] && set -- "$@" "$package"
+	done <"$packages_file"
+	[ "$#" -gt 0 ] || die "source-update dependency profile is empty"
+	note "Installing required source-update dependencies: $*"
+	sudo dnf install -y "$@"
+	source_update_dependencies_ready ||
+		die "source-update dependencies are still unavailable after installation"
 }
 
 verification_failed=0
@@ -198,17 +278,26 @@ verify_install() {
 	done <"$install_sources_file"
 	verify_executable "$expected_display_root_helper" \
 		"$display_root_helper_target" "privileged display helper"
+	verify_executable "$expected_desktop_root_helper" \
+		"$desktop_root_helper_target" "privileged desktop update helper"
 	verify_privileged_helper_trust=1
 	if [ "${DWM_DEV_SYNC_SKIP_PRIVILEGED_TRUST:-0}" = 1 ]; then
 		verify_privileged_helper_trust=0
 	fi
-	if [ "$verify_privileged_helper_trust" -eq 1 ] && [ -e "$display_root_helper_target" ]; then
-		if [ "$(stat -c %u "$display_root_helper_target")" -ne 0 ] ||
-			find "$display_root_helper_target" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
-			printf 'UNTRUSTED: privileged display helper ownership or mode (%s)\n' \
-				"$display_root_helper_target" >&2
+	if [ "$verify_privileged_helper_trust" -eq 1 ]; then
+		if ! python3 "$repo_dir/scripts/dwm-desktop-update" verify-trust \
+			"$prefix/share/dwm-titus/desktop-install.json"; then
 			verification_failed=1
 		fi
+		for privileged_target in "$display_root_helper_target" "$desktop_root_helper_target"; do
+			[ -e "$privileged_target" ] || continue
+			if [ "$(stat -c %u "$privileged_target")" -ne 0 ] ||
+				find "$privileged_target" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+				printf 'UNTRUSTED: privileged helper ownership or mode (%s)\n' \
+					"$privileged_target" >&2
+				verification_failed=1
+			fi
+		done
 	fi
 
 	verify_file "$expected_man" "$man_target" "dwm man page"
@@ -223,9 +312,23 @@ verify_install() {
 		verify_tree "$cursor_source" "$data_root/icons/$cursor_name" \
 			"cursor theme $cursor_name"
 	done
+	for theme_source in "$repo_dir"/assets/themes/Dwm-*; do
+		[ -d "$theme_source" ] || continue
+		verify_tree "$theme_source" "$data_root/themes/${theme_source##*/}" \
+			"application theme ${theme_source##*/}"
+		for qt_backend in qt5ct qt6ct; do
+			verify_file "$theme_source/qt/colors.conf" \
+				"$data_root/$qt_backend/colors/${theme_source##*/}.conf" "Qt palette ${theme_source##*/}"
+		done
+	done
 	verify_file "$repo_dir/assets/cursors/COPYING" \
 		"$data_root/licenses/dwm-titus/capitaine-cursors/COPYING" \
 		"cursor license"
+	if ! HOME="$user_home" XDG_CONFIG_HOME="$config_home" XDG_DATA_HOME="$xdg_data_home" \
+		XDG_STATE_HOME="$state_home" python3 "$repo_dir/scripts/dwm-desktop-update" \
+		verify-receipts "$repo_dir" "$prefix/share/dwm-titus/desktop-install.json"; then
+		verification_failed=1
+	fi
 
 	if [ "$verification_failed" -eq 0 ]; then
 		printf 'All managed files match the checkout.\n'
@@ -272,9 +375,19 @@ backup_live_install() {
 		add_system_backup_path "$prefix/bin/${install_source##*/}"
 	done <"$install_sources_file"
 	add_system_backup_path "$display_root_helper_target"
+	add_system_backup_path "$desktop_root_helper_target"
+	add_system_backup_path "$prefix/share/dwm-titus/desktop-install.json"
 	for cursor_source in "$repo_dir"/assets/cursors/Capitaine-Cursors*; do
 		[ -d "$cursor_source" ] || continue
 		add_system_backup_path "$data_root/icons/${cursor_source##*/}"
+	done
+	for theme_target in "$data_root"/themes/Dwm-*; do
+		add_system_backup_path "$theme_target"
+	done
+	for qt_backend in qt5ct qt6ct; do
+		for palette_target in "$data_root/$qt_backend"/colors/Dwm-*.conf; do
+			add_system_backup_path "$palette_target"
+		done
 	done
 	add_system_backup_path "$data_root/licenses/dwm-titus/capitaine-cursors/COPYING"
 	if [ -s "$system_manifest" ]; then
@@ -314,12 +427,9 @@ runtime_verify() {
 	dwm_pid=$(pgrep -xo dwm 2>/dev/null || true)
 	dwm_restart_required=0
 	if [ -n "$dwm_pid" ]; then
-		running_executable=$(readlink "/proc/$dwm_pid/exe" 2>/dev/null || true)
-		case $running_executable in
-		*" (deleted)") dwm_restart_required=1 ;;
-		esac
-		if [ "$dwm_restart_required" -eq 0 ] &&
-			! cmp -s "/proc/$dwm_pid/exe" "$binary_target"; then
+		# Reinstallation can unlink the running executable without changing its
+		# bytes. Proc still exposes that inode; compare it even when deleted.
+		if ! cmp -s "/proc/$dwm_pid/exe" "$binary_target"; then
 			dwm_restart_required=1
 		fi
 	fi
@@ -406,17 +516,18 @@ runtime_verify() {
 	[ "$runtime_failed" -eq 0 ]
 }
 
+if [ "$check_only" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+	die "run this script as the desktop user, not root"
+fi
+
 prepare_expected_files
+reconcile_source_update_dependencies
 
 if [ "$check_only" -eq 1 ]; then
 	note "Checking live install against $repo_dir"
 	verify_install || exit 1
 	runtime_verify 0 || exit 1
 	exit 0
-fi
-
-if [ "$(id -u)" -eq 0 ]; then
-	die "run this script as the desktop user, not root"
 fi
 
 note "Building current checkout"
@@ -445,7 +556,8 @@ sudo "$make_path" -C "$repo_dir" install \
 	USER_HOME="$user_home" \
 	OWNER="$owner" \
 	XDG_CONFIG_HOME="$config_home" \
-	XDG_DATA_HOME="$xdg_data_home"
+	XDG_DATA_HOME="$xdg_data_home" \
+	XDG_STATE_HOME="$state_home"
 
 note "Verifying installed state"
 verify_install || die "live installation does not match the checkout"

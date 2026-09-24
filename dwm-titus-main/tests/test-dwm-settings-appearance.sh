@@ -6,13 +6,16 @@ helper=$repo/scripts/dwm-settings-appearance
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
+export HOME=$work/home
+mkdir -p "$HOME"
+
 config_home=$work/config
 data_root=$work/data
 bin_dir=$work/bin
 mkdir -p "$config_home/dwm-titus" "$config_home/alacritty" "$config_home/kitty" \
 	"$config_home/gtk-3.0" "$config_home/gtk-4.0" \
 	"$data_root/themes/Nordic/gtk-3.0" "$data_root/themes/Nordic/gtk-4.0" \
-	"$data_root/icons/Capitaine-Cursors-White" "$bin_dir"
+	"$data_root/icons/Capitaine-Cursors-White/cursors" "$bin_dir"
 cp "$repo/config/themes.toml" "$config_home/dwm-titus/themes.toml"
 declare -A fixture_color=()
 while read -r key _ color; do
@@ -74,11 +77,11 @@ cp "$config_home/kitty/active-theme.conf" "$work/kitty-valid.conf"
 printf 'import = ["%s"]\n' "$config_home/alacritty/active-theme.toml" \
 	>"$config_home/alacritty/alacritty.toml"
 
-printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\n' \
+printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\nexport XCURSOR_SIZE=32\n' \
 	>"$config_home/dwm-titus/theme-env.sh"
 printf 'Xcursor.theme: Capitaine-Cursors-White\n' \
 	>"$config_home/dwm-titus/cursor.Xresources"
-printf '[Settings]\ngtk-theme-name=Nordic\ngtk-cursor-theme-name=Capitaine-Cursors-White\n' \
+printf '  [Settings]  \ngtk-theme-name=Nordic\ngtk-cursor-theme-name=Capitaine-Cursors-White\n' \
 	>"$config_home/gtk-3.0/settings.ini"
 printf '[Settings]\ngtk-theme-name=Nordic\ngtk-cursor-theme-name=Capitaine-Cursors-White\n' \
 	>"$config_home/gtk-4.0/settings.ini"
@@ -218,8 +221,29 @@ grep -Fqx $'integration\tqt\tavailable\tqt6ct\tQt applications use the supported
 grep -Fqx $'integration\tcursor\tavailable\tCapitaine-Cursors-White\tManaged cursor theme is installed and applied' <<<"$output"
 grep -Fqx $'integration\talacritty\tavailable\tactive-theme\tGenerated terminal theme matches the resolved palette' <<<"$output"
 grep -Fqx $'integration\tkitty\tavailable\tactive-theme\tGenerated terminal theme matches the resolved palette' <<<"$output"
-grep -Fqx $'integration\tcompositor\tpartial\tpicom\tPicom is available but has no shared theme mutation contract' <<<"$output"
-grep -Fqx $'error\tcompositor\tunsupported\tPicom theme mutation is not implemented' <<<"$output"
+grep -Fqx $'integration\tcompositor\tavailable\tpicom\tGlobal opacity is configured in the Compositor section' <<<"$output"
+if grep -Fq 'Picom theme mutation is not implemented' <<<"$output"; then exit 1; fi
+
+no_picom_bin=$work/no-picom-bin
+cp -a "$bin_dir" "$no_picom_bin"
+rm -f "$no_picom_bin/picom"
+missing_picom=$(PATH=$no_picom_bin GTK_THEME='' XCURSOR_THEME='' \
+	XDG_CONFIG_HOME="$config_home" XDG_DATA_HOME="$data_root" \
+	DWM_APPEARANCE_DATA_DIRS="$data_root" "$helper" snapshot)
+grep -Fqx $'provider\tappearance\tavailable\tread-only\tShared theme inventory and integration state' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\tgtk\tavailable\tNordic\tRequested GTK theme is installed and applied' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\tqt\tavailable\tqt6ct\tQt applications use the supported theme backend' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\tcursor\tavailable\tCapitaine-Cursors-White\tManaged cursor theme is installed and applied' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\talacritty\tavailable\tactive-theme\tGenerated terminal theme matches the resolved palette' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\tkitty\tavailable\tactive-theme\tGenerated terminal theme matches the resolved palette' \
+	<<<"$missing_picom"
+grep -Fqx $'integration\tcompositor\tunavailable\tmissing\tPicom is optional and not installed' \
+	<<<"$missing_picom"
 
 printf '[window]\nimport = ["%s"]\n' "$config_home/alacritty/active-theme.toml" \
 	>"$config_home/alacritty/alacritty.toml"
@@ -308,9 +332,93 @@ grep -Fqx $'error\tqt\tmissing-backend\tNo applied Qt theme backend is recorded'
 	<<<"$no_qt"
 mv "$work/theme-env.sh" "$config_home/dwm-titus/theme-env.sh"
 
+mv "$config_home/dwm-titus/theme-env.sh" "$work/theme-env-regular.sh"
+mkfifo "$config_home/dwm-titus/theme-env.sh"
+timeout 3 env PATH="$bin_dir" GTK_THEME='' \
+	QT_QPA_PLATFORMTHEME=qt6ct XCURSOR_THEME=Capitaine-Cursors-White \
+	XDG_CONFIG_HOME="$config_home" XDG_DATA_HOME="$data_root" \
+	DWM_APPEARANCE_DATA_DIRS="$data_root" "$helper" snapshot \
+	>"$work/special-theme-env.out"
+grep -Fqx $'integration\tqt\tavailable\tqt6ct\tQt applications use the supported theme backend' \
+	"$work/special-theme-env.out"
+rm "$config_home/dwm-titus/theme-env.sh"
+mv "$work/theme-env-regular.sh" "$config_home/dwm-titus/theme-env.sh"
+
 gtk3_qt=$(QT_QPA_PLATFORMTHEME=gtk3 snapshot)
-grep -Fqx $'integration\tqt\tavailable\tgtk3\tQt applications use the supported theme backend' \
+grep -Fqx $'integration\tqt\tavailable\tqt6ct\tQt applications use the supported theme backend' \
 	<<<"$gtk3_qt"
+
+for malformed_environment in unknown duplicate missing-size; do
+	case $malformed_environment in
+	unknown)
+		printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\nexport XCURSOR_SIZE=32\nexport CUSTOM_VALUE=yes\n' \
+			>"$config_home/dwm-titus/theme-env.sh"
+		;;
+	duplicate)
+		printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport QT_QPA_PLATFORMTHEME=gtk3\nexport XCURSOR_THEME=Capitaine-Cursors-White\nexport XCURSOR_SIZE=32\n' \
+			>"$config_home/dwm-titus/theme-env.sh"
+		;;
+	missing-size)
+		printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\n' \
+			>"$config_home/dwm-titus/theme-env.sh"
+		;;
+	esac
+	malformed_snapshot=$(QT_QPA_PLATFORMTHEME=gtk3 \
+		XCURSOR_THEME=Capitaine-Cursors-White snapshot)
+	grep -Fqx $'integration\tqt\tavailable\tgtk3\tQt applications use the supported theme backend' \
+		<<<"$malformed_snapshot"
+done
+printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\nexport XCURSOR_SIZE=32\n' \
+	>"$config_home/dwm-titus/theme-env.sh"
+
+printf 'personalization-protocol\t1\t0\ngtk\tfollow-system\n' \
+	>"$config_home/dwm-titus/personalization.conf"
+invalid_gtk_override=$(snapshot)
+grep -Fqx $'integration\tgtk\tavailable\tNordic\tRequested GTK theme is installed and applied' \
+	<<<"$invalid_gtk_override"
+if grep -F $'integration\tgtk\tpartial\tfollow-system\t' <<<"$invalid_gtk_override"; then
+	printf 'semantically invalid GTK personalization was reported as active\n' >&2
+	exit 1
+fi
+rm -f "$config_home/dwm-titus/personalization.conf"
+
+home_cursor_root=$work/home-cursor
+mkdir -p "$home_cursor_root/.icons/Cursor One/cursors"
+printf 'personalization-protocol\t1\t0\ncursor\tCursor One\n' \
+	>"$config_home/dwm-titus/personalization.conf"
+printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Cursor\\ One\nexport XCURSOR_SIZE=32\n' \
+	>"$config_home/dwm-titus/theme-env.sh"
+printf 'Xcursor.theme: Cursor One\n' >"$config_home/dwm-titus/cursor.Xresources"
+sed -i 's/gtk-cursor-theme-name=.*/gtk-cursor-theme-name=Cursor One/' \
+	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
+spaced_cursor=$(HOME=$home_cursor_root snapshot)
+grep -Fqx $'integration\tcursor\tavailable\tCursor One\tManaged cursor theme is installed and applied' \
+	<<<"$spaced_cursor"
+stale_environment_cursor=$(HOME=$home_cursor_root PATH=$bin_dir GTK_THEME='' XCURSOR_THEME='Old Cursor' \
+	XDG_CONFIG_HOME=$config_home XDG_DATA_HOME=$data_root \
+	DWM_APPEARANCE_DATA_DIRS=$data_root "$helper" snapshot)
+grep -Fqx $'integration\tcursor\tavailable\tCursor One\tManaged cursor theme is installed and applied' \
+	<<<"$stale_environment_cursor"
+mkdir -p "$data_root/icons/IconOnly"
+printf 'personalization-protocol\t1\t0\ncursor\tIconOnly\n' \
+	>"$config_home/dwm-titus/personalization.conf"
+printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=IconOnly\nexport XCURSOR_SIZE=32\n' \
+	>"$config_home/dwm-titus/theme-env.sh"
+printf 'Xcursor.theme: IconOnly\n' >"$config_home/dwm-titus/cursor.Xresources"
+sed -i 's/gtk-cursor-theme-name=.*/gtk-cursor-theme-name=IconOnly/' \
+	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
+icon_only_cursor=$(HOME=$home_cursor_root snapshot)
+grep -Fqx $'integration\tcursor\tunavailable\tIconOnly\tManaged cursor theme is missing' \
+	<<<"$icon_only_cursor"
+grep -Fqx $'error\tcursor\tmissing-theme\tCursor theme '\''IconOnly'\'' is not installed' \
+	<<<"$icon_only_cursor"
+rm -f "$config_home/dwm-titus/personalization.conf"
+printf 'export QT_QPA_PLATFORMTHEME=qt6ct\nexport XCURSOR_THEME=Capitaine-Cursors-White\nexport XCURSOR_SIZE=32\n' \
+	>"$config_home/dwm-titus/theme-env.sh"
+printf 'Xcursor.theme: Capitaine-Cursors-White\n' \
+	>"$config_home/dwm-titus/cursor.Xresources"
+sed -i 's/gtk-cursor-theme-name=.*/gtk-cursor-theme-name=Capitaine-Cursors-White/' \
+	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
 
 sed -i 's/XCURSOR_THEME=Capitaine-Cursors-White/XCURSOR_THEME=Capitaine-Cursors/' \
 	"$config_home/dwm-titus/theme-env.sh"
@@ -662,6 +770,15 @@ if grep -Fq $'error\tgtk\tmissing-theme' <<<"$adwaita"; then
 fi
 sed -i 's/gtk-theme-name=Adwaita-dark/gtk-theme-name=Nordic/' \
 	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
+
+mkdir -p "$data_root/themes/adw-gtk3-dark/gtk-3.0" "$data_root/themes/adw-gtk3-dark/gtk-4.0"
+sed -i 's/gtk-theme-name=Nordic/gtk-theme-name=adw-gtk3-dark/' \
+	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
+adw_dark=$(snapshot)
+grep -Fqx $'integration\tgtk\tavailable\tadw-gtk3-dark\tRequested GTK theme is installed and applied' <<<"$adw_dark"
+sed -i 's/gtk-theme-name=adw-gtk3-dark/gtk-theme-name=Nordic/' \
+	"$config_home/gtk-3.0/settings.ini" "$config_home/gtk-4.0/settings.ini"
+rm -rf "$data_root/themes/adw-gtk3-dark"
 
 cp "$work/managed-themes.toml" "$config_home/dwm-titus/themes.toml"
 sed -i '0,/theme = "nord"/s//theme = "missing"/' "$config_home/dwm-titus/themes.toml"

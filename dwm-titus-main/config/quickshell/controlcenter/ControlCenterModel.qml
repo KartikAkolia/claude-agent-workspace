@@ -11,14 +11,28 @@ Scope {
     property bool utilityVisible: false
     property string utilityPage: ""
     property var utilityScreen: null
-    property bool showVolumeWidget: true
-    property bool showBluetoothWidget: true
-    property bool showNetworkWidget: true
-    property bool showPowerWidget: true
-    property bool showWorkspaceWidget: true
+    property var panelSettingsModel: null
+    readonly property var widgetIds: ({
+        "Workspaces": "workspaces",
+        "Volume": "volume",
+        "Bluetooth": "bluetooth",
+        "Network": "network",
+        "Power": "power"
+    })
+    readonly property bool showVolumeWidget: root.panelSettingsModel
+        ? root.panelSettingsModel.widgetEnabled("volume") : true
+    readonly property bool showBluetoothWidget: root.panelSettingsModel
+        ? root.panelSettingsModel.widgetEnabled("bluetooth") : true
+    readonly property bool showNetworkWidget: root.panelSettingsModel
+        ? root.panelSettingsModel.widgetEnabled("network") : true
+    readonly property bool showPowerWidget: root.panelSettingsModel
+        ? root.panelSettingsModel.widgetEnabled("power") : true
+    readonly property bool showWorkspaceWidget: root.panelSettingsModel
+        ? root.panelSettingsModel.widgetEnabled("workspaces") : true
     property string message: ""
     property string pendingAction: ""
     property bool actionSucceeded: false
+    property string actionError: ""
     property var powerModel: null
     property var infoRows: []
     property var themeRows: []
@@ -31,6 +45,7 @@ Scope {
             { "id": "reload-wallpaper", "label": "Reload Wallpaper" },
             { "id": "restart-networkmanager", "label": "Restart NetworkManager" },
             { "id": "dependency-check", "label": "Dependency Check" },
+            { "id": "self-heal", "label": "Self-Heal" },
             { "id": "install-missing-deps", "label": "Install Missing Deps" },
             { "id": "open-wallpapers", "label": "Wallpaper Folder" }
         ];
@@ -73,19 +88,15 @@ Scope {
     }
 
     function widgetEnabled(name) {
-        if (name === "Volume") return root.showVolumeWidget;
-        if (name === "Bluetooth") return root.showBluetoothWidget;
-        if (name === "Network") return root.showNetworkWidget;
-        if (name === "Power") return root.showPowerWidget;
-        return root.showWorkspaceWidget;
+        const id = root.widgetIds[name];
+        if (!root.panelSettingsModel || id === undefined) return true;
+        return root.panelSettingsModel.widgetEnabled(id);
     }
 
     function toggleWidget(name) {
-        if (name === "Volume") root.showVolumeWidget = !root.showVolumeWidget;
-        else if (name === "Bluetooth") root.showBluetoothWidget = !root.showBluetoothWidget;
-        else if (name === "Network") root.showNetworkWidget = !root.showNetworkWidget;
-        else if (name === "Power") root.showPowerWidget = !root.showPowerWidget;
-        else if (name === "Workspaces") root.showWorkspaceWidget = !root.showWorkspaceWidget;
+        const id = root.widgetIds[name];
+        if (!root.panelSettingsModel || id === undefined) return;
+        root.panelSettingsModel.toggleWidget(id);
     }
 
     function toggle() {
@@ -186,6 +197,7 @@ Scope {
         root.busy = true;
         root.pendingAction = action;
         root.actionSucceeded = false;
+        root.actionError = "";
         root.message = "Running " + action + "...";
         actionProcess.command = Commands.controlCenterHelperCommand("action", [action]);
         actionProcess.running = true;
@@ -265,12 +277,17 @@ Scope {
             onStreamFinished: root.actionSucceeded = this.text.indexOf("action\t") === 0
         }
 
+        stderr: StdioCollector {
+            onStreamFinished: root.actionError = this.text.trim().slice(0, 1024)
+        }
+
         onRunningChanged: {
             if (!running && root.busy) {
                 root.busy = false;
                 root.message = root.actionSucceeded
                     ? "Action dispatched"
-                    : "Action failed: " + root.pendingAction;
+                    : (root.actionError.length > 0 ? root.actionError
+                        : "Action failed: " + root.pendingAction);
                 root.pendingAction = "";
                 root.refreshCurrentPage();
             }

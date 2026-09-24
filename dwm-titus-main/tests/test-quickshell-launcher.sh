@@ -41,6 +41,8 @@ symlink_desktop="$work/data/applications/symlink.desktop"
 flatpak_desktop="$work/home/.local/share/flatpak/exports/share/applications/flatpak.desktop"
 snap_desktop="$work/home/.local/share/snapd/applications/snap.desktop"
 localized_desktop="$work/data/applications/localized.desktop"
+chatgpt_native_desktop="$work/data/applications/chatgpt.desktop"
+chatgpt_web_desktop="$work/empty/applications/ChatGPT.desktop"
 
 cat >"$work/data/applications/visible.desktop" <<'DESKTOP'
 [Desktop Entry]
@@ -149,6 +151,24 @@ Exec=hidden-app
 NoDisplay=true
 DESKTOP
 
+mkdir -p "$work/empty/applications"
+cat >"$chatgpt_native_desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=ChatGPT
+GenericName=AI assistant
+Exec=chatgpt %U
+Categories=Utility;Development;
+DESKTOP
+
+cat >"$chatgpt_web_desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=ChatGPT
+Exec=webapp-launch https://chatgpt.com/
+Categories=Network;WebApp;
+DESKTOP
+
 cat >"$work/data/applications/link.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Link
@@ -156,11 +176,70 @@ Name=Link Entry
 Exec=xdg-open https://example.invalid
 DESKTOP
 
+cat >"$work/data/applications/only-xfce.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=XFCE Only App
+Exec=xfce-app
+OnlyShowIn=XFCE;
+DESKTOP
+
+cat >"$work/data/applications/only-dwm.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=DWM Only App
+Exec=dwm-only-app
+OnlyShowIn=XFCE;dwm;
+DESKTOP
+
+cat >"$work/data/applications/only-xdwm.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=X-DWM Only App
+Exec=xdwm-only-app
+OnlyShowIn=X-DWM;
+DESKTOP
+
+cat >"$work/data/applications/not-dwm.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Not DWM App
+Exec=not-dwm-app
+NotShowIn=dwm;
+DESKTOP
+
+cat >"$work/data/applications/not-kde.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Not KDE App
+Exec=not-kde-app
+NotShowIn=KDE;
+DESKTOP
+
+cat >"$work/data/applications/both-keys.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Both Keys App
+Exec=both-keys-app
+OnlyShowIn=dwm;
+NotShowIn=XFCE;
+DESKTOP
+
+cat >"$work/data/applications/empty-only.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Empty Only App
+Exec=empty-only-app
+OnlyShowIn=
+DESKTOP
+
 output=$(
 	LANG=en_US.UTF-8 \
 		HOME="$work/home" \
+		XDG_RUNTIME_DIR=relative-runtime \
 		XDG_DATA_HOME="$work/empty" \
 		XDG_DATA_DIRS="$work/data" \
+		XDG_CURRENT_DESKTOP="X-DWM:dwm" \
 		"$repo/scripts/dwm-quickshell-launcher" list
 )
 
@@ -172,27 +251,248 @@ assert_listed 'Flatpak Export	Exported App	Shown from Flatpak export path	flatpa
 assert_listed 'Snap Export	Packaged App	Shown from Snap export path	snap-export	snap	'"$snap_desktop"'	snap;exported;	Utility;	snap-export	new-window;'
 assert_listed 'Localized Name	Localized Generic	Localized comment	localized-app	localized	'"$localized_desktop"'	localized;translated;	Office;'
 assert_listed 'Symlinked App			symlinked-app		'"$symlink_desktop"
+assert_listed 'DWM Only App			dwm-only-app		'"$work/data/applications/only-dwm.desktop"
+assert_listed 'X-DWM Only App			xdwm-only-app		'"$work/data/applications/only-xdwm.desktop"
+assert_listed 'Not KDE App			not-kde-app		'"$work/data/applications/not-kde.desktop"
+if printf '%s\n' "$output" | grep -F 'XFCE Only App'; then
+	printf 'XFCE Only App should not be listed under default dwm desktop\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$output" | grep -F 'Not DWM App'; then
+	printf 'Not DWM App should not be listed under default dwm desktop\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$output" | grep -F 'Both Keys App'; then
+	printf 'Both Keys App should not be listed under default dwm desktop (violates spec mutual exclusivity)\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$output" | grep -F 'Empty Only App'; then
+	printf 'Empty Only App should not be listed under default dwm desktop\n' >&2
+	exit 1
+fi
 if printf '%s\n' "$output" | grep -F 'Hidden App'; then
 	exit 1
 fi
 if printf '%s\n' "$output" | grep -F 'Link Entry'; then
 	exit 1
 fi
+assert_listed "$chatgpt_native_desktop"
+if printf '%s\n' "$output" | grep -F "$chatgpt_web_desktop"; then
+	exit 1
+fi
+
+unset_desktop_output=$(
+	LANG=en_US.UTF-8 \
+		HOME="$work/home" \
+		XDG_RUNTIME_DIR=relative-runtime \
+		XDG_DATA_HOME="$work/empty" \
+		XDG_DATA_DIRS="$work/data" \
+		env -u XDG_CURRENT_DESKTOP \
+		"$repo/scripts/dwm-quickshell-launcher" list
+)
+if ! printf '%s\n' "$unset_desktop_output" | grep -Fq 'DWM Only App'; then
+	printf 'DWM Only App should be listed when XDG_CURRENT_DESKTOP is unset (fallback to X-DWM:dwm)\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$unset_desktop_output" | grep -Fq 'XFCE Only App'; then
+	printf 'XFCE Only App should not be listed when XDG_CURRENT_DESKTOP is unset\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$unset_desktop_output" | grep -Fq 'Both Keys App'; then
+	printf 'Both Keys App should not be listed when XDG_CURRENT_DESKTOP is unset\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$unset_desktop_output" | grep -Fq 'Empty Only App'; then
+	printf 'Empty Only App should not be listed when XDG_CURRENT_DESKTOP is unset\n' >&2
+	exit 1
+fi
+
+custom_desktop_output=$(
+	LANG=en_US.UTF-8 \
+		HOME="$work/home" \
+		XDG_RUNTIME_DIR=relative-runtime \
+		XDG_DATA_HOME="$work/empty" \
+		XDG_DATA_DIRS="$work/data" \
+		XDG_CURRENT_DESKTOP="XFCE" \
+		"$repo/scripts/dwm-quickshell-launcher" list
+)
+if ! printf '%s\n' "$custom_desktop_output" | grep -Fq 'XFCE Only App'; then
+	printf 'XFCE Only App should be listed when XDG_CURRENT_DESKTOP=XFCE\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$custom_desktop_output" | grep -Fq 'X-DWM Only App'; then
+	printf 'X-DWM Only App should not be listed when XDG_CURRENT_DESKTOP=XFCE\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$custom_desktop_output" | grep -Fq 'Both Keys App'; then
+	printf 'Both Keys App should not be listed when XDG_CURRENT_DESKTOP=XFCE\n' >&2
+	exit 1
+fi
+if printf '%s\n' "$custom_desktop_output" | grep -Fq 'Empty Only App'; then
+	printf 'Empty Only App should not be listed when XDG_CURRENT_DESKTOP=XFCE\n' >&2
+	exit 1
+fi
 
 cat >"$work/bin/dex" <<'SH'
 #!/bin/sh
 printf '%s\n' "$1" >"$DWM_TEST_DEX_LOG"
+printf '%s\t%s\t%s\n' "${QT_QPA_PLATFORMTHEME:-}" "${XCURSOR_THEME:-}" \
+	"${XCURSOR_SIZE:-}" >"$DWM_TEST_THEME_ENV_LOG"
 SH
 chmod +x "$work/bin/dex"
 
+mkdir -p "$work/home/.config/dwm-titus"
+mkdir -p "$work/runtime"
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME=gtk3' \
+	'export XCURSOR_THEME=Cursor-One' 'export XCURSOR_SIZE=32' \
+	>"$work/home/.config/dwm-titus/theme-env.sh"
+
 DWM_TEST_DEX_LOG="$work/dex.log" \
+	DWM_TEST_THEME_ENV_LOG="$work/theme-env.log" \
+	HOME="$work/home" \
+	XDG_CONFIG_HOME="$work/home/.config" \
+	XDG_RUNTIME_DIR="$work/runtime" \
 	PATH="$work/bin:$PATH" \
 	"$repo/scripts/dwm-quickshell-launcher" launch "$work/data/applications/visible.desktop"
 assert_file_line "$work/dex.log" "$work/data/applications/visible.desktop"
+assert_file_line "$work/theme-env.log" "$(printf 'gtk3\tCursor-One\t32')"
+
+mkdir -p "$work/relative-config/dwm-titus"
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME=qt6ct' \
+	'export XCURSOR_THEME=Wrong-Cursor' 'export XCURSOR_SIZE=48' \
+	>"$work/relative-config/dwm-titus/theme-env.sh"
+(
+	cd "$work"
+	DWM_TEST_DEX_LOG="$work/dex-relative-config.log" \
+		DWM_TEST_THEME_ENV_LOG="$work/theme-env-relative-config.log" \
+		HOME="$work/home" \
+		XDG_CONFIG_HOME=relative-config \
+		XDG_RUNTIME_DIR="$work/runtime" \
+		PATH="$work/bin:$PATH" \
+		"$repo/scripts/dwm-session-launch" dex \
+		"$work/data/applications/visible.desktop"
+)
+assert_file_line "$work/theme-env-relative-config.log" "$(printf 'gtk3\tCursor-One\t32')"
+
+exec 9>"$work/runtime/dwm-theme-apply.lock"
+flock 9
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME=qt6ct' \
+	'export XCURSOR_THEME=Uncommitted-Cursor' 'export XCURSOR_SIZE=48' \
+	>"$work/home/.config/dwm-titus/theme-env.sh"
+rm -f "$work/theme-env-locked.log" "$work/dex-locked.log"
+DWM_TEST_DEX_LOG="$work/dex-locked.log" \
+	DWM_TEST_THEME_ENV_LOG="$work/theme-env-locked.log" \
+	HOME="$work/home" \
+	XDG_CONFIG_HOME="$work/home/.config" \
+	XDG_RUNTIME_DIR="$work/runtime" \
+	PATH="$work/bin:$PATH" \
+	"$repo/scripts/dwm-quickshell-launcher" launch "$work/data/applications/visible.desktop" &
+locked_launcher_pid=$!
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+	kill -0 "$locked_launcher_pid" 2>/dev/null || break
+	[ ! -e "$work/theme-env-locked.log" ] || break
+	attempts=$((attempts + 1))
+	sleep 0.1
+done
+[ ! -e "$work/theme-env-locked.log" ]
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME=gtk3' \
+	'export XCURSOR_THEME=Cursor-One' 'export XCURSOR_SIZE=32' \
+	>"$work/home/.config/dwm-titus/theme-env.sh"
+flock -u 9
+exec 9>&-
+wait "$locked_launcher_pid"
+assert_file_line "$work/theme-env-locked.log" "$(printf 'gtk3\tCursor-One\t32')"
+
+exec 9>"$work/runtime/dwm-theme-apply.lock"
+flock 9
+QT_QPA_PLATFORMTHEME=parent-qt XCURSOR_THEME=Parent-Cursor XCURSOR_SIZE=24 \
+	DWM_TEST_DEX_LOG="$work/dex-timeout.log" \
+	DWM_TEST_THEME_ENV_LOG="$work/theme-env-timeout.log" \
+	HOME="$work/home" \
+	XDG_CONFIG_HOME="$work/home/.config" \
+	XDG_RUNTIME_DIR="$work/runtime" \
+	PATH="$work/bin:$PATH" \
+	timeout 4 "$repo/scripts/dwm-session-launch" dex \
+	"$work/data/applications/visible.desktop"
+flock -u 9
+exec 9>&-
+assert_file_line "$work/theme-env-timeout.log" "$(printf 'parent-qt\tParent-Cursor\t24')"
+
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME="unterminated' \
+	>"$work/home/.config/dwm-titus/theme-env.sh"
+QT_QPA_PLATFORMTHEME=parent-qt XCURSOR_THEME=Parent-Cursor XCURSOR_SIZE=24 \
+	DWM_TEST_DEX_LOG="$work/dex-malformed.log" \
+	DWM_TEST_THEME_ENV_LOG="$work/theme-env-malformed.log" \
+	HOME="$work/home" \
+	XDG_CONFIG_HOME="$work/home/.config" \
+	XDG_RUNTIME_DIR="$work/runtime" \
+	PATH="$work/bin:$PATH" \
+	"$repo/scripts/dwm-quickshell-launcher" launch "$work/data/applications/visible.desktop"
+assert_file_line "$work/dex-malformed.log" "$work/data/applications/visible.desktop"
+assert_file_line "$work/theme-env-malformed.log" "$(printf 'parent-qt\tParent-Cursor\t24')"
+
+mv "$work/home/.config/dwm-titus/theme-env.sh" "$work/theme-env.saved"
+mkfifo "$work/home/.config/dwm-titus/theme-env.sh"
+timeout 3 env \
+	QT_QPA_PLATFORMTHEME=parent-qt XCURSOR_THEME=Parent-Cursor XCURSOR_SIZE=24 \
+	DWM_TEST_DEX_LOG="$work/dex-fifo.log" \
+	DWM_TEST_THEME_ENV_LOG="$work/theme-env-fifo.log" \
+	HOME="$work/home" \
+	XDG_CONFIG_HOME="$work/home/.config" \
+	XDG_RUNTIME_DIR="$work/runtime" \
+	PATH="$work/bin:$PATH" \
+	"$repo/scripts/dwm-quickshell-launcher" launch "$work/data/applications/visible.desktop"
+assert_file_line "$work/dex-fifo.log" "$work/data/applications/visible.desktop"
+assert_file_line "$work/theme-env-fifo.log" "$(printf 'parent-qt\tParent-Cursor\t24')"
+rm "$work/home/.config/dwm-titus/theme-env.sh"
+mv "$work/theme-env.saved" "$work/home/.config/dwm-titus/theme-env.sh"
+
+rm -f "$work/dex.log"
+DWM_TEST_DEX_LOG="$work/dex.log" \
+	HOME="$work/home" \
+	PATH="$work/bin:$PATH" \
+	XDG_DATA_HOME="$work/empty" \
+	XDG_DATA_DIRS="$work/data" \
+	"$repo/scripts/dwm-quickshell-launcher" launch-chatgpt
+assert_file_line "$work/dex.log" "$chatgpt_native_desktop"
+
+rm "$chatgpt_native_desktop"
+output=$(
+	LANG=en_US.UTF-8 \
+		HOME="$work/home" \
+		XDG_DATA_HOME="$work/empty" \
+		XDG_DATA_DIRS="$work/data" \
+		"$repo/scripts/dwm-quickshell-launcher" list
+)
+assert_listed "$chatgpt_web_desktop"
+
+cat >"$work/bin/webapp-launch" <<'SH'
+#!/bin/sh
+printf '%s\n' "$1" >"$DWM_TEST_WEBAPP_LOG"
+SH
+chmod +x "$work/bin/webapp-launch"
+
+DWM_TEST_WEBAPP_LOG="$work/webapp.log" \
+	HOME="$work/home" \
+	PATH="$work/bin:$PATH" \
+	XDG_DATA_HOME="$work/empty" \
+	XDG_DATA_DIRS="$work/data" \
+	"$repo/scripts/dwm-quickshell-launcher" launch-chatgpt
+assert_file_line "$work/webapp.log" 'https://chatgpt.com'
 
 if "$repo/scripts/dwm-quickshell-launcher" launch "$work/data/applications/missing.desktop" 2>"$work/missing.err"; then
 	exit 1
 fi
 grep -Fqx "desktop entry not found: $work/data/applications/missing.desktop" "$work/missing.err"
+
+grep -Fq 'readlink("/proc/self/exe", launcher' "$repo/dwm.c"
+grep -Fq 'memcpy(separator, "/dwm-session-launch"' "$repo/dwm.c"
+grep -Fq 'posix_spawn(NULL, wrapped[0]' "$repo/dwm.c"
+if grep -Fq -- '-DPREFIX=' "$repo/config.mk"; then
+	printf 'DWM still embeds a stale compile-time install prefix\n' >&2
+	exit 1
+fi
+grep -Fq 'scripts/dwm-session-launch' "$repo/Makefile"
 
 printf 'Quickshell launcher helper: PASS\n'

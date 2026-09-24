@@ -4,9 +4,11 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.SystemTray
+import qs.accessibility
 import qs.appearance
 import qs.controlcenter
 import qs.controls
+import qs.core
 import qs.defaults
 import qs.health
 import qs.launcher
@@ -16,6 +18,7 @@ import qs.panel
 import qs.power
 import qs.settings
 import qs.state
+import qs.systemmanagement
 
 pragma ComponentBehavior: Bound
 
@@ -37,6 +40,9 @@ ShellRoot {
         }
 
         commandMenuModel.close();
+        launcherModel.close();
+        notificationModel.closeHistory();
+        controlCenterModel.closeUtility();
         if (popupId !== "bluetooth") bluetoothModel.close();
         if (popupId !== "controlcenter") controlCenterModel.close();
         if (popupId !== "controls") controlsModel.close();
@@ -105,10 +111,9 @@ ShellRoot {
         id: dwmState
     }
 
-    SystemClock {
+    ClockModel {
         id: clock
-
-        precision: SystemClock.Minutes
+        timezoneState: systemManagementModel.nativeStates.timezone || null
     }
 
     LauncherModel {
@@ -174,6 +179,14 @@ ShellRoot {
         id: appearanceModel
     }
 
+    AccessibilityModel {
+        id: accessibilityModel
+    }
+
+    PanelSettingsModel {
+        id: panelSettingsModel
+    }
+
     NetworkModel {
         id: networkModel
     }
@@ -189,10 +202,29 @@ ShellRoot {
     ControlCenterModel {
         id: controlCenterModel
         powerModel: powerModel
+        panelSettingsModel: panelSettingsModel
     }
 
     SystemHealthModel {
         id: systemHealthModel
+    }
+
+    SystemManagementModel {
+        id: systemManagementModel
+        desktopUpdateBusy: desktopUpdateModel.updateOwned
+        desktopUpdateInterrupted: desktopUpdateModel.status.state === "interrupted"
+        healthModel: systemHealthModel
+        targetScreen: settingsWindow.screen || settingsModel.targetScreen || root.activePanelScreen
+        onHealthOpened: settingsModel.close()
+    }
+
+    DesktopUpdateModel {
+        id: desktopUpdateModel
+        backgroundMonitor: true
+        onAuthorizationRequested: settingsModel.close()
+        settingsVisible: settingsModel.visible && settingsModel.selectedSectionId === "system"
+        systemBusy: systemManagementModel.operation.busy || systemManagementModel.activeOperation !== null
+            || systemManagementModel.updateConfirmation !== null
     }
 
     SettingsModel {
@@ -205,6 +237,9 @@ ShellRoot {
         defaultsModel: defaultsModel
         autostartModel: autostartModel
         appearanceModel: appearanceModel
+        accessibilityModel: accessibilityModel
+        panelSettingsModel: panelSettingsModel
+        systemManagementModel: systemManagementModel
     }
 
     LazyLoader {
@@ -410,6 +445,34 @@ ShellRoot {
             return notificationModel.historyLatestSummary();
         }
 
+        function doNotDisturb(): bool {
+            return notificationModel.doNotDisturb;
+        }
+
+        function popupTimeout(): int {
+            return notificationModel.popupTimeoutMs;
+        }
+
+        function policyState(): string {
+            return notificationModel.policyState;
+        }
+
+        function policyStatus(): string {
+            return notificationModel.policyStatus();
+        }
+
+        function resetPolicy(): void {
+            notificationModel.resetPolicy();
+        }
+
+        function setDoNotDisturb(enabled: bool): void {
+            notificationModel.setDoNotDisturb(enabled);
+        }
+
+        function setPopupTimeout(timeoutMs: int): void {
+            notificationModel.setPopupTimeout(timeoutMs);
+        }
+
         function openHistory(): void {
             notificationModel.openHistory();
         }
@@ -492,6 +555,80 @@ ShellRoot {
 
         function inputStatus(): string {
             return settingsModel.inputState;
+        }
+
+        function systemManagementProviderStatus(): string {
+            return systemManagementModel.providerState;
+        }
+
+        function systemManagementUpdateCount(): int {
+            return systemManagementModel.updates.length;
+        }
+
+        function systemManagementRestartState(): string {
+            return systemManagementModel.updateRestart.status + ":" + systemManagementModel.updateRestart.value;
+        }
+
+        function systemManagementPackageChangeCount(): int {
+            return systemManagementModel.packageChanges.length;
+        }
+
+        function systemManagementInstallAvailability(): string {
+            const action = systemManagementModel.actions.find(function(item) {
+                return item.id === "updates-install-all";
+            });
+            return action === undefined ? "missing" : action.availability;
+        }
+
+        function systemManagementErrorCodes(): string {
+            return systemManagementModel.errors.map(function(item) {
+                return item.code;
+            }).join(",");
+        }
+
+        function systemManagementSnapshotState(): string {
+            return systemManagementModel.snapshotState;
+        }
+
+        function systemManagementDiscoveryStatus(): string {
+            const discovery = systemManagementModel.discovery;
+            return discovery.phase + ":" + (discovery.ready ? "ready"
+                : discovery.failed ? "failed" : "inactive");
+        }
+
+        function systemManagementOperationState(): string {
+            return systemManagementModel.operation.state;
+        }
+
+        function systemManagementOperationResult(): string {
+            const result = systemManagementModel.operation.result;
+            return result === null ? "" : result.actionId + ":" + result.state;
+        }
+
+        function inputAccessibilityValue(settingId: string): string {
+            const setting = settingsModel.inputSettings.find(function(item) {
+                return item.device === "accessx" && item.id === settingId;
+            });
+            return setting ? setting.value : "";
+        }
+
+        function inputAccessibilityPreview(settingId: string, enabled: bool): void {
+            settingsModel.previewInput("accessx", settingId, enabled ? "1" : "0");
+        }
+
+        function inputPreviewState(): string {
+            return settingsModel.previewKind;
+        }
+
+        function inputPreviewAction(action: string): void {
+            if (settingsModel.previewKind !== "input") return;
+            if (action === "keep") settingsModel.keepPreview();
+            else if (action === "revert") settingsModel.revertPreview();
+        }
+
+        function inputAccessibilityReset(settingId: string): void {
+            if (settingsModel.previewOperationLocked) return;
+            settingsModel.resetInput("accessx", settingId);
         }
 
         function networkProviderStatus(): string {
@@ -654,9 +791,46 @@ ShellRoot {
             return appearanceModel.applicationState;
         }
 
+        function appearanceInventoryState(capability: string): string {
+            return appearanceModel.inventorySelection(capability).state;
+        }
+
+        function appearanceInventoryProviderState(): string {
+            return appearanceModel.inventoryProviderState;
+        }
+
+        function appearanceInventoryWatchState(): string {
+            return appearanceModel.inventoryWatchState;
+        }
+
+        function appearanceInventoryWatchDetail(): string {
+            return appearanceModel.inventoryWatchDetail;
+        }
+
+        function appearanceInventoryProviderDetail(): string {
+            return appearanceModel.inventoryProviderDetail;
+        }
+
+        function appearanceInventoryCandidateState(capability: string, token: string): string {
+            const match = appearanceModel.inventoryCandidates.find(function(item) {
+                return item.id === capability && item.token === token;
+            });
+            return match ? match.state : "";
+        }
+
         function appearanceIntegrationState(integrationId: string): string {
             const match = appearanceModel.integrations.find(function(item) { return item.id === integrationId; });
             return match ? match.state : "";
+        }
+
+        function appearanceIntegrationDetail(integrationId: string): string {
+            const match = appearanceModel.integrations.find(function(item) { return item.id === integrationId; });
+            return match ? match.detail : "";
+        }
+
+        function appearanceErrorCode(scope: string): string {
+            const match = appearanceModel.errors.find(function(item) { return item.scope === scope; });
+            return match ? match.code : "";
         }
 
         function appearanceActiveTheme(): string {
@@ -683,6 +857,18 @@ ShellRoot {
             return appearanceModel.wallpaperState;
         }
 
+        function appearanceWallpaperProviderState(): string {
+            return appearanceModel.wallpaperProviderState;
+        }
+
+        function appearanceWallpaperProviderDetail(): string {
+            return appearanceModel.wallpaperProviderDetail;
+        }
+
+        function appearanceWallpaperDetail(): string {
+            return appearanceModel.wallpaperDetail;
+        }
+
         function appearanceWallpaperPath(): string {
             return appearanceModel.wallpaperPath;
         }
@@ -695,8 +881,20 @@ ShellRoot {
             return appearanceModel.wallpaperMutationDetail;
         }
 
+        function appearanceWallpaperMutationState(): string {
+            return appearanceModel.wallpaperMutationState;
+        }
+
         function appearanceWallpaperResetReady(): bool {
             return appearanceModel.wallpaperResetReady;
+        }
+
+        function appearanceWallpaperResetState(): string {
+            return appearanceModel.wallpaperResetState;
+        }
+
+        function appearanceWallpaperResetDetail(): string {
+            return appearanceModel.wallpaperResetDetail;
         }
 
         function appearanceWallpaperPreviewState(): string {
@@ -739,12 +937,105 @@ ShellRoot {
             return appearanceModel.fontPreviewRemaining;
         }
 
+        function appearancePersonalizationStatus(): string {
+            return appearanceModel.personalizationProviderState;
+        }
+
+        function appearancePersonalizationStatusBusy(): bool {
+            return appearanceModel.personalizationStatusBusy;
+        }
+
+        function appearanceRefresh(): void {
+            appearanceModel.refreshAll(true);
+        }
+
+        function capabilityStatus(capabilityId: string): string {
+            return settingsModel.capabilityById(capabilityId).status;
+        }
+
+        function accessibilityState(): string {
+            return accessibilityModel.providerState;
+        }
+
+        function accessibilityMutationReady(): bool {
+            return accessibilityModel.mutationReady;
+        }
+
+        function accessibilityBusy(): bool {
+            return accessibilityModel.busy;
+        }
+
+        function accessibilityHighContrast(): bool {
+            return accessibilityModel.highContrast;
+        }
+
+        function accessibilityReducedMotion(): bool {
+            return accessibilityModel.reducedMotion;
+        }
+
+        function accessibilitySetContrast(enabled: bool): void {
+            accessibilityModel.setSetting("contrast", enabled ? "high" : "standard");
+        }
+
+        function accessibilitySetReducedMotion(enabled: bool): void {
+            accessibilityModel.setSetting("motion", enabled ? "reduced" : "full");
+        }
+
+        function accessibilityReset(): void {
+            accessibilityModel.reset();
+        }
+
+        function appearancePersonalizationMutationState(): string {
+            return appearanceModel.personalizationMutationState;
+        }
+
+        function appearancePersonalizationValue(capability: string): string {
+            return appearanceModel.personalizationSelection(capability).value;
+        }
+
+        function appearancePersonalizationOption(capability: string): string {
+            return appearanceModel.personalizationSelection(capability).option;
+        }
+
+        function appearancePersonalizationEffectiveState(capability: string): string {
+            return appearanceModel.personalizationEffectiveState(capability);
+        }
+
+        function appearancePersonalizationApplyState(capability: string): string {
+            return appearanceModel.personalizationReadiness(capability).apply;
+        }
+
+        function appearancePersonalizationResetState(capability: string): string {
+            return appearanceModel.personalizationReadiness(capability).reset;
+        }
+
+        function appearancePersonalizationDelegateState(capability: string): string {
+            const match = appearanceModel.personalizationDelegates[capability];
+            return match ? match.state : "";
+        }
+
         function appearanceMessage(): string {
             return appearanceModel.message;
         }
 
         function appearanceRecoveryState(): string {
             return appearanceModel.recoveryState;
+        }
+
+        function panelSettingsState(): string {
+            return panelSettingsModel.providerState;
+        }
+
+        function panelWidgetEnabled(widget: string): bool {
+            return panelSettingsModel.widgetEnabled(widget);
+        }
+
+        function panelWidgetSet(widget: string, enabled: bool): void {
+            panelSettingsModel.setWidget(widget, enabled);
+        }
+
+        function panelWidgetsReset(): void {
+            panelSettingsModel.reset();
         }
 
         function autostartConfirming(): bool {
@@ -773,7 +1064,7 @@ ShellRoot {
         }
 
         function open(): void {
-            settingsModel.open();
+            settingsModel.openOnScreen(dwmState.focusedScreen());
         }
 
         function refresh(): void {
@@ -789,7 +1080,8 @@ ShellRoot {
         }
 
         function toggle(): void {
-            settingsModel.toggle();
+            if (settingsModel.visible) settingsModel.close();
+            else settingsModel.openOnScreen(dwmState.focusedScreen());
         }
     }
 
@@ -858,8 +1150,10 @@ ShellRoot {
             controlsModel: controlsModel
             bluetoothModel: bluetoothModel
             controlCenterModel: controlCenterModel
+            panelSettingsModel: panelSettingsModel
             powerModel: powerModel
             powerMenuModel: powerMenuModel
+            desktopUpdateModel: desktopUpdateModel
             primaryPanel: modelData === Quickshell.screens[0]
             onPopupRequested: (panel, popupId) => root.selectPanelPopup(panel, popupId)
         }
@@ -909,6 +1203,8 @@ ShellRoot {
     }
 
     SettingsWindow {
+        id: settingsWindow
+        clock: clock
         settingsModel: settingsModel
         networkModel: networkModel
         bluetoothModel: bluetoothModel
@@ -918,5 +1214,10 @@ ShellRoot {
         defaultsModel: defaultsModel
         autostartModel: autostartModel
         appearanceModel: appearanceModel
+        accessibilityModel: accessibilityModel
+        notificationModel: notificationModel
+        panelSettingsModel: panelSettingsModel
+        systemManagementModel: systemManagementModel
+        desktopUpdateModel: desktopUpdateModel
     }
 }

@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+DISPLAY=${DISPLAY:-:fixture}
+export DISPLAY
+
 repo=$(
 	unset CDPATH
 	cd -- "$(dirname -- "$0")/.." && pwd
@@ -28,7 +31,7 @@ SH
 	chmod +x "$work/bin/$name"
 }
 
-for name in quickshell xprop dwm-quickshell-launcher dwm-quickshell-controlcenter dex picom feh maim notify-send pactl brightnessctl xset gsettings light-locker setsid dwm-terminal dwm-default-apps dwm-settings-wallpaper xdg-open nwg-look pkill pgrep dnf; do
+for name in quickshell xprop dwm-quickshell-launcher dwm-quickshell-controlcenter dex picom dwm-settings-picom feh maim notify-send pactl brightnessctl xset gsettings light-locker setsid dwm-terminal dwm-default-apps dwm-settings-wallpaper xdg-open nwg-look pkill pgrep dnf; do
 	stub_command "$name"
 done
 
@@ -40,6 +43,16 @@ case ${1:-} in
 esac
 SH
 chmod +x "$work/bin/quickshell"
+
+cat >"$work/bin/nwg-look" <<'SH'
+#!/bin/sh
+printf 'nwg-look %s\n' "$*" >>"${DWM_TEST_LOG:?}"
+if [ -n "${DWM_TEST_THEME_ENV_LOG:-}" ]; then
+	printf '%s\t%s\t%s\n' "${QT_QPA_PLATFORMTHEME:-}" "${XCURSOR_THEME:-}" \
+		"${XCURSOR_SIZE:-}" >"$DWM_TEST_THEME_ENV_LOG"
+fi
+SH
+chmod +x "$work/bin/nwg-look"
 
 cat >"$work/bin/pkill" <<'SH'
 #!/bin/sh
@@ -213,7 +226,7 @@ run_helper() {
 		DWM_TEST_MODE=1 \
 		DWM_TEST_QUICKSHELL_VERSION="${DWM_TEST_QUICKSHELL_VERSION:-0.3.0}" \
 		DWM_HEALTH_COMMAND_TIMEOUT=2 \
-		PATH="$work/bin:/usr/bin:/bin" \
+		PATH="${DWM_TEST_PATH:-$work/bin:/usr/bin:/bin}" \
 		"$repo/scripts/dwm-quickshell-controlcenter" "$@"
 }
 
@@ -281,13 +294,25 @@ grep -Fq 'theme is unavailable, invalid, or the source is unsafe to mutate: miss
 	"$work/theme-set.err"
 
 mkdir -p "$work/prefix/bin"
-cp "$repo/scripts/dwm-quickshell-controlcenter" "$work/prefix/bin/"
+cp "$repo/scripts/dwm-quickshell-controlcenter" "$repo/scripts/dwm-session-launch" \
+	"$work/prefix/bin/"
 rm "$work/config/dwm-titus/themes.toml"
 installed_themes=$(HOME="$work/home" XDG_CONFIG_HOME="$work/config" \
 	XDG_DATA_HOME="$work/data" "$work/prefix/bin/dwm-quickshell-controlcenter" themes)
 printf '%s\n' "$installed_themes" | grep -Fqx 'active	nord'
 printf '%s\n' "$installed_themes" | grep -Fqx 'available	dracula'
 cp "$work/data/dwm-titus/config/themes.toml" "$work/config/dwm-titus/themes.toml"
+printf '%s\n' 'export QT_QPA_PLATFORMTHEME=qt6ct' \
+	'export XCURSOR_THEME=Custom-Cursor' 'export XCURSOR_SIZE=32' \
+	>"$work/config/dwm-titus/theme-env.sh"
+DWM_TEST_LOG="$work/actions.log" DWM_TEST_SYNC=1 \
+	DWM_TEST_THEME_ENV_LOG="$work/custom-prefix-theme-env.log" \
+	HOME="$work/home" XDG_CONFIG_HOME="$work/config" XDG_RUNTIME_DIR="$work/runtime" \
+	QT_QPA_PLATFORMTHEME=gtk3 XCURSOR_THEME=Old-Cursor XCURSOR_SIZE=24 \
+	PATH="$work/bin:/usr/bin:/bin" \
+	"$work/prefix/bin/dwm-quickshell-controlcenter" action gtk-settings >/dev/null
+grep -Fqx "$(printf 'qt6ct\tCustom-Cursor\t32')" \
+	"$work/custom-prefix-theme-env.log"
 
 rm "$work/config/dwm-titus/themes.toml" "$work/data/dwm-titus/config/themes.toml"
 run_helper theme-set dracula >"$work/theme-set-source.out"
@@ -356,7 +381,7 @@ grep -Fqx 'xset s off' "$work/actions.log"
 grep -Fqx 'xset s noblank' "$work/actions.log"
 grep -Fqx 'gsettings set apps.light-locker lock-after-screensaver 0' "$work/actions.log"
 grep -Fqx 'gsettings set apps.light-locker lock-on-suspend false' "$work/actions.log"
-grep -Fqx "pkill -u $test_uid -x light-locker" "$work/actions.log"
+grep -Fqx "pkill -u $test_uid -x light-locker --env DISPLAY=$DISPLAY" "$work/actions.log"
 test ! -e "$work/power-state/light-locker.running"
 
 # Persisted settings remain authoritative when X11 or light-locker state drifts.
@@ -375,7 +400,7 @@ grep -Fqx 'xset s noblank' "$work/actions.log"
 grep -Fqx 'gsettings set apps.light-locker lock-after-screensaver 0' "$work/actions.log"
 grep -Fqx 'gsettings set apps.light-locker lock-on-suspend false' "$work/actions.log"
 grep -Fqx 'false' "$work/power-state/lock_on_suspend"
-grep -Fqx "pkill -u $test_uid -x light-locker" "$work/actions.log"
+grep -Fqx "pkill -u $test_uid -x light-locker --env DISPLAY=$DISPLAY" "$work/actions.log"
 test ! -e "$work/power-state/light-locker.running"
 
 : >"$work/actions.log"
@@ -394,8 +419,7 @@ grep -Fq 'quickshell --no-duplicate' "$work/actions.log"
 : >"$work/actions.log"
 run_helper action restart-picom >"$work/picom.out"
 grep -Fqx 'action	restart-picom' "$work/picom.out"
-grep -Fq 'pkill -x picom' "$work/actions.log"
-grep -Fqx 'picom ' "$work/actions.log"
+grep -Fqx 'dwm-settings-picom restart' "$work/actions.log"
 
 : >"$work/actions.log"
 run_helper action open-wallpapers >"$work/wallpapers.out"
@@ -407,7 +431,10 @@ run_helper action gtk-settings >"$work/gtk-settings.out"
 grep -Fqx 'action	gtk-settings' "$work/gtk-settings.out"
 grep -Fqx 'nwg-look ' "$work/actions.log"
 rm -f "$work/bin/nwg-look"
-if run_helper action gtk-settings 2>"$work/gtk-settings.err"; then
+mkdir -p "$work/no-nwg-look-bin"
+ln -s "$(command -v dirname)" "$work/no-nwg-look-bin/dirname"
+if DWM_TEST_PATH="$work/no-nwg-look-bin" \
+	run_helper action gtk-settings 2>"$work/gtk-settings.err"; then
 	exit 1
 fi
 grep -Fqx 'nwg-look is unavailable' "$work/gtk-settings.err"
@@ -439,9 +466,49 @@ if run_helper action not-real 2>"$work/action.err"; then
 fi
 grep -Fqx 'unknown action: not-real' "$work/action.err"
 
+# Self-Heal passes an executable path as one argv value, including punctuation.
+self_heal_script="$work/self heal 'quoted';.sh"
+cat >"$self_heal_script" <<'SH'
+#!/bin/sh
+printf 'self-heal invoked\n'
+exit "${DWM_TEST_SELF_HEAL_STATUS:-0}"
+SH
+chmod +x "$self_heal_script"
+cp "$work/bin/dwm-terminal" "$work/bin/dwm-terminal.saved"
+cat >"$work/bin/dwm-terminal" <<'SH'
+#!/bin/sh
+if [ "$1" = --print-command ]; then
+	exit "${DWM_TEST_TERMINAL_STATUS:-0}"
+fi
+[ "$1" = -e ] || exit 2
+shift
+exec "$@"
+SH
+chmod +x "$work/bin/dwm-terminal"
+printf '%s\n' "$self_heal_script" >"$work/config/dwm-titus/self-heal.path"
+printf '\n' | run_helper action self-heal >"$work/self-heal.out"
+grep -Fqx 'self-heal invoked' "$work/self-heal.out"
+grep -Fq 'Self-Heal exited with status 0.' "$work/self-heal.out"
+status=0
+printf '\n' | DWM_TEST_SELF_HEAL_STATUS=7 run_helper action self-heal >"$work/self-heal-fail.out" || status=$?
+[ "$status" -eq 7 ]
+if DWM_SELF_HEAL_SCRIPT="$work/missing" run_helper action self-heal 2>"$work/self-heal-missing.err"; then
+	exit 1
+fi
+grep -Fq 'Self-Heal script is not executable' "$work/self-heal-missing.err"
+if DWM_TEST_TERMINAL_STATUS=127 run_helper action self-heal \
+	>"$work/self-heal-no-terminal.out" 2>"$work/self-heal-no-terminal.err"; then
+	printf 'Self-Heal accepted an unavailable terminal backend\n' >&2
+	exit 1
+fi
+[ ! -s "$work/self-heal-no-terminal.out" ]
+grep -Fq 'Self-Heal requires an available terminal' "$work/self-heal-no-terminal.err"
+rm "$work/config/dwm-titus/self-heal.path"
+mv "$work/bin/dwm-terminal.saved" "$work/bin/dwm-terminal"
+
 grep -Fq 'watchChanges: true' "$repo/config/quickshell/appearance/AppearanceModel.qml"
-[ "$(grep -Fc 'watchChanges: true' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 5 ]
-[ "$(grep -Fc 'onFileChanged: reload()' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 6 ]
+[ "$(grep -Fc 'watchChanges: true' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 6 ]
+[ "$(grep -Fc 'onFileChanged: reload()' "$repo/config/quickshell/appearance/AppearanceModel.qml")" -eq 7 ]
 grep -Fq 'themes.toml' "$repo/config/quickshell/appearance/AppearanceModel.qml"
 grep -Fq 'ClickAwayPopup {' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
 grep -Fq 'onDismissed: controlCenterModel.close()' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
@@ -514,6 +581,22 @@ grep -Fq 'readonly property int cardWidth: Theme.controlCenterWidth' "$repo/conf
 grep -Fq '? Theme.controlCenterX' "$repo/config/quickshell/power/PowerMenuWindow.qml"
 grep -Fq 'property bool navigates: false' "$repo/config/quickshell/core/MenuRow.qml"
 grep -Fq 'MenuHeader {' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
+grep -Fq 'readonly property int compactRowHeight: Math.max(28, Theme.fontBodySize + 12)' \
+	"$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
+grep -Fq 'margin: Theme.spacingLg' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
+if grep -Fq 'SectionLabel {' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"; then
+	printf 'Control Center still renders redundant overview section headers\n' >&2
+	exit 1
+fi
+if grep -Fq 'text: root.powerModel.dpmsEnabled' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml" ||
+	grep -Fq 'text: root.powerModel.lockEnabled' "$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"; then
+	printf 'Control Center still renders duplicate power status labels\n' >&2
+	exit 1
+fi
+grep -Fq '? root.formatDuration(root.powerModel.dpmsTimeout) : "Off"' \
+	"$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
+grep -Fq '? root.formatDuration(root.powerModel.lockTimeout) : "Off"' \
+	"$repo/config/quickshell/controlcenter/ControlCenterWindow.qml"
 grep -Fq 'MenuHeader {' "$repo/config/quickshell/power/PowerMenuWindow.qml"
 grep -Fq 'delegate: MenuRow {' "$repo/config/quickshell/power/PowerMenuWindow.qml"
 grep -Fq 'popupHeight: powerCard.implicitHeight' "$repo/config/quickshell/power/PowerMenuWindow.qml"
@@ -548,8 +631,8 @@ grep -Fq 'root.anchorItem.mapToGlobal(edge, 0)' "$repo/config/quickshell/core/Pa
 grep -Fq 'opacity: 1.0' "$repo/config/quickshell/core/PanelPill.qml"
 grep -Fq 'opacity: 1.0' "$repo/config/quickshell/core/ShellSurface.qml"
 grep -Fq 'opacity: 1.0' "$repo/config/quickshell/core/ClickAwayPopup.qml"
-grep -Fq 'RunningAppsArea { state: root.state }' "$repo/config/quickshell/panel/DwmPanel.qml"
-grep -Fq 'onFocusRequested: windowId => root.state.focusWindow(windowId)' "$repo/config/quickshell/panel/RunningAppsArea.qml"
+grep -Fq 'RunningAppsArea { desktopState: root.state }' "$repo/config/quickshell/panel/DwmPanel.qml"
+grep -Fq 'onFocusRequested: windowId => root.desktopState.focusWindow(windowId)' "$repo/config/quickshell/panel/RunningAppsArea.qml"
 grep -Fq 'source: Icons.launcherIcon(root.app.appClass)' "$repo/config/quickshell/panel/RunningAppItem.qml"
 grep -Fq 'root.state.activeWindowTitle' "$repo/config/quickshell/panel/DwmPanel.qml"
 grep -Fq 'root.state.statusSegments' "$repo/config/quickshell/panel/DwmPanel.qml"

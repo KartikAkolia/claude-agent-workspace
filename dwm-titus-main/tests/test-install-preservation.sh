@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture verifies files, never the developer's live desktop services.
+export DISPLAY='' DBUS_SESSION_BUS_ADDRESS=''
+export DWM_APPEARANCE_TRANSACTIONAL=1
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -49,17 +53,12 @@ run_as_owner() {
 
 grep -Fq 'Start LightDM now (optional): sudo systemctl start lightdm.service' \
 	"$REPO_DIR/install.sh"
-grep -Fq "sudo make install-system \\" "$REPO_DIR/install.sh"
-grep -Fq "make install-user \\" "$REPO_DIR/install.sh"
-if grep -Fq "sudo make install \\" "$REPO_DIR/install.sh"; then
-	printf 'Installer still runs the user installation stage as root.\n' >&2
-	exit 1
-fi
-grep -Fq "runuser -u \"\$\$target_user\" -- env -u DBUS_SESSION_BUS_ADDRESS \\" \
-	"$REPO_DIR/Makefile"
-grep -Fq "HOME=\"\${USER_HOME}\" XDG_RUNTIME_DIR=\"/run/user/\$\$target_uid\" \\" \
-	"$REPO_DIR/Makefile"
-grep -Fq "\$(MAKE) install-user " "$REPO_DIR/Makefile"
+grep -Fq 'sudo make install ' "$REPO_DIR/install.sh"
+# shellcheck disable=SC2016
+grep -Fq 'runuser -u "$$target_user" -- env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR' "$REPO_DIR/Makefile"
+# shellcheck disable=SC2016
+grep -Fq 'set -- "XDG_RUNTIME_DIR=$$runtime_dir"' "$REPO_DIR/Makefile"
+grep -Fq "\$(MAKE) install-user-files " "$REPO_DIR/Makefile"
 grep -Fq 'dwm.desktop not found (run '\''./install.sh'\'')' \
 	"$REPO_DIR/scripts/check-deps.sh"
 grep -Fq 'Run: make && sudo make install-system && make install-user' \
@@ -136,7 +135,9 @@ fi
 mkdir -p "$TEST_REPO"
 tar -C "$REPO_DIR" \
 	--exclude='./.git' \
-	--exclude='./docs/book' \
+	--exclude='./docs/.astro' \
+	--exclude='./docs/dist' \
+	--exclude='./docs/node_modules' \
 	--exclude='./release' \
 	--exclude='./dwm' \
 	--exclude='./*.o' \
@@ -217,7 +218,8 @@ mkdir -p \
 printf '%s\n' '/* local config marker */' >"$TEST_REPO/config.h"
 printf '%s\n' '# existing xinitrc marker' >"$TEST_HOME/.xinitrc"
 printf '%s\n' '# existing hotkeys marker' >"$XDG_CONFIG_HOME/dwm-titus/hotkeys.toml"
-printf '%s\n' '# existing themes marker' >"$XDG_CONFIG_HOME/dwm-titus/themes.toml"
+cp "$TEST_REPO/config/themes.toml" "$XDG_CONFIG_HOME/dwm-titus/themes.toml"
+printf '%s\n' '# existing themes marker' >>"$XDG_CONFIG_HOME/dwm-titus/themes.toml"
 printf '%s\n' '# existing rules marker' >"$XDG_CONFIG_HOME/dwm-titus/window-rules.toml"
 printf '%s\n' '# existing picom marker' >"$XDG_CONFIG_HOME/picom/picom.conf"
 printf '%s\n' '<!-- existing Thunar actions marker -->' >"$XDG_CONFIG_HOME/Thunar/uca.xml"
@@ -234,7 +236,7 @@ cat >"$XDG_CONFIG_DIRS/autostart/light-locker.desktop" <<'EOF'
 Type=Application
 Name=Vendor screen locker
 Exec=light-locker --lock-after-screensaver=5
-OnlyShowIn=MATE;XFCE;
+OnlyShowIn=MATE;X-DWM;XFCE;dwm;
 AutostartCondition=GSettings org.mate.lockdown disable-lock-screen
 EOF
 cat >"$XDG_CONFIG_DIRS/autostart/polkit-mate-authentication-agent-1.desktop" <<'EOF'
@@ -242,7 +244,6 @@ cat >"$XDG_CONFIG_DIRS/autostart/polkit-mate-authentication-agent-1.desktop" <<'
 Type=Application
 Name=Vendor PolicyKit agent
 Exec=/usr/libexec/polkit-mate-authentication-agent-1
-OnlyShowIn=MATE;
 NotShowIn=GNOME;KDE;
 X-MATE-Autostart-Phase=Initialization
 EOF
@@ -307,6 +308,10 @@ for _ in 1 2; do
 		XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
 		XDG_CONFIG_DIRS="$XDG_CONFIG_DIRS" \
 		XDG_DATA_HOME="$XDG_DATA_HOME"
+	[[ $(stat -c %a "$XDG_DATA_HOME/dwm-titus/scripts/image/check-packagekit.py") == "$(stat -c %a "$TEST_REPO/scripts/image/check-packagekit.py")" ]] || {
+		printf 'Managed source file modes changed during installation.\n' >&2
+		exit 1
+	}
 done
 
 assert_preserved config-h "$TEST_REPO/config.h" "$WORK_DIR/config-h.before"
@@ -352,11 +357,17 @@ grep -Fqx 'Exec=light-locker --lock-after-screensaver=5' "$LOCKER_OVERRIDE"
 grep -Fqx 'OnlyShowIn=MATE;XFCE;' "$LOCKER_OVERRIDE"
 grep -Fqx 'AutostartCondition=GSettings org.mate.lockdown disable-lock-screen' \
 	"$LOCKER_OVERRIDE"
-grep -Fqx 'NotShowIn=X-DWM;' "$LOCKER_OVERRIDE"
+if grep -q '^NotShowIn=' "$LOCKER_OVERRIDE"; then
+	printf 'OnlyShowIn override must not also contain NotShowIn.\n' >&2
+	exit 1
+fi
 
 POLKIT_OVERRIDE="$XDG_CONFIG_HOME/autostart/polkit-mate-authentication-agent-1.desktop"
 grep -Fqx 'Exec=/usr/libexec/polkit-mate-authentication-agent-1' "$POLKIT_OVERRIDE"
-grep -Fqx 'OnlyShowIn=MATE;' "$POLKIT_OVERRIDE"
+if grep -q '^OnlyShowIn=' "$POLKIT_OVERRIDE"; then
+	printf 'NotShowIn override must not also contain OnlyShowIn.\n' >&2
+	exit 1
+fi
 grep -Fqx 'X-MATE-Autostart-Phase=Initialization' "$POLKIT_OVERRIDE"
 grep -Fqx 'NotShowIn=GNOME;KDE;X-DWM;' "$POLKIT_OVERRIDE"
 test "$(grep -o 'X-DWM;' "$POLKIT_OVERRIDE" | wc -l)" -eq 1
@@ -408,5 +419,26 @@ if find "$EMPTY_CONFIG_HOME/autostart" -type f -print -quit | grep -q .; then
 	exit 1
 fi
 test "$(stat -c %U "$EMPTY_CONFIG_HOME/autostart")" = "$OWNER"
+
+cat >"$EMPTY_CONFIG_DIRS/autostart/light-locker.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=DWM-only fixture
+Exec=light-locker
+OnlyShowIn=X-DWM;dwm;
+EOF
+cat >"$EMPTY_CONFIG_DIRS/autostart/polkit-mate-authentication-agent-1.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Invalid fixture
+Exec=polkit-mate-authentication-agent-1
+OnlyShowIn=MATE;
+NotShowIn=GNOME;
+EOF
+HOME="$TEST_HOME" XDG_CONFIG_HOME="$EMPTY_CONFIG_HOME" \
+	XDG_CONFIG_DIRS="$EMPTY_CONFIG_DIRS" DWM_INSTALL_OWNER="$OWNER" \
+	"$TEST_REPO/scripts/seed-autostart-overrides.sh"
+grep -Fqx 'OnlyShowIn=' "$EMPTY_CONFIG_HOME/autostart/light-locker.desktop"
+test ! -e "$EMPTY_CONFIG_HOME/autostart/polkit-mate-authentication-agent-1.desktop"
 
 printf 'Repeated install preservation: PASS\n'

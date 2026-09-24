@@ -19,6 +19,14 @@ script_dir=$(cd "${script_path%/*}" && pwd -P) || {
 	printf 'dwm-settings-appearance: executable path could not be resolved\n' >&2
 	exit 1
 }
+if [[ $script_dir == */bin && -x $script_dir/dwm-desktop-update ]]; then
+	data_updater=$script_dir/dwm-desktop-update
+else
+	data_updater=$(command -v dwm-desktop-update || printf '%s' "$script_dir/dwm-desktop-update")
+fi
+if session_data_dirs=$("$data_updater" data-directories 2>/dev/null); then
+	export XDG_DATA_DIRS=$session_data_dirs
+fi
 config_home=${XDG_CONFIG_HOME:-}
 data_home=${XDG_DATA_HOME:-}
 state_home=${XDG_STATE_HOME:-}
@@ -71,7 +79,7 @@ readonly -a required_colors=(
 )
 
 usage() {
-	printf 'usage: %s {snapshot|inventory|watch-inventory|watch-compositor}\n' "$0" >&2
+	printf 'usage: %s {snapshot|inventory|watch-inventory}\n' "$0" >&2
 }
 
 clean_field() {
@@ -669,14 +677,25 @@ inventory_field_safe() {
 		$field != *$'\r'* && $field != *$'\n'* && $field != *"$key_separator"* ]]
 }
 
+personalization_candidate_safe() {
+	local candidate_name=$1
+	inventory_field_safe "$candidate_name" && ((${#candidate_name} <= 255)) &&
+		[[ $candidate_name != follow-theme && $candidate_name != follow-system &&
+			$candidate_name != unknown &&
+			$candidate_name != */* && $candidate_name != *\\* && $candidate_name != *\"* &&
+			$candidate_name != *=* && $candidate_name != *'|'* && $candidate_name != *'&'* &&
+			$candidate_name != . && $candidate_name != .. ]]
+}
+
 start_inventory_stream() {
 	stop_inventory_stream cancel
-	coproc DWM_INVENTORY_STREAM {
+	# Own the read descriptor even if the producer exits before this shell
+	# resumes. Bash can unset a completed named coprocess's PID and fd array.
+	exec {inventory_stream_fd}< <(
 		exec timeout --signal=TERM --kill-after=1 \
-			"$max_inventory_scan_seconds" "$@" 2>/dev/null
-	}
-	inventory_stream_pid=$DWM_INVENTORY_STREAM_PID
-	exec {inventory_stream_fd}<&"${DWM_INVENTORY_STREAM[0]}"
+			"$max_inventory_scan_seconds" "$@" </dev/null 2>/dev/null
+	)
+	inventory_stream_pid=$!
 }
 
 stop_inventory_stream() {
@@ -800,12 +819,35 @@ emit_wallpaper_inventory() {
 	fi
 }
 
+font_candidate_resolved_family() {
+	local candidate=$1 resolved
+	resolved=$(timeout 1 fc-match --format '%{family[0]}\n' \
+		"$candidate:charset=20-7e" 2>/dev/null || true)
+	[[ ${resolved,,} == "${candidate,,}" ]] && {
+		printf '%s' "$resolved"
+		return 0
+	}
+	case ${candidate,,}:${resolved,,} in
+	'meslolgs nerd font mono:meslolgs nerd font' | \
+		'meslolgs nerd font mono:meslolgs nf' | \
+		'meslolgs nerd font:meslolgs nerd font mono' | \
+		'meslolgs nerd font:meslolgs nf' | \
+		'meslolgs nf:meslolgs nerd font mono' | \
+		'meslolgs nf:meslolgs nerd font')
+		printf '%s' "$resolved"
+		return 0
+		;;
+	esac
+	return 1
+}
+
 emit_font_inventory() {
 	local family style candidate current_description current_stem current_family='' requested_style
-	local normalized_requested normalized_style resolved count=0 scan_failed=false
-	local font_validation_deadline
+	local normalized_current normalized_family normalized_requested normalized_style normalized_candidate
+	local saved_font='' count=0 scan_failed=false
+	local font_validation_deadline resolved_family normalized_resolved
 	local -a font_families=()
-	local -A seen=()
+	local -A seen=() seen_normalized=() emitted=() emitted_normalized=()
 	if ! command -v fc-list >/dev/null 2>&1 || ! command -v fc-match >/dev/null 2>&1; then
 		emit_inventory_selection font unavailable '' '' \
 			'Fontconfig inventory tools are unavailable'
@@ -825,16 +867,19 @@ emit_font_inventory() {
 	# every enabled suggestion can be applied without a guaranteed rejection.
 	start_inventory_stream fc-list ':charset=20-7e' --format $'%{family[0]}\t%{style[0]}\n'
 	while IFS=$'\t' read -r -u "$inventory_stream_fd" family style; do
-		if inventory_field_safe "$family" && [[ -z ${seen[$family]+x} ]]; then
+		if personalization_candidate_safe "$family" && [[ -z ${seen[$family]+x} ]]; then
 			seen[$family]=1
+			seen_normalized[${family,,}]=1
 			if ((${#font_families[@]} < max_inventory_candidates)); then
 				font_families+=("$family")
 			fi
 		fi
-		if [[ $current_stem == "$family" ]]; then
+		normalized_current=${current_stem,,}
+		normalized_family=${family,,}
+		if [[ $normalized_current == "$normalized_family" ]]; then
 			((${#family} > ${#current_family})) && current_family=$family
-		elif [[ $current_stem == "$family "* && -n $style ]]; then
-			requested_style=${current_stem#"$family "}
+		elif [[ $normalized_current == "$normalized_family "* && -n $style ]]; then
+			requested_style=${normalized_current#"$normalized_family "}
 			normalized_requested=${requested_style,,}
 			normalized_requested=${normalized_requested//[^[:alnum:]]/}
 			normalized_style=${style,,}
@@ -849,26 +894,45 @@ emit_font_inventory() {
 		scan_failed=true
 	fi
 	if [[ $scan_failed == false ]]; then
+		if [[ -z $current_family && -n $current_stem ]]; then
+			resolved_family=$(font_candidate_resolved_family "$current_stem" 2>/dev/null || true)
+			normalized_resolved=${resolved_family,,}
+			if [[ -n $resolved_family && -n ${seen_normalized[$normalized_resolved]+x} ]]; then
+				current_family=$resolved_family
+			fi
+		fi
+		saved_font=$(personalization_value font 2>/dev/null || true)
+		[[ $saved_font != follow-system ]] || saved_font=
 		font_validation_deadline=$((SECONDS + max_inventory_scan_seconds))
+		# Reserve the effective and saved families before the 24-choice ceiling.
+		# A saved override can differ after an external GSettings change, but it
+		# remains selectable only when the same bounded Fontconfig scan validates it.
+		for candidate in "$current_family" "$saved_font"; do
+			((count < max_font_candidates && SECONDS < font_validation_deadline)) || break
+			[[ -n $candidate ]] || continue
+			resolved_family=$(font_candidate_resolved_family "$candidate" 2>/dev/null || true)
+			normalized_resolved=${resolved_family,,}
+			normalized_candidate=${candidate,,}
+			[[ -n $resolved_family && -n ${seen_normalized[$normalized_resolved]+x} &&
+				-z ${emitted[$candidate]+x} ]] || continue
+			emitted[$candidate]=1
+			emitted_normalized[$normalized_candidate]=1
+			emit_inventory_candidate font available "$candidate" "$candidate" \
+				'Exact Fontconfig family'
+			((count += 1))
+		done
 		for candidate in "${font_families[@]}"; do
 			((count < max_font_candidates && SECONDS < font_validation_deadline)) || break
-			resolved=$(timeout 1 fc-match --format '%{family[0]}\n' \
-				"$candidate:charset=20-7e" 2>/dev/null || true)
-			if [[ $resolved == "$candidate" ]] || {
-				case $candidate:$resolved in
-				'MesloLGS Nerd Font Mono:MesloLGS Nerd Font' | \
-					'MesloLGS Nerd Font Mono:MesloLGS NF' | \
-					'MesloLGS Nerd Font:MesloLGS Nerd Font Mono' | \
-					'MesloLGS Nerd Font:MesloLGS NF' | \
-					'MesloLGS NF:MesloLGS Nerd Font Mono' | \
-					'MesloLGS NF:MesloLGS Nerd Font') true ;;
-				*) false ;;
-				esac
-			} then
-				emit_inventory_candidate font available "$candidate" "$candidate" \
-					'Exact Fontconfig family'
-				((count += 1))
-			fi
+			resolved_family=$(font_candidate_resolved_family "$candidate" 2>/dev/null || true)
+			normalized_resolved=${resolved_family,,}
+			normalized_candidate=${candidate,,}
+			[[ -n $resolved_family && -n ${seen_normalized[$normalized_resolved]+x} &&
+				-z ${emitted_normalized[$normalized_candidate]+x} ]] || continue
+			emitted[$candidate]=1
+			emitted_normalized[$normalized_candidate]=1
+			emit_inventory_candidate font available "$candidate" "$candidate" \
+				'Exact Fontconfig family'
+			((count += 1))
 		done
 	fi
 	if [[ $scan_failed == true ]]; then
@@ -929,8 +993,8 @@ icon_theme_declares_icons() {
 }
 
 emit_directory_inventory() {
-	local capability=$1 selected=$2
-	shift 2
+	local capability=$1 selected=$2 saved=$3
+	shift 3
 	local root path name state detail count=0 limit_reached=false discovery_failed=false
 	local selected_found=false selected_state=unavailable selected_detail
 	local -A seen=()
@@ -961,12 +1025,37 @@ emit_directory_inventory() {
 			((count += 1))
 		done
 	fi
+	if [[ $selected_found == true ]] && personalization_candidate_safe "$selected" &&
+		[[ -z ${seen[$selected]+x} ]]; then
+		seen[$selected]=1
+		emit_inventory_candidate "$capability" "$selected_state" \
+			"$selected" "$selected" "$selected_detail"
+		((count += 1))
+	fi
+	case $saved in
+	'' | follow-system | follow-theme) ;;
+	*)
+		if personalization_candidate_safe "$saved" && [[ -z ${seen[$saved]+x} ]]; then
+			for root in "$@"; do
+				[[ -d $root ]] || continue
+				path=$root/$saved
+				if [[ -d $path ]] && classify_directory_inventory_asset "$capability" "$path"; then
+					seen[$saved]=1
+					emit_inventory_candidate "$capability" "$inventory_directory_state" \
+						"$saved" "$saved" "$inventory_directory_detail"
+					((count += 1))
+					break
+				fi
+			done
+		fi
+		;;
+	esac
 	for root in "$@"; do
 		[[ -d $root ]] || continue
 		start_inventory_stream find -L "$root" -mindepth 1 -maxdepth 1 -type d -print0
 		while IFS= read -r -d '' -u "$inventory_stream_fd" path; do
 			name=${path##*/}
-			if ! inventory_field_safe "$name" || [[ -n ${seen[$name]+x} ]]; then
+			if ! personalization_candidate_safe "$name" || [[ -n ${seen[$name]+x} ]]; then
 				continue
 			fi
 			classify_directory_inventory_asset "$capability" "$path" || continue
@@ -1003,13 +1092,16 @@ emit_directory_inventory() {
 }
 
 emit_cursor_icon_gtk_inventory() {
-	local cursor icon gtk root
+	local cursor icon gtk saved_cursor saved_icon saved_gtk root
 	local -a cursor_roots=() icon_roots=() gtk_roots=()
 	cursor=$(gsettings_value cursor-theme 2>/dev/null || true)
-	[[ -n $cursor ]] || cursor=${XCURSOR_THEME:-}
 	[[ -n $cursor ]] || cursor=$(theme_env_value XCURSOR_THEME 2>/dev/null || true)
+	[[ -n $cursor ]] || cursor=${XCURSOR_THEME:-}
 	icon=$(gsettings_value icon-theme 2>/dev/null || true)
 	gtk=$(gsettings_value gtk-theme 2>/dev/null || true)
+	saved_cursor=$(personalization_value cursor 2>/dev/null || true)
+	saved_icon=$(personalization_value icon 2>/dev/null || true)
+	saved_gtk=$(personalization_value gtk 2>/dev/null || true)
 	while IFS= read -r root; do
 		cursor_roots+=("$root/icons")
 		icon_roots+=("$root/icons")
@@ -1020,9 +1112,9 @@ emit_cursor_icon_gtk_inventory() {
 		icon_roots+=("$HOME/.icons")
 		gtk_roots+=("$HOME/.themes")
 	fi
-	emit_directory_inventory cursor "$cursor" "${cursor_roots[@]}"
-	emit_directory_inventory icon "$icon" "${icon_roots[@]}"
-	emit_directory_inventory gtk "$gtk" "${gtk_roots[@]}"
+	emit_directory_inventory cursor "$cursor" "$saved_cursor" "${cursor_roots[@]}"
+	emit_directory_inventory icon "$icon" "$saved_icon" "${icon_roots[@]}"
+	emit_directory_inventory gtk "$gtk" "$saved_gtk" "${gtk_roots[@]}"
 }
 
 emit_qt_inventory() {
@@ -1071,34 +1163,11 @@ normalize_x11_display() {
 	printf '%s\n' "$display"
 }
 
-picom_running_for_display() {
-	local current_display=${DISPLAY:-} proc_root=${DWM_APPEARANCE_PROC_ROOT:-/proc}
-	local pid environment_entry process_display
-	[[ -n $current_display ]] || return 1
-	current_display=$(normalize_x11_display "$current_display")
-	command -v pgrep >/dev/null 2>&1 || return 1
-	command -v id >/dev/null 2>&1 || return 1
-	command -v tr >/dev/null 2>&1 || return 1
-	while IFS= read -r pid; do
-		[[ $pid =~ ^[1-9][0-9]*$ && -r $proc_root/$pid/environ ]] || continue
-		while IFS= read -r environment_entry; do
-			[[ $environment_entry == DISPLAY=* ]] || continue
-			process_display=$(normalize_x11_display "${environment_entry#DISPLAY=}")
-			[[ $process_display == "$current_display" ]] && return 0
-		done < <(tr '\0' '\n' <"$proc_root/$pid/environ" 2>/dev/null)
-	done < <(pgrep -u "$(id -u)" -x picom 2>/dev/null || true)
-	return 1
-}
-
 emit_compositor_inventory() {
-	if ! command -v picom >/dev/null 2>&1; then
-		emit_inventory_selection compositor unavailable '' missing \
-			'Picom is optional and not installed'
-	elif picom_running_for_display; then
-		emit_inventory_selection compositor available picom running 'Picom is running'
+	if command -v picom >/dev/null 2>&1; then
+		emit_inventory_selection compositor available picom configuration 'Picom controls use its configuration file'
 	else
-		emit_inventory_selection compositor partial picom stopped \
-			'Picom is installed but not running on this display'
+		emit_inventory_selection compositor unavailable '' missing 'Picom is optional and not installed'
 	fi
 }
 
@@ -1389,7 +1458,8 @@ watch_inventory() {
 			event_types=${event%%$'\t'*}
 			event_path=${event#*$'\t'}
 			case $event_path in
-			"$canonical_config_dir"/.font-exchange-a.* | "$canonical_config_dir"/.font-exchange-b.*) continue ;;
+			"$canonical_config_dir"/.font-exchange-a.* | "$canonical_config_dir"/.font-exchange-b.* | \
+				"$canonical_config_dir"/.accessibility-exchange-a.* | "$canonical_config_dir"/.accessibility-exchange-b.*) continue ;;
 			esac
 			if [[ ,$event_types, == *,ATTRIB,* && ,$event_types, == *,ISDIR,* ]]; then
 				canonical_event_path=$(readlink -m -- "$event_path") || canonical_event_path=
@@ -1406,41 +1476,6 @@ watch_inventory() {
 			((status != 0)) || status=1
 			return "$status"
 		fi
-	done
-}
-
-compositor_watch_cleanup() {
-	trap - EXIT HUP INT TERM
-	stop_parent_exit_watch
-	if [[ -n ${compositor_watch_work:-} ]]; then
-		rm -f -- "$compositor_watch_work/wait"
-		rmdir -- "$compositor_watch_work" 2>/dev/null || true
-	fi
-}
-
-watch_compositor() {
-	local state previous='' wait_fd
-	command -v pgrep >/dev/null 2>&1 || {
-		printf 'dwm-settings-appearance: pgrep is required for compositor watching\n' >&2
-		return 1
-	}
-	arm_parent_exit_watch
-	compositor_watch_work=$(mktemp -d "${TMPDIR:-/tmp}/dwm-appearance-compositor.XXXXXX")
-	mkfifo -- "$compositor_watch_work/wait"
-	exec {wait_fd}<>"$compositor_watch_work/wait"
-	trap compositor_watch_cleanup EXIT
-	trap 'exit 143' HUP INT TERM
-	while :; do
-		if picom_running_for_display; then
-			state=running
-		else
-			state=stopped
-		fi
-		if [[ $state != "$previous" ]]; then
-			printf 'compositor\t%s\n' "$state"
-			previous=$state
-		fi
-		read -r -t 1 -u "$wait_fd" _ || true
 	done
 }
 
@@ -1461,9 +1496,18 @@ gtk_theme_available() {
 
 gtk_settings_file_matches() {
 	local file=$1 key=$2 expected=$3
-	awk -F= -v target_key="$key" -v expected="$expected" '
-		/^[[:space:]]*\[/ { in_settings = ($0 == "[Settings]"); next }
-		in_settings && $1 == target_key {
+	awk -v target_key="$key" -v expected="$expected" '
+		/^[[:space:]]*\[/ {
+			header = $0
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
+			in_settings = (header == "[Settings]")
+			next
+		}
+		in_settings {
+			equals = index($0, "=")
+			name = equals ? substr($0, 1, equals - 1) : ""
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+			if (name != target_key) next
 			value = substr($0, index($0, "=") + 1)
 			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
 			found = (value == expected)
@@ -1485,18 +1529,129 @@ gtk_theme_applied() {
 	done
 }
 
+decode_theme_environment_value() {
+	local raw=$1 result='' character index
+	for ((index = 0; index < ${#raw}; index++)); do
+		character=${raw:index:1}
+		if [[ $character == \\ ]]; then
+			((index += 1))
+			((index < ${#raw})) || return 1
+			result+=${raw:index:1}
+		elif [[ $character =~ ^[A-Za-z0-9._+@-]$ ]]; then
+			result+=$character
+		else
+			return 1
+		fi
+	done
+	[[ -n $result ]] || return 1
+	decoded_theme_environment_value=$result
+}
+
+parse_theme_environment() {
+	local env_file=$config_home/dwm-titus/theme-env.sh line value
+	local seen_qt=false seen_cursor=false seen_size=false
+	[[ -f $env_file && ! -L $env_file && -r $env_file &&
+		$(stat -c %u -- "$env_file") == "$UID" &&
+		$(stat -c %h -- "$env_file") == 1 &&
+		$(stat -c %s -- "$env_file") -le 4096 ]] || return 1
+	parsed_theme_qt=
+	parsed_theme_cursor=
+	parsed_theme_cursor_size=
+	while IFS= read -r line || [[ -n $line ]]; do
+		case $line in
+		'# Auto-generated by theme-apply.sh '* | '') ;;
+		'export QT_QPA_PLATFORMTHEME='*)
+			[[ $seen_qt == false ]] || return 1
+			decode_theme_environment_value "${line#*=}" || return 1
+			value=$decoded_theme_environment_value
+			[[ $value == gtk3 || $value == qt5ct || $value == qt6ct ]] || return 1
+			parsed_theme_qt=$value
+			seen_qt=true
+			;;
+		'export XCURSOR_THEME='*)
+			[[ $seen_cursor == false ]] || return 1
+			decode_theme_environment_value "${line#*=}" || return 1
+			value=$decoded_theme_environment_value
+			((${#value} <= 255)) && personalization_value_valid cursor "$value" || return 1
+			parsed_theme_cursor=$value
+			seen_cursor=true
+			;;
+		'export XCURSOR_SIZE='*)
+			[[ $seen_size == false ]] || return 1
+			decode_theme_environment_value "${line#*=}" || return 1
+			value=$decoded_theme_environment_value
+			[[ $value != *[!0-9]* ]] || return 1
+			parsed_theme_cursor_size=$value
+			seen_size=true
+			;;
+		*) return 1 ;;
+		esac
+	done <"$env_file"
+	[[ $seen_qt == true && $seen_cursor == true && $seen_size == true ]]
+}
+
 theme_env_value() {
-	local key=$1 env_file=$config_home/dwm-titus/theme-env.sh
-	[[ -r $env_file ]] || return 1
-	awk -F= -v target="export $key" '
-		$1 == target { print substr($0, index($0, "=") + 1); found = 1; exit }
-		END { exit(found ? 0 : 1) }
-	' "$env_file"
+	local key=$1
+	parse_theme_environment || return 1
+	case $key in
+	QT_QPA_PLATFORMTHEME) printf '%s' "$parsed_theme_qt" ;;
+	XCURSOR_THEME) printf '%s' "$parsed_theme_cursor" ;;
+	XCURSOR_SIZE) printf '%s' "$parsed_theme_cursor_size" ;;
+	*) return 1 ;;
+	esac
+}
+
+personalization_value() {
+	local key=$1 file=$config_home/dwm-titus/personalization.conf value
+	[[ -f $file && ! -L $file && -r $file && $(stat -c %u -- "$file") == "$UID" &&
+	$(stat -c %h -- "$file") == 1 &&
+	$(stat -c %s -- "$file") -le 4096 ]] || return 1
+	value=$(awk -F '\t' -v key="$key" '
+		NR == 1 { if ($0 != "personalization-protocol\t1\t0") bad = 1; next }
+		NF != 2 || $1 !~ /^(font|text-size|cursor|icon|gtk|qt)$/ || seen[$1]++ { bad = 1 }
+		$1 == key { value = $2; found = 1 }
+		END {
+			if (bad || !found) exit 1
+			print value
+		}
+	' "$file") || return 1
+	personalization_value_valid "$key" "$value" || return 1
+	printf '%s\n' "$value"
+}
+
+personalization_value_valid() {
+	local capability=$1 value=$2
+	[[ -n $value && ${#value} -le 255 && $value != *$'\t'* &&
+		$value != *$'\r'* && $value != *$'\n'* ]] || return 1
+	case $capability:$value in
+	cursor:follow-theme | gtk:follow-theme | qt:follow-theme | \
+		font:follow-system | text-size:follow-system | icon:follow-system) return 0 ;;
+	esac
+	[[ $value != follow-theme && $value != follow-system && $value != unknown ]] || return 1
+	case $capability in
+	text-size)
+		case $value in
+		0.75 | 0.875 | 1.0 | 1.125 | 1.25 | 1.5 | 1.75 | 2.0) ;;
+		*) return 1 ;;
+		esac
+		;;
+	qt)
+		case $value in gtk3 | qt6ct | qt5ct) ;; *) return 1 ;; esac
+		;;
+	font | cursor | icon | gtk)
+		[[ $value != */* && $value != *\\* && $value != *\"* &&
+			$value != *=* && $value != *'|'* &&
+			$value != *'&'* && $value != . && $value != .. ]]
+		;;
+	*) return 1 ;;
+	esac
 }
 
 cursor_theme_applied() {
-	local expected=$1 effective=${XCURSOR_THEME:-} version file
-	[[ -n $effective ]] || effective=$(theme_env_value XCURSOR_THEME) || return 1
+	local expected=$1 effective version file
+	effective=$(theme_env_value XCURSOR_THEME 2>/dev/null || true)
+	[[ -n $effective ]] || effective=${XCURSOR_THEME:-}
+	[[ -n $effective ]] || return 1
 	[[ $effective == "$expected" ]] || return 1
 	[[ -f $config_home/dwm-titus/cursor.Xresources ]] || return 1
 	awk -F: -v expected="$expected" '
@@ -1518,8 +1673,15 @@ cursor_theme_applied() {
 asset_available() {
 	local kind=$1 name=$2 root
 	while IFS= read -r root; do
-		[[ -d $root/$kind/$name ]] && return 0
+		if [[ $kind == icons ]]; then
+			[[ -d $root/$kind/$name/cursors ]] && return 0
+		elif [[ -d $root/$kind/$name ]]; then
+			return 0
+		fi
 	done < <(data_roots)
+	if [[ $kind == icons && -d ${HOME:-}/.icons/$name/cursors ]]; then
+		return 0
+	fi
 	if [[ $kind == themes && -d ${HOME:-}/.themes/$name ]]; then
 		return 0
 	fi
@@ -1719,8 +1881,8 @@ terminal_imports_active_theme() {
 }
 
 effective_qt_backend() {
-	qt_backend=${QT_QPA_PLATFORMTHEME:-}
-	[[ -n $qt_backend ]] || qt_backend=$(theme_env_value QT_QPA_PLATFORMTHEME) || qt_backend=
+	qt_backend=$(theme_env_value QT_QPA_PLATFORMTHEME 2>/dev/null || true)
+	[[ -n $qt_backend ]] || qt_backend=${QT_QPA_PLATFORMTHEME:-}
 }
 
 emit_theme_records() {
@@ -1790,18 +1952,84 @@ emit_color_records() {
 }
 
 emit_integrations() {
-	local dark requested_gtk fallback_gtk cursor qt_backend terminal terminal_theme_file
+	local dark requested_gtk fallback_gtk cursor qt_backend terminal terminal_theme_file override
 	[[ -n $resolved_theme ]] || return 0
 
 	dark=${value[$resolved_theme$key_separator'dark_mode']:-true}
 	[[ $dark == true || $dark == false ]] || dark=true
 	requested_gtk=${value[$resolved_theme$key_separator'gtk_theme']:-}
+	if [[ -z $requested_gtk ]] && gtk_theme_available "Dwm-$resolved_theme"; then
+		requested_gtk="Dwm-$resolved_theme"
+	fi
 	if [[ -z $requested_gtk ]]; then
 		if [[ $dark == true ]]; then
-			[[ $resolved_theme == nord ]] && requested_gtk=Nordic || requested_gtk=Adwaita-dark
+			case $resolved_theme in
+			nord)
+				if gtk_theme_available "Nordic"; then
+					requested_gtk=Nordic
+				fi
+				;;
+			dracula)
+				if gtk_theme_available "Dracula"; then
+					requested_gtk=Dracula
+				elif gtk_theme_available "dracula"; then
+					requested_gtk=dracula
+				fi
+				;;
+			gruvbox*)
+				if gtk_theme_available "Gruvbox-Dark"; then
+					requested_gtk=Gruvbox-Dark
+				elif gtk_theme_available "gruvbox-dark"; then
+					requested_gtk=gruvbox-dark
+				fi
+				;;
+			catppuccin*)
+				if gtk_theme_available "Catppuccin-Mocha"; then
+					requested_gtk=Catppuccin-Mocha
+				fi
+				;;
+			tokyonight*)
+				if gtk_theme_available "Tokyonight-Dark"; then
+					requested_gtk=Tokyonight-Dark
+				fi
+				;;
+			esac
+			if [[ -z $requested_gtk ]]; then
+				if gtk_theme_available "adw-gtk3-dark"; then
+					requested_gtk=adw-gtk3-dark
+				elif gtk_theme_available "Adwaita-dark"; then
+					requested_gtk=Adwaita-dark
+				elif gtk_theme_available "Arc-Dark"; then
+					requested_gtk=Arc-Dark
+				else
+					requested_gtk=Adwaita-dark
+				fi
+			fi
 		else
-			requested_gtk=Adwaita
+			case $resolved_theme in
+			gruvbox-light)
+				if gtk_theme_available "Gruvbox-Light"; then
+					requested_gtk=Gruvbox-Light
+				fi
+				;;
+			catppuccin-latte)
+				if gtk_theme_available "Catppuccin-Latte"; then
+					requested_gtk=Catppuccin-Latte
+				fi
+				;;
+			esac
+			if [[ -z $requested_gtk ]]; then
+				if gtk_theme_available "adw-gtk3"; then
+					requested_gtk=adw-gtk3
+				else
+					requested_gtk=Adwaita
+				fi
+			fi
 		fi
+	fi
+	override=$(personalization_value gtk 2>/dev/null || true)
+	if [[ -n $override && $override != follow-theme ]]; then
+		requested_gtk=$override
 	fi
 	if gtk_theme_version_available "$requested_gtk" 3.0 &&
 		gtk_theme_version_available "$requested_gtk" 4.0 &&
@@ -1822,7 +2050,25 @@ emit_integrations() {
 			"$(clean_field "$requested_gtk")"
 		add_error gtk stale-theme "Applied GTK settings do not match '$requested_gtk'"
 	else
-		[[ $dark == true ]] && fallback_gtk=Adwaita-dark || fallback_gtk=Adwaita
+		if gtk_theme_available "Dwm-$resolved_theme"; then
+			fallback_gtk="Dwm-$resolved_theme"
+		elif [[ $dark == true ]]; then
+			if gtk_theme_available "adw-gtk3-dark"; then
+				fallback_gtk=adw-gtk3-dark
+			elif gtk_theme_available "Adwaita-dark"; then
+				fallback_gtk=Adwaita-dark
+			elif gtk_theme_available "Arc-Dark"; then
+				fallback_gtk=Arc-Dark
+			else
+				fallback_gtk=Adwaita-dark
+			fi
+		else
+			if gtk_theme_available "adw-gtk3"; then
+				fallback_gtk=adw-gtk3
+			else
+				fallback_gtk=Adwaita
+			fi
+		fi
 		printf 'integration\tgtk\tpartial\t%s\tRequested GTK theme is missing; apply falls back to %s\n' \
 			"$(clean_field "$requested_gtk")" "$fallback_gtk"
 		add_error gtk missing-theme "GTK theme '$requested_gtk' is not installed"
@@ -1845,6 +2091,10 @@ emit_integrations() {
 	fi
 
 	[[ $dark == true ]] && cursor=Capitaine-Cursors-White || cursor=Capitaine-Cursors
+	override=$(personalization_value cursor 2>/dev/null || true)
+	if [[ -n $override && $override != follow-theme ]]; then
+		cursor=$override
+	fi
 	if asset_available icons "$cursor" && cursor_theme_applied "$cursor"; then
 		printf 'integration\tcursor\tavailable\t%s\tManaged cursor theme is installed and applied\n' "$cursor"
 	elif asset_available icons "$cursor"; then
@@ -1882,8 +2132,7 @@ emit_integrations() {
 	done
 
 	if command -v picom >/dev/null 2>&1; then
-		printf 'integration\tcompositor\tpartial\tpicom\tPicom is available but has no shared theme mutation contract\n'
-		add_error compositor unsupported 'Picom theme mutation is not implemented'
+		printf 'integration\tcompositor\tavailable\tpicom\tGlobal opacity is configured in the Compositor section\n'
 	else
 		printf 'integration\tcompositor\tunavailable\tmissing\tPicom is optional and not installed\n'
 	fi
@@ -1952,13 +2201,7 @@ watch-inventory)
 	}
 	watch_inventory
 	;;
-watch-compositor)
-	[[ $# -eq 1 ]] || {
-		usage
-		exit 2
-	}
-	watch_compositor
-	;;
+
 -h | --help | help)
 	usage
 	;;

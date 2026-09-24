@@ -12,8 +12,32 @@ dwm_packages() {
 			libXinerama-devel libXrender-devel imlib2-devel libxcb-devel \
 			xcb-util-devel freetype-devel fontconfig-devel
 		;;
+	fedora:ci-smoke)
+		dwm_packages "$family" build
+		printf '%s\n' quickshell python3 dbus-daemon util-linux procps-ng \
+			xorg-x11-server-Xvfb xdotool xprop xrandr xset xsettingsd \
+			jq inotify-tools gawk google-noto-sans-fonts
+		;;
+	fedora:image-build)
+		printf '%s\n' xorriso rsync squashfs-tools-ng isomd5sum python3-pillow fontconfig google-noto-sans-fonts
+		;;
+	fedora:image-factory)
+		dwm_packages "$family" image-build
+		printf '%s\n' qemu-system-x86 qemu-img edk2-ovmf libguestfs pykickstart xz zstd time
+		;;
+	fedora:image-boot)
+		printf '%s\n' tar dracut-network grub2-pc grub2-pc-modules grub2-efi-x64 shim-x64 \
+			lvm2 cryptsetup btrfs-progs xfsprogs e2fsprogs mdadm dosfstools
+		;;
+	fedora:image-desktop)
+		# Dedicated image defaults; existing-system installs retain user choices.
+		printf '%s\n' brave-origin
+		;;
+	fedora:media)
+		printf '%s\n' celluloid mpv sxiv python3 desktop-file-utils
+		;;
 	fedora:x11)
-		printf '%s\n' xorg-x11-server-Xorg xorg-x11-xinit xrandr xset xsetroot xinput setxkbmap
+		printf '%s\n' xorg-x11-server-Xorg xorg-x11-xinit xrandr xset xsetroot xinput setxkbmap xkbset
 		;;
 	fedora:runtime-required)
 		printf '%s\n' dbus-x11 curl git procps-ng psmisc unzip util-linux xclip xdotool xprop xdg-utils
@@ -23,10 +47,23 @@ dwm_packages() {
 		# fedora/updates repositories. It is required and belongs in the strict
 		# desktop transaction; the Fedora package-map check proves availability.
 		printf '%s\n' \
-			quickshell picom feh dex-autostart mate-polkit \
+			quickshell picom python3 feh dex-autostart mate-polkit xsettingsd bubblewrap libseccomp \
 			alsa-utils brightnessctl dbus-tools inotify-tools jq pulseaudio-utils pipewire pavucontrol \
 			pipewire-pulseaudio wireplumber libnotify light-locker xorg-x11-drv-libinput \
 			bluez blueman playerctl upower power-profiles-daemon flatpak xdg-desktop-portal-gtk
+		;;
+	fedora:system-management)
+		printf '%s\n' \
+			PackageKit PackageKit-glib python3-gobject python3-rpm accountsservice cups \
+			system-config-printer
+		;;
+	fedora:system-management-optional)
+		printf '%s\n' lxqt-admin dnfdragora
+		;;
+	fedora:source-update)
+		# Dependencies introduced after the initial installation that the supported
+		# source-checkout synchronization path must reconcile for existing systems.
+		printf '%s\n' xsettingsd xkbset bubblewrap libseccomp
 		;;
 	fedora:desktop-optional)
 		printf '%s\n' \
@@ -42,7 +79,7 @@ dwm_packages() {
 		fi
 		;;
 	fedora:theme)
-		printf '%s\n' dconf
+		printf '%s\n' dconf adwaita-icon-theme papirus-icon-theme
 		;;
 	fedora:theme-gtk)
 		printf '%s\n' \
@@ -60,7 +97,7 @@ dwm_packages() {
 		printf '%s\n' qt6-qtdeclarative-devel
 		;;
 	fedora:qml-validation)
-		printf '%s\n' quickshell
+		printf '%s\n' quickshell xsettingsd
 		dwm_packages "$family" qml-development
 		;;
 	fedora:lightdm)
@@ -79,9 +116,11 @@ dwm_packages() {
 		dwm_packages "$family" build
 		dwm_packages "$family" x11
 		dwm_packages "$family" runtime-required
+		dwm_packages "$family" media
 		;;
 	fedora:recommended)
 		dwm_packages "$family" desktop
+		dwm_packages "$family" system-management
 		dwm_packages "$family" screenshot-optional
 		dwm_packages "$family" theme
 		dwm_packages "$family" theme-gtk
@@ -90,6 +129,7 @@ dwm_packages() {
 	fedora:optional)
 		dwm_packages "$family" theme-optional
 		dwm_packages "$family" desktop-optional
+		dwm_packages "$family" system-management-optional
 		;;
 	fedora:full)
 		dwm_packages "$family" required
@@ -102,6 +142,15 @@ dwm_packages() {
 		;;
 	esac
 }
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+	[[ $# == 2 ]] || {
+		printf 'usage: %s FAMILY PROFILE\n' "$0" >&2
+		exit 2
+	}
+	dwm_packages "$1" "$2"
+	exit $?
+fi
 
 dwm_install_package_profile() {
 	local profile=$1

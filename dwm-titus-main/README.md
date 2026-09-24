@@ -1,6 +1,5 @@
 <div align="center">
-  <img src="./dwm-titus.png" alt="dwm-titus logo" width="190" />
-  <h1>dwm-titus</h1>
+  <img alt="dwm-titus logo" src="./branding/anaconda/usr/share/anaconda/pixmaps/ctt-logo.png" />
   <p><strong>A fast, focused Fedora X11 desktop built for keyboard-driven work.</strong></p>
   <p>
     <a href="https://dwm.christitus.com">Documentation</a> |
@@ -28,7 +27,7 @@ existing-system installer on Fedora Linux.
 | --- | --- |
 | **A focused desktop** | Automatic window tiling, nine workspaces, fast keyboard navigation, multi-monitor support, and flexible fullscreen modes. |
 | **Everyday essentials** | A polished panel, application launcher, system tray, Control Center, Settings, notifications, screenshots, audio, brightness, and power controls. |
-| **Easy discovery** | An interactive keybind viewer, guided display setup, built-in diagnostics, and clear unsupported-feature reporting. |
+| **Easy discovery** | An interactive keybind viewer, guided display setup, built-in diagnostics, workstation self-heal, and clear unsupported-feature reporting. |
 | **Personal configuration** | Live-reloading hotkeys, themes, and window rules, with local configuration preserved across upgrades. |
 | **Two installation paths** | A ready-to-install Fedora image or an installer for an existing Fedora system. |
 
@@ -49,17 +48,37 @@ For complete requirements and installation details, see the
 
 ### Fedora ISO
 
-Download the latest image:
+Download the **current offline images** for Fedora 44 x86_64:
 
 | Image | Download |
 | --- | --- |
-| Standard | [`dwm-titus.iso`](https://github.com/ChrisTitusTech/dwm-titus/releases/latest/download/dwm-titus.iso) |
-| NVIDIA | [`dwm-titus-nvidia.iso`](https://github.com/ChrisTitusTech/dwm-titus/releases/latest/download/dwm-titus-nvidia.iso) |
-| Checksums and release notes | [Latest release](https://github.com/ChrisTitusTech/dwm-titus/releases/latest) |
+| Standard | [Standard ISO](https://downloads.christitus.com/iso/dwm-titus.iso) |
+| NVIDIA | [NVIDIA ISO](https://downloads.christitus.com/iso/dwm-titus-nvidia.iso) |
+| Verification | [SHA256SUMS](https://downloads.christitus.com/iso/SHA256SUMS) and [release notes](https://github.com/ChrisTitusTech/dwm-titus/releases/latest) |
 
-Use the NVIDIA image only for systems that need the dedicated NVIDIA
-installation path. Write the selected ISO to a USB drive, boot it, complete the
-Fedora installer, and reboot into the `dwm` session.
+These stable URLs always serve the current builds. The [build manifest](https://downloads.christitus.com/iso/BUILD-MANIFEST.json)
+records the version, sizes and hashes. Download a fresh checksum file with your
+selected ISO; restart partial downloads if the build changes. In that directory, run:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
+Confirm your ISO reports `OK`. Write it as a disk image to an 8 GB or larger USB
+drive, boot it, choose your disk, locale and administrator account in Anaconda,
+then install and reboot into the `dwm` session. Writing the USB erases its contents;
+review Anaconda's disk changes before starting installation.
+
+Packages are already included in the compressed system image. Installation needs
+no Internet connection or software selection. The images include Quickshell,
+Gear Lever, `maim`, region capture and clipboard tools. Internet access is needed
+later for updates and additional software.
+
+See the [installation guide](https://dwm.christitus.com/install.html#fedora-iso-recommended-for-a-new-installation)
+and [current build qualification](https://downloads.christitus.com/iso/BUILD-NOTES.md)
+for tested firmware modes and hardware limits, including NVIDIA and Secure Boot.
+Use the Cloudflare links above for the current offline installation images.
+For building images, see [compressed-image builds](docs/COMPRESSED-IMAGES.md).
 
 ### Existing System
 
@@ -80,7 +99,7 @@ before making changes.
 | Profile | Includes |
 | --- | --- |
 | `core` | The X11 session, required dependencies, and one terminal emulator. |
-| `recommended` | The complete everyday desktop, including Alacritty, Quickshell, Gear Lever for AppImages, theming, screenshots, audio, and brightness tools. |
+| `recommended` | The complete everyday desktop, including Alacritty, Quickshell, Gear Lever for AppImages, theming, screenshots, audio, brightness, and the PackageKit, Python RPM binding, AccountsService, CUPS, and printer-tool prerequisites for Phase 6 system management. |
 | `full` | The recommended desktop plus optional file-manager, keyring, wallpaper, display-manager, and supported Fedora gaming integrations. |
 
 `maim` is an optional dependency used only by the screenshot hotkeys. If it is
@@ -133,9 +152,44 @@ display with a reversible preview. Persistent generation selects compatible
 TearFree or NVIDIA Full Composition Pipeline behavior automatically; pass
 `--force-full-composition-pipeline off` to disable the NVIDIA default.
 The adjacent `dwm-settings-input` provider uses `xinput`, `setxkbmap` for
-keyboard settings, and `udevadm` for stable device identity and hotplug events.
-Kept values are stored in `input-settings.conf` in the same XDG directory;
-`DWM_INPUT_SETTINGS_FILE` can select another file.
+keyboard settings, `xkbset` for session-wide AccessX controls, and `udevadm`
+for stable device identity and hotplug events. Kept values are stored in
+`input-settings.conf` in the same XDG directory; `DWM_INPUT_SETTINGS_FILE` can
+select another file.
+
+The compositor settings in **Settings -> Appearance -> Compositor** and the CLI
+helper `dwm-settings-picom` manage window opacity and rendering backends. Sliders
+adjust active and inactive window opacity with live persistence in the active configuration
+(resolved from `DWM_PICOM_CONFIG`, a running Picom `--config` argument, or standard
+fallback paths `~/.config/picom.conf` and `~/.config/picom/picom.conf`). The automatic
+backend policy selects GLX for accelerated Intel/AMD graphics and falls back to XRender
+on NVIDIA or software rendering, with manual GLX, XRender, and EGL overrides available.
+Edits preserve custom comments and includes with up to ten automatic recovery backups.
+All 15 shipped presets include offline `Dwm-<preset>` application themes,
+including `Dwm-dracula`, for Thunar and other native GTK 2/3/4 applications.
+The system install places their files under `${DATADIR}/themes` (normally
+`/usr/share/themes` with the supported installer); source updates install and
+verify them too.
+Qt applications using qt5ct or qt6ct receive the matching installed palette,
+also listed in those tools from `${DATADIR}/qt5ct/colors` and
+`${DATADIR}/qt6ct/colors`;
+Alacritty and Kitty continue to receive the active terminal colors. Restart
+Qt applications if they do not reload their platform theme dynamically.
+These are dwm-titus palette adaptations of GTK's built-in widgets, not the
+upstream third-party theme packages. Libadwaita and sandboxed applications may
+follow only the light/dark preference rather than the custom palette.
+
+Existing explicit `gtk_theme` values and Appearance personalization overrides
+are preserved. Remove an explicit GTK theme setting to follow the bundled
+preset automatically, or select a `Dwm-` theme in Appearance. The existing explicit `Nordic` selection remains supported; `Dwm-nord` is
+also available offline. Existing installations need the supported source
+installer once (`./install.sh --profile recommended`) to add the new system
+file paths before subsequent updates can use Settings.
+Maintainers regenerate assets with `python3 scripts/generate-app-themes.py`
+after changing the shipped palettes.
+
+Cursor theme changes in Settings take effect immediately across running X11
+applications via `dwm-cursor-reload`.
 
 See the [Configuration Guide](https://dwm.christitus.com/configuration.html)
 and [Theming Guide](https://dwm.christitus.com/theming.html) for examples and
@@ -159,11 +213,38 @@ apply dwm patches to install and use the desktop.
 
 ## Troubleshooting
 
+**Settings -> System** separates read-only **Reload status** from confirmed
+metadata refresh and package installation. Review all package changes, including
+dependency additions and removals, before confirming. PackageKit owns
+authorization and cancellation; closing Settings does not cancel an operation.
+If discovery or recovery is incomplete, reload status and follow its guidance.
+
+The same section provides confirmed account, password, printer, and software-source
+tool launches. Missing tools or stale provider status disable only the affected
+entry. Account and repository inventories remain read-only. A successful launch
+does not mean administration inside the tool completed; authorize and confirm
+those changes in the tool itself. Enter passwords only in the terminal prompt.
+
+For timezone or system locale, **Load choices**, filter and select a reported
+value, then **Review change**. Network time offers fixed enable/disable previews.
+Review the complete preview before **Apply change**: a sent regional change
+cannot be canceled. Cancel only dismisses the preview, and closing Settings does
+not undo an action. An uncertain result requires fresh status and new confirmation,
+not automatic retry. Locale changes apply to new sessions; log out manually when
+ready. Synchronization status is labeled as the last read.
+The panel and System Settings share one minute-level local clock. A newly
+reported timezone refreshes both displays without restarting Quickshell.
+
 Start with the built-in diagnostic report:
 
 ```bash
 dwm-diagnostics
 ```
+
+You can also run **Control Center -> Quick Actions -> Self-Heal** to execute a
+configured workstation repair script (`dwm-self-heal` on `$PATH` or referenced in
+`${XDG_CONFIG_HOME:-$HOME/.config}/dwm-titus/self-heal.path`) inside an interactive
+terminal with visible output and authorization prompts.
 
 You can also open **Control Center -> System Health** for a graphical overview.
 If the session does not start, run `startx` from a TTY to see its error output.

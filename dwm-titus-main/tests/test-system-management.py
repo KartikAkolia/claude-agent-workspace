@@ -1,0 +1,13905 @@
+#!/usr/bin/python3
+"""Contract tests for the Phase 6 system-management snapshot."""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import hashlib
+import io
+import json
+import importlib.util
+import importlib.machinery
+import os
+import pathlib
+import pty
+import select
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+from dataclasses import replace
+from unittest import mock
+
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+PROVIDER_PATH = REPO / "scripts" / "dwm-system-management"
+sys.dont_write_bytecode = True
+SPEC = importlib.util.spec_from_loader(
+    "dwm_system_management",
+    importlib.machinery.SourceFileLoader("dwm_system_management", str(PROVIDER_PATH)),
+)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError("cannot load dwm-system-management")
+provider = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = provider
+SPEC.loader.exec_module(provider)
+
+
+class ComposedFixtureSnapshotTests(unittest.TestCase):
+    def test_original_snapshot_modes_survive_each_fixture_wrapper(self):
+        for name in ("system-native-discovery-provider.py", "system-regional-settings-provider.py",
+                     "system-delegate-confirmation-provider.py"):
+            for mode in ("snapshot-core", "snapshot-without-storage", "snapshot"):
+                with self.subTest(fixture=name, mode=mode), tempfile.TemporaryDirectory() as directory:
+                    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+                        DWM_NATIVE_DISCOVERY_FIXTURE=directory, DWM_NATIVE_ACTION_FIXTURE=directory,
+                        DWM_NATIVE_ACTION="timezone-set", DWM_NATIVE_ACTION_SCENARIO="success")
+                    result = subprocess.run([sys.executable, str(REPO / "tests" / "fixtures" / name), mode],
+                        env=environment, capture_output=True, text=True, timeout=3, check=True)
+                    records = [line.split("\t") for line in result.stdout.splitlines()]
+                    self.assertEqual(records[0], ["system-management-protocol", "1",
+                        "1" if mode == "snapshot-core" else "2"])
+                    self.assertEqual(records[-1], ["complete", "snapshot"])
+                    storage = [row for row in records if row[:2] == ["provider", "storage"]]
+                    filesystems = [row for row in records if row[0] == "filesystem"]
+                    if mode == "snapshot-core":
+                        self.assertEqual(storage, [])
+                        self.assertEqual(filesystems, [])
+                        self.assertFalse(any(row[:2] == ["action", "health-open"] for row in records))
+                    elif mode == "snapshot-without-storage":
+                        self.assertEqual(storage[0][2], "partial")
+                        self.assertEqual(filesystems, [])
+                        summary = next(row for row in records if row[:2] == ["state", "filesystem-summary"])
+                        self.assertEqual(summary[2:4], ["partial", "unknown"])
+                    else:
+                        self.assertEqual(storage[0][2], "available")
+                        self.assertEqual(len(filesystems), 1)
+
+
+class InformationSnapshotTests(unittest.TestCase):
+    def sources(self):
+        source = mock.Mock(spec=provider.InformationSnapshotSources)
+        source.local.return_value = {identifier: provider.InformationState("available", "1", "Local")
+            for identifier in provider.INFORMATION_LOCAL_IDS}
+        source.hardware.return_value = {identifier: provider.InformationState("available", "Hardware", "Host")
+            for identifier in provider.HARDWARE_INFORMATION_FIELDS.values()}
+        source.security.side_effect = lambda identifier: provider.InformationState("available",
+            {"selinux": "enforcing", "root-encryption": "encrypted"}.get(identifier, "enabled"), "Security")
+        source.filesystems.return_value = provider.FilesystemInformation(
+            provider.information_number(1, "Filesystems"), (provider.FilesystemRow(
+                "12", "available", "/dev/test", "/", "ext4", "18446744073709551615", "2", "3", "Bytes"),))
+        return source
+
+    def test_complete_records_and_exact_counters_without_admission(self):
+        with mock.patch.object(provider, "open_journal_directory", side_effect=AssertionError("Journal opened")):
+            result = provider.build_information_snapshot(self.sources())
+        self.assertEqual(len(rows(result, "provider")), 4)
+        self.assertEqual(len(rows(result, "state")), 19)
+        self.assertEqual([row[1] for row in rows(result, "action")], ["health-open"])
+        self.assertEqual(rows(result, "filesystem")[0][6], "18446744073709551615")
+        self.assertTrue(all(row[2] == "available" for row in rows(result, "provider")))
+        self.assertFalse(rows(result, "system-management-protocol"))
+
+    def test_source_failures_preserve_other_states_and_navigation(self):
+        source = self.sources()
+        source.hardware.side_effect = provider.SnapshotFailure("timeout", "Hardware timed out", "unavailable")
+        source.security.side_effect = lambda identifier: (provider.InformationState("restricted", "unknown", "Denied", "permission-denied")
+            if identifier == "selinux" else provider.InformationState("available", "enabled", "Security"))
+        result = provider.build_information_snapshot(source)
+        states = {row[1]: row for row in rows(result, "state")}
+        self.assertEqual(states["hardware-model"][2:4], ["unavailable", "unknown"])
+        self.assertEqual(states["os-name"][2], "available")
+        self.assertEqual(states["selinux"][2:4], ["restricted", "unknown"])
+        self.assertEqual(states["firewalld"][2], "available")
+        self.assertEqual(rows(result, "action")[0][2], "available")
+        self.assertEqual(len([row for row in rows(result, "error") if row[1] == "information"]), 1)
+
+    def test_interruption_stops_all_following_sources(self):
+        for reader in ("local", "hardware", "security", "filesystems"):
+            with self.subTest(reader=reader):
+                source = self.sources()
+                getattr(source, reader).side_effect = InterruptedError("Canceled")
+                with self.assertRaises(InterruptedError):
+                    provider.build_information_snapshot(source)
+                if reader in ("local", "hardware", "security"):
+                    source.filesystems.assert_not_called()
+                if reader in ("local", "hardware"):
+                    source.security.assert_not_called()
+
+    def test_real_parser_overflow_discards_complete_inventory(self):
+        source = self.sources()
+        data = json.dumps({"filesystems": [{"id": index, "source": "/dev/test", "target": "/mnt/test",
+            "fstype": "ext4", "size": 10, "used": 2, "avail": 8} for index in range(257)]}).encode()
+        source.filesystems.side_effect = lambda: provider.parse_filesystem_information(data)
+        result = provider.build_information_snapshot(source)
+        self.assertEqual(rows(result, "filesystem"), [])
+        self.assertTrue(any(row[1:3] == ["storage", "malformed"] for row in rows(result, "error")))
+        self.assertEqual(len(rows(result, "state")), 19)
+
+    def test_missing_state_is_explicit_and_owner_scoped(self):
+        source = self.sources()
+        del source.local.return_value["cpu-model"]
+        result = provider.build_information_snapshot(source)
+        state = next(row for row in rows(result, "state") if row[1] == "cpu-model")
+        self.assertEqual(state[2:4], ["partial", "unknown"])
+        self.assertEqual(len(rows(result, "state")), 19)
+
+    def test_unmonitored_storage_mode_does_not_start_the_filesystem_reader(self):
+        source = provider.InformationSnapshotSources(storage_ready=False)
+        with mock.patch.object(provider, "read_filesystem_information", side_effect=AssertionError("Unmonitored read")) as read:
+            value = source.filesystems()
+        read.assert_not_called()
+        self.assertEqual((value.summary.status, value.summary.value, value.rows), ("partial", "unknown", ()))
+
+    def test_fixed_snapshot_modes_reject_extra_arguments_before_backend_reads(self):
+        with mock.patch.object(provider, "PackageKitBackend") as backend, contextlib.redirect_stderr(io.StringIO()):
+            for command in ("snapshot", "snapshot-core", "snapshot-without-storage"):
+                self.assertEqual(provider.main([command, "arbitrary"]), 2)
+        backend.assert_not_called()
+
+    def test_partial_filesystem_subset_retains_unknown_summary(self):
+        source = self.sources()
+        source.filesystems.return_value = replace(source.filesystems.return_value,
+            summary=provider.InformationState("partial", "unknown", "Incomplete", "malformed"))
+        result = provider.build_information_snapshot(source)
+        self.assertEqual(len(rows(result, "filesystem")), 1)
+        self.assertIn("state\tfilesystem-summary\tpartial\tunknown\tIncomplete", result)
+
+    def test_invalid_filesystem_list_is_discarded_atomically(self):
+        for kind in ("duplicate", "records", "bytes"):
+            with self.subTest(kind=kind):
+                source = self.sources()
+                row = source.filesystems.return_value.rows[0]
+                if kind == "duplicate":
+                    inventory = (row, row)
+                else:
+                    inventory = tuple(replace(row, mount_id=str(index),
+                        source="a" * 512, target="b" * 512, fstype="c" * 512, detail="d" * 512)
+                        for index in range(257 if kind == "records" else 256))
+                source.filesystems.return_value = replace(source.filesystems.return_value, rows=inventory)
+                result = provider.build_information_snapshot(source)
+                self.assertEqual(rows(result, "filesystem"), [])
+                self.assertTrue(any(row[1:4] == ["filesystem-summary", "partial", "unknown"] for row in rows(result, "state")))
+                self.assertTrue(any(row[1:3] == ["storage", "malformed"] for row in rows(result, "error")))
+                self.assertEqual(len(rows(result, "state")), 19)
+
+    def test_all_unavailable_statuses_aggregate_without_hiding_peers(self):
+        for status in ("restricted", "unsupported", "unavailable", "partial"):
+            with self.subTest(status=status):
+                source = self.sources()
+                source.security.side_effect = lambda _identifier: provider.InformationState(status, "unknown", "Absent", "missing-provider")
+                result = provider.build_information_snapshot(source)
+                providers = {row[1]: row for row in rows(result, "provider")}
+                self.assertEqual(providers["security"][2], status)
+                self.assertEqual(providers["information"][2], "available")
+                self.assertEqual(providers["diagnostics"][2], "available")
+
+
+class FixtureBackend:
+    def __init__(
+        self,
+        *,
+        refresh_age=42,
+        updates=(),
+        restart_types=(),
+        plan=(),
+        refresh_failure=None,
+        updates_failure=None,
+        plan_failure=None,
+    ):
+        self.refresh_age = refresh_age
+        self.update_records = tuple(updates)
+        self.restart_types = tuple(restart_types)
+        self.plan_records = tuple(plan)
+        self.refresh_failure = refresh_failure
+        self.updates_failure = updates_failure
+        self.plan_failure = plan_failure
+        self.simulated_ids = None
+
+    def last_refresh_age(self):
+        if self.refresh_failure:
+            raise self.refresh_failure
+        return self.refresh_age
+
+    def updates(self):
+        if self.updates_failure:
+            raise self.updates_failure
+        return provider.TransactionResult(self.update_records, self.restart_types)
+
+    def simulate(self, package_ids):
+        self.simulated_ids = tuple(package_ids)
+        if self.plan_failure:
+            raise self.plan_failure
+        return provider.TransactionResult(self.plan_records)
+
+
+def package(info, package_id, summary):
+    return provider.Package(info, package_id, summary)
+
+
+def rows(lines, kind):
+    return [line.split("\t") for line in lines if line.startswith(f"{kind}\t")]
+
+
+class LocalInformationTests(unittest.TestCase):
+    FILES = {
+        "/etc/os-release": b'NAME=ignored\nPRETTY_NAME="Fedora Linux 44 (Fixture)"\nVERSION_ID=44\n',
+        "/proc/cpuinfo": b"processor: 0\nmodel name\t: Fixture CPU\nmodel name: Later CPU\n",
+        "/proc/meminfo": b"MemTotal: 1024 kB\nMemAvailable: 768 kB\nSwapTotal: 256 kB\nSwapFree: 128 kB\n",
+    }
+
+    def read(self, files=None, *, identity=None, count=4, uptime=10.99):
+        """Exercise the fixed reader without files, services, subprocesses, or journals."""
+        contents = dict(self.FILES)
+        contents.update(files or {})
+        streams, reads, opened = [], [], []
+
+        class Source(io.BytesIO):
+            def read(self, size=-1):
+                reads.append(size)
+                return super().read(size)
+
+        def open_source(path, mode):
+            self.assertEqual(mode, "rb")
+            self.assertIn(path, self.FILES)
+            opened.append(path)
+            value = contents[path]
+            if isinstance(value, Exception):
+                raise value
+            stream = Source(value)
+            streams.append(stream)
+            return stream
+
+        identity = identity if identity is not None else types.SimpleNamespace(release="6.fixture", machine="x86_64")
+        def response(value):
+            return {"side_effect": value} if isinstance(value, Exception) else {"return_value": value}
+
+        output = io.StringIO()
+        with mock.patch.object(provider, "open", open_source, create=True), \
+                mock.patch.object(provider.os, "uname", **response(identity)), \
+                mock.patch.object(provider.os, "cpu_count", **response(count)), \
+                mock.patch.object(provider.time, "clock_gettime", **response(uptime)) as clock, \
+                mock.patch.object(provider.subprocess, "Popen", side_effect=AssertionError("Unexpected subprocess")), \
+                mock.patch.object(provider.os, "system", side_effect=AssertionError("Unexpected shell")), \
+                mock.patch.object(provider.ServiceRead, "run", side_effect=AssertionError("Unexpected service read")), \
+                mock.patch.object(provider, "open_journal_directory", side_effect=AssertionError("Unexpected journal")), \
+                contextlib.redirect_stdout(output):
+            result = provider.read_local_information()
+            if getattr(provider.time, "CLOCK_BOOTTIME", None) is not None:
+                clock.assert_called_once_with(provider.time.CLOCK_BOOTTIME)
+            else:
+                clock.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertCountEqual(opened, self.FILES)
+        self.assertEqual(len(reads), len(streams))
+        self.assertTrue(all(stream.closed for stream in streams))
+        self.assertTrue(all(size in (65537, 4194305, 1048577) for size in reads))
+        self.assertEqual(len(result), 11)
+        for state in result.values():
+            if state.status != "available":
+                self.assertEqual(state.value, "unknown")
+                self.assertNotEqual(state.error_code, "")
+        return result
+
+    def test_complete_fixed_local_snapshot(self):
+        result = self.read()
+        self.assertTrue(all(state.status == "available" and state.error_code == "" for state in result.values()))
+        expected = {"os-name": "Fedora Linux 44 (Fixture)", "os-version": "44",
+            "kernel-release": "6.fixture", "architecture": "x86_64", "cpu-model": "Fixture CPU",
+            "logical-cpus": "4", "memory-total-bytes": "1048576", "memory-available-bytes": "786432",
+            "swap-total-bytes": "262144", "swap-free-bytes": "131072", "uptime-seconds": "10"}
+        self.assertEqual({key: state.value for key, state in result.items()}, expected)
+
+    def test_file_failures_remain_source_scoped_and_do_not_expose_exception_text(self):
+        for path, identifier in (("/etc/os-release", "os-name"), ("/proc/cpuinfo", "cpu-model"),
+                                 ("/proc/meminfo", "memory-total-bytes")):
+            for number, status, code in ((errno.ENOENT, "unsupported", "missing-provider"),
+                    (errno.ENOTDIR, "unsupported", "missing-provider"),
+                    (errno.EACCES, "restricted", "permission-denied"),
+                    (errno.EPERM, "restricted", "permission-denied"), (errno.EIO, "unavailable", "internal")):
+                with self.subTest(path=path, errno=number):
+                    result = self.read({path: OSError(number, "private source details")})
+                    self.assertEqual((result[identifier].status, result[identifier].error_code), (status, code))
+                    self.assertEqual(result["logical-cpus"].status, "available")
+                    self.assertEqual(result["kernel-release"].status, "available")
+                    self.assertNotIn("private source details", repr(result))
+
+    def test_each_file_is_capped_before_parsing_and_exact_limit_is_accepted(self):
+        for path, limit, identifier in (("/etc/os-release", 65536, "os-name"),
+                ("/proc/cpuinfo", 4194304, "cpu-model"), ("/proc/meminfo", 1048576, "memory-total-bytes")):
+            with self.subTest(path=path):
+                data = self.FILES[path] + b"#" * (limit - len(self.FILES[path]))
+                self.assertEqual(self.read({path: data})[identifier].status, "available")
+                result = self.read({path: data + b"x"})
+                self.assertEqual(result[identifier].error_code, "malformed")
+                self.assertEqual(result["uptime-seconds"].status, "available")
+
+    def test_os_keys_are_allowlisted_and_quoted_values_are_never_evaluated(self):
+        result = self.read({"/etc/os-release": b"PRETTY_NAME='$(false) literal'\nVERSION_ID=44\nTOKEN=do-not-disclose\nOTHER='unclosed\nUNRELATED=\xff\n"})
+        self.assertEqual(result["os-name"].value, "$(false) literal")
+        self.assertEqual(result["os-version"].value, "44")
+        self.assertNotIn("do-not-disclose", repr(result))
+
+    def test_malformed_os_field_does_not_hide_the_other_key(self):
+        for field in (b'PRETTY_NAME="unclosed', b"PRETTY_NAME=two words", b"PRETTY_NAME=",
+                      b"PRETTY_NAME", b"PRETTY_NAME=one\nPRETTY_NAME=two\nPRETTY_NAME=three"):
+            with self.subTest(field=field):
+                result = self.read({"/etc/os-release": field + b"\nVERSION_ID=44\n"})
+                self.assertEqual(result["os-name"].status, "partial")
+                self.assertEqual(result["os-version"].value, "44")
+
+    def test_missing_fields_and_invalid_utf8_are_scoped(self):
+        result = self.read({"/etc/os-release": b"", "/proc/cpuinfo": b"", "/proc/meminfo": b""})
+        self.assertEqual(sum(state.status == "available" for state in result.values()), 4)
+        for path, identifier, target in (("/etc/os-release", "os-name", b"Fedora Linux 44 (Fixture)"),
+                ("/proc/cpuinfo", "cpu-model", b"Fixture CPU"), ("/proc/meminfo", "memory-total-bytes", b"1024 kB")):
+            result = self.read({path: self.FILES[path].replace(target, b"\xff")})
+            self.assertEqual(result[identifier].error_code, "malformed")
+            self.assertEqual(result["architecture"].status, "available")
+            self.assertEqual(result["os-version"].value, "44")
+            self.assertEqual(result["memory-available-bytes"].value, "786432")
+
+    def test_first_cpu_model_and_utf8_field_bound(self):
+        for name, status in (("", "partial"), ("\x00CPU", "partial"), ("e" * 512, "available"),
+                             ("e" * 513, "partial"), ("\u00e9" * 256, "available"), ("\u00e9" * 257, "partial")):
+            with self.subTest(length=len(name), status=status):
+                result = self.read({"/proc/cpuinfo": ("model name: " + name + "\nmodel name: valid later\n").encode()})
+                self.assertEqual(result["cpu-model"].status, status)
+        result = self.read({"/proc/cpuinfo": b"model name: First\nmodel name: \xff\n"})
+        self.assertEqual(result["cpu-model"].value, "First")
+
+    def test_memory_units_numbers_duplicates_and_unknown_keys(self):
+        for value in ("1 KB", "1 MB", "-1 kB", "+1 kB", "1.5 kB", "1e3 kB", "\u0661 kB", "1 kB extra", "9" * 1000 + " kB"):
+            with self.subTest(value=value[:30]):
+                data = self.FILES["/proc/meminfo"].replace(b"768 kB", value.encode())
+                result = self.read({"/proc/meminfo": data})
+                self.assertEqual(result["memory-available-bytes"].status, "partial")
+                self.assertEqual(result["memory-total-bytes"].value, "1048576")
+        data = self.FILES["/proc/meminfo"] + b"MemAvailable: 1 kB\nMemAvailable: 2 kB\nUnknown: invalid\n"
+        self.assertEqual(self.read({"/proc/meminfo": data})["memory-available-bytes"].error_code, "malformed")
+
+    def test_memory_conversion_overflow_boundary_and_canonical_zeroes(self):
+        maximum = provider.INFORMATION_UINT_MAX // 1024
+        for value, expected in ((str(maximum), str(maximum * 1024)), (str(maximum + 1), "unknown"),
+                                ("00000000000000000001", "1024"), ("0", "0")):
+            result = self.read({"/proc/meminfo": self.FILES["/proc/meminfo"].replace(b"768 kB", (value + " kB").encode())})
+            self.assertEqual(result["memory-available-bytes"].value, expected)
+
+    def test_uname_failure_and_fields_are_independent(self):
+        result = self.read(identity=OSError(errno.EIO, "private uname detail"))
+        self.assertEqual(result["kernel-release"].status, "unavailable")
+        self.assertEqual(result["architecture"].status, "unavailable")
+        self.assertEqual(result["os-name"].status, "available")
+        result = self.read(identity=types.SimpleNamespace(release="bad\nrelease", machine="x86_64"))
+        self.assertEqual(result["kernel-release"].status, "partial")
+        self.assertEqual(result["architecture"].value, "x86_64")
+
+    def test_logical_processor_count_is_checked_without_hiding_other_cpu_data(self):
+        for value in (None, True, False, 0, -1, 1.5, "4", 1 << 64):
+            with self.subTest(value=value):
+                result = self.read(count=value)
+                self.assertEqual(result["logical-cpus"].status, "partial")
+                self.assertEqual(result["cpu-model"].status, "available")
+
+    def test_uptime_is_checked_floored_and_uses_only_boottime(self):
+        for value in (float("nan"), float("inf"), -float("inf"), -0.1, True, "10", 1 << 64, 1 << 10000):
+            result = self.read(uptime=value)
+            self.assertEqual(result["uptime-seconds"].status, "partial")
+            self.assertEqual(result["memory-total-bytes"].status, "available")
+        for value, expected in ((0, "0"), (0.99, "0"), (12.99, "12")):
+            self.assertEqual(self.read(uptime=value)["uptime-seconds"].value, expected)
+        with mock.patch.object(provider.time, "CLOCK_BOOTTIME", None):
+            self.assertEqual(self.read()["uptime-seconds"].status, "unsupported")
+        self.assertEqual(self.read(uptime=OSError(errno.EIO, "clock unavailable"))["uptime-seconds"].status, "unavailable")
+
+
+class LocalSecurityTests(unittest.TestCase):
+    runtime_path = "/sys/fs/selinux/enforce"
+    config_path = "/etc/selinux/config"
+    variable_path = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+    def read(self, kind, *, runtime=b"1", config=b"SELINUX=disabled\n", variable=b"\x07\x00\x00\x00\x01", efi=None):
+        contents = {self.runtime_path: runtime, self.config_path: config, self.variable_path: variable}
+        limits = {self.runtime_path: 2, self.config_path: 65537, self.variable_path: 6}
+        opened, streams = [], []
+        class Source(io.BytesIO):
+            def read(inner, size=-1):
+                self.assertEqual(size, limits[inner.path])
+                return super().read(size)
+        def source(path, mode):
+            self.assertEqual(mode, "rb")
+            self.assertIn(path, contents)
+            opened.append(path)
+            value = contents[path]
+            if isinstance(value, Exception):
+                raise value
+            stream = Source(value)
+            stream.path = path
+            streams.append(stream)
+            return stream
+        efi = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755) if efi is None else efi
+        stat_options = {"side_effect": efi} if isinstance(efi, Exception) else {"return_value": efi}
+        with mock.patch.object(provider, "open", source, create=True), \
+                mock.patch.object(provider.os, "stat", **stat_options) as source_stat, \
+                mock.patch.object(provider.os, "listdir", side_effect=AssertionError("Unexpected enumeration")), \
+                mock.patch.object(provider.os, "scandir", side_effect=AssertionError("Unexpected enumeration")), \
+                mock.patch.object(provider.subprocess, "Popen", side_effect=AssertionError("Unexpected subprocess")), \
+                mock.patch.object(provider, "open_journal_directory", side_effect=AssertionError("Unexpected journal")):
+            result = provider.read_selinux_status() if kind == "selinux" else provider.read_secure_boot_status()
+        self.assertTrue(all(stream.closed for stream in streams))
+        self.assertEqual(len(opened), len(set(opened)))
+        if kind == "selinux":
+            source_stat.assert_not_called()
+        else:
+            source_stat.assert_called_once_with("/sys/firmware/efi/efivars")
+        if result.status != "available":
+            self.assertEqual(result.value, "unknown")
+            self.assertNotEqual(result.error_code, "")
+        self.assertNotIn("private detail", repr(result))
+        return result, opened
+
+    def absent(self):
+        return OSError(errno.ENOENT, "private detail")
+
+    def test_selinux_runtime_is_authoritative_and_config_is_not_read(self):
+        for data, value in ((b"1", "enforcing"), (b"0", "permissive")):
+            result, opened = self.read("selinux", runtime=data, config=AssertionError("Unused config"))
+            self.assertEqual((result.status, result.value), ("available", value))
+            self.assertEqual(opened, [self.runtime_path])
+
+    def test_malformed_or_denied_runtime_never_falls_back_to_disabled(self):
+        for data in (b"", b"1\n", b"2", b"\x01", b"1" * 100):
+            result, opened = self.read("selinux", runtime=data)
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(opened, [self.runtime_path])
+        for number, status in ((errno.EACCES, "restricted"), (errno.EPERM, "restricted"), (errno.EIO, "unavailable")):
+            result, opened = self.read("selinux", runtime=OSError(number, "private detail"))
+            self.assertEqual(result.status, status)
+            self.assertEqual(opened, [self.runtime_path])
+
+    def test_only_disabled_config_can_establish_state_without_runtime(self):
+        for text in (b"SELINUX=disabled", b' SELINUX = "disabled" # comment\nOTHER=\xff\n'):
+            result, opened = self.read("selinux", runtime=self.absent(), config=text)
+            self.assertEqual((result.status, result.value), ("available", "disabled"))
+            self.assertEqual(opened, [self.runtime_path, self.config_path])
+        for text in (b"SELINUX=enforcing", b"SELINUX=permissive", b"SELINUX=DISABLED", b"SELINUX=",
+                     b"SELINUX='unclosed", b"SELINUX=$(false)", b"SELINUX=\xff", b"SELINUX",
+                     b"SELINUX=disabled\nSELINUX=disabled\nSELINUX=disabled"):
+            result, _opened = self.read("selinux", runtime=self.absent(), config=text)
+            self.assertEqual(result.status, "partial")
+
+    def test_missing_config_or_key_is_unsupported_but_denial_is_restricted(self):
+        for config in (self.absent(), b"", b"# SELINUX=disabled\nUNRELATED=value"):
+            result, _opened = self.read("selinux", runtime=self.absent(), config=config)
+            self.assertEqual(result.status, "unsupported")
+        result, _opened = self.read("selinux", runtime=self.absent(), config=PermissionError(errno.EACCES, "private detail"))
+        self.assertEqual(result.status, "restricted")
+
+    def test_selinux_config_byte_limit_precedes_parsing(self):
+        base = b"SELINUX=disabled\n"
+        exact = base + b"#" * (65536 - len(base))
+        self.assertEqual(self.read("selinux", runtime=self.absent(), config=exact)[0].value, "disabled")
+        self.assertEqual(self.read("selinux", runtime=self.absent(), config=exact + b"x")[0].status, "partial")
+
+    def test_secure_boot_exact_binary_payload_and_attributes_prefix(self):
+        for value, state in ((0, "disabled"), (1, "enabled")):
+            result, opened = self.read("secure-boot", variable=b"\xff" * 4 + bytes([value]))
+            self.assertEqual((result.status, result.value), ("available", state))
+            self.assertEqual(opened, [self.variable_path])
+        for data in (b"", b"\x00" * 4, b"\x00" * 6, b"\x00" * 4 + b"1", b"\x00" * 4 + b"\x02"):
+            self.assertEqual(self.read("secure-boot", variable=data)[0].status, "partial")
+
+    def test_secure_boot_platform_absence_and_variable_absence_are_distinct(self):
+        result, opened = self.read("secure-boot", efi=self.absent())
+        self.assertEqual(result.status, "unsupported")
+        self.assertEqual(opened, [])
+        result, opened = self.read("secure-boot", variable=self.absent())
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(opened, [self.variable_path])
+        result, opened = self.read("secure-boot", efi=types.SimpleNamespace(st_mode=stat.S_IFREG))
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(opened, [])
+
+    def test_secure_boot_denial_and_io_failure_never_mean_disabled(self):
+        for source in ("efi", "variable"):
+            for number, status in ((errno.EACCES, "restricted"), (errno.EPERM, "restricted"), (errno.EIO, "unavailable")):
+                result, _opened = self.read("secure-boot", **{source: OSError(number, "private detail")})
+                self.assertEqual(result.status, status)
+
+    def test_source_selector_is_closed_before_open(self):
+        for kind in ("other", "/etc/passwd", [], None):
+            with mock.patch.object(provider, "open", create=True) as source, \
+                    self.assertRaises(provider.SnapshotFailure):
+                provider.read_security_bytes(kind)
+            source.assert_not_called()
+
+
+class FirewalldReadTests(unittest.TestCase):
+    def collect(self, state=None, *, remote=None, mode="normal"):
+        _unused, connection, gio, glib, variant = RegionalReadTests().reader()
+        read = provider.FirewalldRead(gio, glib)
+        gio.dbus_error_get_remote_error.return_value = remote
+        def run():
+            if mode == "connect-timeout":
+                read.expire()
+            read.connected(None, object(), None)
+            if mode == "timeout":
+                read.expire()
+            if remote:
+                connection.call_finish.side_effect = variant.Error("private detail")
+            else:
+                connection.call_finish.return_value = (variant.Variant("(s)", ("bad",)) if mode == "malformed"
+                    else CupsReadTests().reply(variant, state, **{"0": "firewalld.service"}))
+            if mode == "decode-timeout":
+                decode = provider.decode_unit_state
+                def delayed(reply):
+                    read.deadline = time.monotonic() - 1
+                    return decode(reply)
+                with mock.patch.object(provider, "decode_unit_state", side_effect=delayed):
+                    read.replied(connection, object(), None)
+            else:
+                read.replied(connection, object(), None)
+        read.loop.run.side_effect = run
+        with mock.patch.object(provider, "FirewalldRead", return_value=read), \
+                mock.patch.object(provider, "open_journal_directory") as journal:
+            result = provider.read_firewalld_status()
+        journal.assert_not_called()
+        connection.close_sync.assert_not_called()
+        self.assertTrue(read.cancellable.cancel.called)
+        self.assertNotIn("private detail", repr(result))
+        return result, read, connection, gio, glib
+
+    def test_fixed_unit_query_and_known_states(self):
+        for active, value in (("active", "enabled"), ("inactive", "disabled")):
+            result, _read, connection, gio, glib = self.collect(CupsReadTests().state(active=active))
+            self.assertEqual((result.status, result.value), ("available", value))
+            self.assertIn("other firewall", result.detail)
+            connection.call.assert_called_once()
+            args = connection.call.call_args.args
+            self.assertEqual(args[:4], (provider.SYSTEMD_NAME, provider.SYSTEMD_PATH, provider.SYSTEMD_MANAGER, "ListUnitsByNames"))
+            self.assertEqual(args[4].unpack(), (["firewalld.service"],))
+            self.assertEqual(args[6], gio.DBusCallFlags.NO_AUTO_START)
+            self.assertTrue(0 < args[7] <= 10000)
+            glib.source_remove.assert_called_once_with(17)
+
+    def test_absent_failed_transitional_and_malformed_states(self):
+        for active in ("failed", "activating", "deactivating", "reloading", "unknown"):
+            result, *_rest = self.collect(CupsReadTests().state(active=active))
+            self.assertEqual((result.status, result.value), ("partial", "unknown"))
+        result, *_rest = self.collect(CupsReadTests().state(load="not-found"))
+        self.assertEqual((result.status, result.value), ("unsupported", "unknown"))
+        for state in (CupsReadTests().state(load="not-found", active="active"), CupsReadTests().state(active="bad\nstate")):
+            self.assertEqual(self.collect(state)[0].error_code, "malformed")
+        self.assertEqual(self.collect(mode="malformed")[0].status, "partial")
+
+    def test_service_failures_and_late_replies_are_scoped(self):
+        for remote, status, code in (("org.freedesktop.systemd1.NoSuchUnit", "unsupported", "missing-provider"),
+                ("org.freedesktop.DBus.Error.AccessDenied", "unavailable", "permission-denied"),
+                ("org.freedesktop.DBus.Error.ServiceUnknown", "unavailable", "missing-provider")):
+            result, *_rest = self.collect(remote=remote)
+            self.assertEqual((result.status, result.value, result.error_code), (status, "unknown", code))
+        for mode in ("timeout", "connect-timeout"):
+            result, read, connection, _gio, _glib = self.collect(mode=mode)
+            self.assertEqual((result.status, result.error_code), ("unavailable", "timeout"))
+            connection.call_finish.reset_mock()
+            read.replied(connection, object(), None)
+            connection.call_finish.assert_not_called()
+            if mode == "connect-timeout":
+                connection.call.assert_not_called()
+
+    def test_missing_bindings_and_interruption(self):
+        with mock.patch.object(provider, "FirewalldRead", side_effect=provider.SnapshotFailure(
+                "missing-provider", "Bindings unavailable", "unavailable")):
+            self.assertEqual(provider.read_firewalld_status().status, "unavailable")
+        with mock.patch.object(provider, "FirewalldRead"), \
+                mock.patch.object(provider, "run_interruptible_read", side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                provider.read_firewalld_status()
+
+    def test_decode_deadline_and_completed_callback_cannot_publish_late_state(self):
+        self.assertEqual(self.collect(mode="decode-timeout")[0].error_code, "timeout")
+        _result, read, connection, _gio, _glib = self.collect()
+        connection.call_finish.reset_mock()
+        read.replied(connection, object(), None)
+        connection.call_finish.assert_not_called()
+
+    def test_actual_private_bus_state_deadline_and_shared_connection(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-firewalld-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Private-bus firewalld reads: PASS (fixed query, states, failures, deadline, late reply, shared bus)\n")
+
+
+class FilesystemInformationTests(unittest.TestCase):
+    def row(self, identifier=7, **changes):
+        return dict({"id": identifier, "source": "/dev/fixture", "target": "/", "fstype": "ext4",
+            "size": 1048576, "used": 1024, "avail": 1047552}, **changes)
+
+    def parse(self, rows):
+        return provider.parse_filesystem_information(provider.json.dumps({"filesystems": rows}).encode())
+
+    def test_complete_nested_inventory_is_keyed_and_sorted_by_mount_id(self):
+        result = self.parse([self.row(10, children=[self.row(2)])])
+        self.assertEqual((result.summary.status, result.summary.value), ("available", "2"))
+        self.assertEqual([row.mount_id for row in result.rows], ["2", "10"])
+        self.assertTrue(all(row.status == "available" and row.size_bytes == "1048576" for row in result.rows))
+        self.assertEqual(self.parse([]).summary.value, "0")
+
+    def test_display_sanitization_does_not_merge_distinct_mounts(self):
+        result = self.parse([self.row(1, target="/a\nb", source="/dev/\tfixture"),
+            self.row(2, target="/a b", fstype="x" * 600)])
+        self.assertEqual(result.summary.value, "2")
+        self.assertEqual([row.target for row in result.rows], ["/a b", "/a b"])
+        self.assertEqual(result.rows[0].source, "/dev/ fixture")
+        self.assertEqual(len(result.rows[1].fstype), 512)
+        result = self.parse([self.row(source="\u00e9" * 300)])
+        self.assertEqual(len(result.rows[0].source.encode()), 512)
+
+    def test_bad_rows_and_nested_shape_preserve_valid_peers(self):
+        for bad in (None, [], self.row(id="7"), self.row(id=True), self.row(id=-1),
+                    self.row(source=None), self.row(target=""), self.row(fstype="\ud800")):
+            result = self.parse([bad, self.row(8)])
+            self.assertEqual((result.summary.status, result.summary.value), ("partial", "unknown"))
+            self.assertEqual([row.mount_id for row in result.rows], ["8"])
+        result = self.parse([self.row(children="wrong")])
+        self.assertEqual(result.summary.status, "partial")
+        self.assertEqual(len(result.rows), 1)
+
+    def test_counters_remain_exact_and_failed_values_are_unknown(self):
+        for value in (None, True, False, -1, 1.0, "1", 1 << 64):
+            result = self.parse([self.row(size=value)])
+            self.assertEqual(result.summary.status, "partial")
+            row = result.rows[0]
+            self.assertEqual((row.status, row.size_bytes, row.used_bytes), ("partial", "unknown", "1024"))
+        result = self.parse([self.row(size=(1 << 64) - 1, used=0, avail=0)])
+        self.assertEqual(result.rows[0].size_bytes, str((1 << 64) - 1))
+        self.assertEqual(result.summary.status, "available")
+        result = self.parse([self.row(size=None, used=None, avail=None)])
+        self.assertEqual((result.rows[0].size_bytes, result.rows[0].used_bytes, result.rows[0].available_bytes),
+                         ("unknown", "unknown", "unknown"))
+
+    def test_duplicate_mount_ids_are_removed_even_after_record_limit(self):
+        result = self.parse([self.row(1), self.row(1), self.row(1), self.row(2)])
+        self.assertEqual([row.mount_id for row in result.rows], ["2"])
+        self.assertEqual(result.summary.status, "partial")
+        result = self.parse([self.row(index) for index in range(256)])
+        self.assertEqual((result.summary.status, result.summary.value), ("available", "256"))
+        with self.assertRaisesRegex(provider.SnapshotFailure, "record limit"):
+            self.parse([self.row(index) for index in range(257)] + [self.row(0)])
+
+    def test_invalid_json_shape_duplicate_keys_numbers_and_utf8(self):
+        for data in (b"", b"[]", b"{}", b'{"filesystems":null}', b'{"filesystems": [], "filesystems": []}',
+                     b'{"filesystems":[{"id":1,"id":2}]}', b'{"filesystems":[],"extra":NaN}',
+                     b'{"filesystems":[],"extra":Infinity}', b'\xff', b"[" * 2000 + b"]" * 2000):
+            with self.subTest(data=data[:50]), self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.parse_filesystem_information(data)
+            self.assertEqual(caught.exception.code, "malformed")
+
+    def test_parser_byte_limit_is_checked_before_decoding(self):
+        data = b'{"filesystems":[]}'
+        exact = data + b" " * (provider.FILESYSTEM_OUTPUT_BYTES - len(data))
+        self.assertEqual(provider.parse_filesystem_information(exact).summary.value, "0")
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.parse_filesystem_information(exact + b" ")
+
+
+class ScreenLockTests(unittest.TestCase):
+    def record(self, status="available", enabled="yes", running="yes"):
+        return f"power-protocol\t1\t0\npower-lock\t{status}\t{enabled}\t600\t{running}\tuser-session\tAutomatic locking\n".encode()
+
+    def test_status_and_semantics_are_independent(self):
+        for status in ("available", "partial", "restricted", "unavailable"):
+            for enabled in ("yes", "no"):
+                for running in ("yes", "no"):
+                    result = provider.parse_screen_lock(self.record(status, enabled, running))
+                    expected_status = "partial" if status == "available" and enabled == "yes" and running == "no" else status
+                    expected_value = ("enabled" if enabled == "yes" else "disabled") if expected_status == "available" else "unknown"
+                    self.assertEqual((result.status, result.value), (expected_status, expected_value))
+
+    def test_version_missing_duplicate_and_malformed_records_fail_closed(self):
+        valid = self.record()
+        for data in (b"", b"power-protocol\t1\t0\n", valid[:-1], valid + valid,
+                valid.replace(b"\t1\t0", b"\t2\t0"), valid.replace(b"\t1\t0", b"\t1\t-1"),
+                valid.replace(b"\tyes\t", b"\ttrue\t"), valid.replace(b"\t600\t", b"\t86401\t"),
+                valid.replace(b"user-session", b"privileged"), valid.replace(b"available", b"idle"),
+                valid.replace(b"Automatic locking", b""), valid.replace(b"Automatic locking", b"\xff"),
+                valid.replace(b"Automatic locking", b"x" * 513), valid + b"x" * 8192):
+            with self.subTest(data=data[:80]), self.assertRaises(provider.SnapshotFailure):
+                provider.parse_screen_lock(data)
+
+    def test_additive_records_and_fields_are_forward_compatible(self):
+        data = self.record().replace(b"\t1\t0", b"\t1\t2\tfuture").replace(b"Automatic locking\n", b"Automatic locking\tfuture\n")
+        self.assertEqual(provider.parse_screen_lock(data + b"future-record\tvalue\n").value, "enabled")
+
+    @contextlib.contextmanager
+    def process(self, program):
+        popen = subprocess.Popen
+        children = []
+        def launch(command, **options):
+            self.assertEqual(command, ["/usr/bin/timeout", "--signal=TERM", "--kill-after=1", "10",
+                str(REPO / "scripts/dwm-quickshell-controlcenter"), "power-lock-snapshot"])
+            self.assertEqual(options["env"]["DISPLAY"], ":fixture")
+            self.assertEqual(options["env"]["LC_ALL"], "C")
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertTrue(options["start_new_session"])
+            child = popen(["/usr/bin/python3", "-c", program], **options)
+            children.append(child)
+            return child
+        try:
+            with mock.patch.dict(os.environ, {"DISPLAY": ":fixture"}), \
+                    mock.patch.object(provider.subprocess, "Popen", side_effect=launch):
+                yield
+            self.assertTrue(all(child.returncode is not None and child.stdout.closed and child.stderr.closed for child in children))
+        finally:
+            for child in children:
+                if child.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=2)
+
+    def test_fixed_power_helper_preserves_session_and_requires_complete_success(self):
+        for code, value, status in ((0, "enabled", "available"), (1, "unknown", "unavailable"), (124, "unknown", "unavailable")):
+            with self.process(f"import sys; sys.stdout.buffer.write({self.record()!r}); sys.exit({code})"), \
+                    mock.patch.object(provider, "open_journal_directory") as journal:
+                state = provider.read_screen_lock()
+            self.assertEqual((state.value, state.status), (value, status))
+            journal.assert_not_called()
+
+    def test_output_budget_and_missing_helper_are_scoped(self):
+        for stream in ("stdout", "stderr"):
+            with self.process(f"import sys; sys.{stream}.write('x' * 8193)"):
+                state = provider.read_screen_lock()
+            self.assertEqual((state.value, state.error_code), ("unknown", "malformed"))
+        with mock.patch.object(provider.subprocess, "Popen", side_effect=FileNotFoundError()):
+            self.assertEqual(provider.read_screen_lock().error_code, "missing-provider")
+
+    def test_deadline_is_bounded_and_cleans_owned_child(self):
+        started = time.monotonic()
+        with self.process("import os, time; os.close(1); os.close(2); time.sleep(30)"):
+            result = provider.read_screen_lock()
+        self.assertEqual((result.status, result.value, result.error_code), ("unavailable", "unknown", "timeout"))
+        self.assertLess(time.monotonic() - started, 13)
+
+    def test_actual_helper_keeps_interrupted_probes_in_owned_group(self):
+        popen = subprocess.Popen
+        for probe in ("xset", "gsettings"):
+            for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                with self.subTest(probe=probe, signal=number), tempfile.TemporaryDirectory() as directory:
+                    path = pathlib.Path(directory)
+                    pidfile = path / "probe.pid"
+                    sleeper = ("#!/usr/bin/python3\nimport os, pathlib, signal, time\n"
+                        + f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                        + f"os.kill({os.getpid()}, {number})\ntime.sleep(30)\n")
+                    for name in ("xset", "gsettings", "light-locker"):
+                        script = path / name
+                        script.write_text(sleeper if name == probe else
+                            "#!/bin/sh\nprintf 'Screen Saver:\n  timeout: 600 cycle: 600\n'\n")
+                        script.chmod(0o700)
+                    def launch(command, **options):
+                        options["env"] = dict(options["env"], PATH=directory + ":/usr/bin:/bin",
+                            HOME=directory, XDG_CONFIG_HOME=directory, XDG_DATA_HOME=directory)
+                        return popen(command, **options)
+                    try:
+                        with mock.patch.object(provider.subprocess, "Popen", side_effect=launch):
+                            with self.assertRaises(SystemExit) as caught:
+                                provider.read_screen_lock()
+                        self.assertEqual(caught.exception.code, 128 + number)
+                        child = int(pidfile.read_text())
+                        record = pathlib.Path(f"/proc/{child}/stat")
+                        self.assertTrue(not record.exists() or record.read_text().rsplit(") ", 1)[1].split()[0] == "Z",
+                            "Nested power probe survived confirmed reader cleanup")
+                    finally:
+                        if pidfile.exists():
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+    def test_interruption_retains_signal_and_restores_handlers(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous = signal.getsignal(number)
+            with self.process(f"import os, signal, time; os.kill(os.getppid(), {number}); time.sleep(30)"):
+                with self.assertRaises(SystemExit) as caught:
+                    provider.read_screen_lock()
+            self.assertEqual(caught.exception.code, 128 + number)
+            self.assertIs(signal.getsignal(number), previous)
+
+
+class RootEncryptionTests(unittest.TestCase):
+    def node(self, name="disk", **changes):
+        return dict({"name": name, "type": "disk", "fstype": None, "mountpoints": [None], "pkname": None}, **changes)
+
+    def topology(self, encrypted=False):
+        root = self.node("root", type="crypt" if encrypted else "part", fstype="ext4", mountpoints=["/"], pkname="disk")
+        return [self.node(children=[root])]
+
+    def parse(self, rows):
+        return provider.parse_root_encryption(provider.json.dumps({"blockdevices": rows}).encode())
+
+    def assert_unknown(self, rows):
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            self.parse(rows)
+        self.assertEqual((caught.exception.code, caught.exception.status), ("malformed", "partial"))
+
+    def test_plain_and_crypt_root_ancestry(self):
+        for encrypted, value in ((False, "unencrypted"), (True, "encrypted")):
+            result = self.parse(self.topology(encrypted))
+            self.assertEqual((result.status, result.value), ("available", value))
+            self.assertIn("hardware encryption are not assessed", result.detail)
+        rows = self.topology()
+        rows[0]["fstype"] = "crypto_LUKS"
+        self.assertEqual(self.parse(rows).value, "encrypted")
+
+    def test_mapper_parent_kernel_alias_and_lvm_root(self):
+        root = self.node("fedora-root", type="lvm", fstype="btrfs", mountpoints=["/", "/home"], pkname="dm-0")
+        crypt = self.node("luks-volume", type="crypt", pkname="disk", children=[root])
+        self.assertEqual(self.parse([self.node(children=[crypt])]).value, "encrypted")
+        # kpartx mapper partitions also have a PART-prefixed UUID and alias.
+        crypt["type"] = "part"
+        self.assertEqual(self.parse([self.node(fstype="crypto_LUKS", children=[crypt])]).value, "encrypted")
+        # A second child must observe the same kernel identity for this mapper.
+        crypt["children"].append(self.node("fedora-swap", type="lvm", fstype="swap", pkname="dm-1"))
+        self.assert_unknown([self.node(children=[crypt])])
+
+    def test_multiple_backing_paths_all_encrypted_or_mixed(self):
+        def branch(name, encrypted):
+            root = self.node("root", type="raid1", fstype="ext4", mountpoints=["/"], pkname=name)
+            return self.node(name, fstype="crypto_LUKS" if encrypted else None, children=[root])
+        self.assertEqual(self.parse([branch("a", True), branch("b", True)]).value, "encrypted")
+        self.assertEqual(self.parse([branch("a", False), branch("b", False)]).value, "unencrypted")
+        self.assert_unknown([branch("a", True), branch("b", False)])
+
+    def test_encryption_above_mixed_backing_paths_covers_every_path(self):
+        root = self.node("crypt-root", type="crypt", fstype="ext4", mountpoints=["/"], pkname="md0")
+        rows = [self.node(name, fstype=fs, children=[self.node("md0", type="raid1", pkname=name, children=[root])])
+                for name, fs in (("a", None), ("b", "crypto_LUKS"))]
+        self.assertEqual(self.parse(rows).value, "encrypted")
+
+    def test_multiple_root_mounts_must_agree(self):
+        rows = [self.node("a", fstype="ext4", mountpoints=["/"]), self.node("b", fstype="btrfs", mountpoints=["/"])]
+        self.assertEqual(self.parse(rows).value, "unencrypted")
+        rows += self.topology(True)
+        self.assert_unknown(rows)
+
+    def test_missing_root_or_incomplete_root_backing_is_unknown(self):
+        for rows in ([], [self.node()], [self.node(mountpoints=["/"])],
+                     [self.node(fstype="crypto_LUKS", mountpoints=["/"])],
+                     [self.node(fstype="ext4", mountpoints=["/root", "//"])],
+                     [self.node(type="loop", fstype="ext4", mountpoints=["/"])],
+                     [self.node(type="crypt", fstype="ext4", mountpoints=["/"])],
+                     [self.node(type="part", fstype="ext4", mountpoints=["/"], pkname="absent")]):
+            self.assert_unknown(rows)
+        rows = self.topology(True)
+        rows[0]["type"] = "loop"
+        self.assert_unknown(rows)
+        # An unrelated unmounted loop does not invalidate resolved root paths.
+        self.assertEqual(self.parse(self.topology() + [self.node("loop0", type="loop")]).value, "unencrypted")
+
+    def test_bad_parent_identity_and_conflicting_duplicate_metadata(self):
+        rows = self.topology()
+        rows[0]["children"][0]["pkname"] = "wrong"
+        self.assert_unknown(rows)
+        rows[0]["children"][0]["pkname"] = "dm-0"
+        self.assert_unknown(rows)  # Physical disks do not have mapper aliases.
+        for field, value in (("type", "crypt"), ("fstype", "btrfs"), ("mountpoints", ["/home"])):
+            rows = self.topology()
+            rows[0]["children"].append(dict(rows[0]["children"][0], **{field: value}))
+            self.assert_unknown(rows)
+        rows = self.topology()
+        rows[0]["children"].append(dict(rows[0]["children"][0]))
+        self.assertEqual(self.parse(rows).value, "unencrypted")
+
+    def test_cycles_and_ambiguous_kernel_aliases_are_unknown(self):
+        a = self.node("a", type="lvm", pkname="disk")
+        b = self.node("b", type="lvm", pkname="dm-0")
+        a["children"] = [b]
+        b["children"] = [dict(a, pkname="dm-1", children=[])]
+        self.assert_unknown(self.topology() + [self.node(children=[a])])
+        rows = []
+        for name in ("a", "b"):
+            rows.append(self.node(name, type="lvm", children=[self.node(name + "-child", pkname="dm-0")]))
+        self.assert_unknown(self.topology() + rows)
+
+    def test_selected_fields_and_children_are_strict(self):
+        for field, value in (("name", ""), ("name", "bad\nname"), ("name", "\ud800"),
+                ("name", "x" * 513), ("name", "\u00e9" * 257), ("type", None), ("fstype", []),
+                ("mountpoints", None), ("mountpoints", [False]), ("children", None), ("children", [None])):
+            rows = self.topology()
+            rows[0][field] = value
+            self.assert_unknown(rows)
+        for field in ("name", "type", "fstype", "mountpoints", "pkname"):
+            rows = self.topology()
+            del rows[0][field]
+            self.assert_unknown(rows)
+
+    def test_unique_record_cap_includes_repeated_rows_without_dropping_evidence(self):
+        rows = [self.node(str(index)) for index in range(1024)]
+        rows[0].update(fstype="ext4", mountpoints=["/"])
+        self.assertEqual(self.parse(rows + [dict(rows[0])]).value, "unencrypted")
+        self.assert_unknown(rows + [self.node("extra")])
+
+    def test_nested_topology_is_resolved_without_recursive_graph_walk(self):
+        child = self.node("root", type="part", fstype="ext4", mountpoints=["/"], pkname="p0")
+        for index in range(150):
+            child = self.node("p" + str(index), type="part", pkname="p" + str(index + 1), children=[child])
+        child["pkname"] = "disk"
+        self.assertEqual(self.parse([self.node(children=[child])]).value, "unencrypted")
+
+    def test_json_byte_limit_keys_numbers_and_decoding_fail_closed(self):
+        for data in (b"", b"[]", b"{}", b'{"blockdevices":null}', b'{"blockdevices":[],"blockdevices":[]}',
+                b'{"blockdevices":[{"name":"a","name":"b"}]}', b'{"blockdevices":[],"extra":NaN}',
+                b"\xff", b"[" * 2000 + b"]" * 2000):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.parse_root_encryption(data)
+        data = provider.json.dumps({"blockdevices": self.topology()}).encode()
+        exact = data + b" " * (provider.FILESYSTEM_OUTPUT_BYTES - len(data))
+        self.assertEqual(provider.parse_root_encryption(exact).value, "unencrypted")
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.parse_root_encryption(exact + b" ")
+
+
+class FilesystemProcessTests(unittest.TestCase):
+    source_command = ["/usr/bin/findmnt", "--json", "--bytes", "--real", "--uniq", "--output",
+                      "ID,SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL"]
+    source_fixture = "system-filesystem-process.py"
+
+    @contextlib.contextmanager
+    def source(self, mode="success", *arguments, signal_number=None, expect_cleanup=True):
+        popen, processes = subprocess.Popen, []
+        def launch(command, **options):
+            self.assertEqual(command, ["/usr/bin/timeout", "--signal=TERM", "--kill-after=1", "3"] + self.source_command)
+            self.assertEqual(options["env"], {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertTrue(options["start_new_session"])
+            self.assertNotIn("preexec_fn", options)
+            process = popen(command[:4] + ["/usr/bin/python3",
+                str(REPO / "tests/fixtures" / self.source_fixture), mode, *arguments], **options)
+            processes.append(process)
+            if signal_number is not None:
+                signal.raise_signal(signal_number)
+            return process
+        try:
+            with mock.patch.object(provider.subprocess, "Popen", side_effect=launch):
+                yield processes
+            if expect_cleanup:
+                self.assertTrue(all(p.returncode is not None and p.stdout.closed and p.stderr.closed for p in processes))
+        finally:
+            for process in processes:
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+                for stream in (process.stdout, process.stderr):
+                    if stream:
+                        stream.close()
+
+    def test_fixed_fresh_command_and_exact_combined_budget(self):
+        with self.source() as processes, mock.patch.dict(os.environ, {"LC_ALL": "invalid"}), \
+                mock.patch.object(provider, "open_journal_directory") as journal:
+            for _ in range(2):
+                result = provider.read_filesystem_information()
+                self.assertEqual((result.summary.status, result.summary.value), ("available", "1"))
+            self.assertEqual(len(processes), 2)
+            journal.assert_not_called()
+        with self.source("exact-budget"):
+            self.assertEqual(provider.read_filesystem_information().summary.status, "available")
+        with self.source("empty-json"):
+            self.assertEqual(provider.read_filesystem_information().summary.value, "0")
+
+    def test_bad_output_is_scoped_and_never_publishes_rows(self):
+        for mode in ("bad-json", "invalid-utf8", "stdout-overflow", "stderr-overflow", "combined-overflow"):
+            with self.subTest(mode=mode), self.source(mode):
+                result = provider.read_filesystem_information()
+                self.assertEqual((result.summary.status, result.summary.value, result.summary.error_code),
+                                 ("partial", "unknown", "malformed"))
+                self.assertEqual(result.rows, ())
+
+    def test_exit_status_is_required_and_stderr_is_not_disclosed(self):
+        for status, code in ((1, "internal"), (125, "internal"), (126, "internal"),
+                             (127, "missing-provider"), (124, "timeout"), (137, "timeout")):
+            with self.subTest(status=status), self.source("exit", str(status)):
+                result = provider.read_filesystem_information()
+                self.assertEqual((result.summary.status, result.summary.error_code), ("unavailable", code))
+                self.assertEqual(result.rows, ())
+                self.assertNotIn("private diagnostic", repr(result))
+
+    def test_missing_command_and_permission_denial_restore_handlers(self):
+        handlers = {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        for error, status, code in ((FileNotFoundError(), "unavailable", "missing-provider"),
+                (PermissionError(errno.EACCES, "private"), "restricted", "permission-denied")):
+            with mock.patch.object(provider.subprocess, "Popen", side_effect=error):
+                result = provider.read_filesystem_information()
+            self.assertEqual((result.summary.status, result.summary.error_code), (status, code))
+            self.assertEqual(result.rows, ())
+        self.assertEqual(handlers, {n: signal.getsignal(n) for n in handlers})
+
+    def test_wall_clock_changes_do_not_extend_timeout_or_preserve_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = str(pathlib.Path(directory) / "child-pid")
+            started = time.monotonic()
+            with self.source("descendant", pid_file), mock.patch.object(provider.time, "time", side_effect=[9999, -9999]):
+                result = provider.read_filesystem_information()
+            self.assertEqual((result.summary.status, result.summary.error_code), ("unavailable", "timeout"))
+            self.assertLess(time.monotonic() - started, 5.5)
+            LocaleEnumerationTests().assert_process_stopped(int(pathlib.Path(pid_file).read_text()))
+
+    def test_eof_without_exit_still_times_out(self):
+        with self.source("closed-pipes"):
+            self.assertEqual(provider.read_filesystem_information().summary.error_code, "timeout")
+
+    def test_decoding_after_deadline_never_publishes_success_or_malformed(self):
+        monotonic = time.monotonic
+        for malformed in (False, True):
+            offset = [0]
+            def decode(_data):
+                offset[0] = 4
+                if malformed:
+                    raise provider.SnapshotFailure("malformed", "Late failure")
+                return provider.FilesystemInformation(provider.InformationState("available", "0", "Fixture"))
+            with self.source(), mock.patch.object(provider.time, "monotonic", side_effect=lambda: monotonic() + offset[0]), \
+                    mock.patch.object(provider, "parse_filesystem_information", side_effect=decode):
+                result = provider.read_filesystem_information()
+            self.assertEqual(result.summary.error_code, "timeout")
+            self.assertEqual(result.rows, ())
+
+    def test_interruption_cleans_owned_children_before_exit(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous = signal.getsignal(number)
+            with self.source("closed-pipes", signal_number=number):
+                with self.assertRaises(SystemExit) as caught:
+                    provider.read_filesystem_information()
+                self.assertEqual(caught.exception.code, 128 + number)
+            self.assertIs(signal.getsignal(number), previous)
+
+    def test_cleanup_failure_never_publishes_success_or_hides_interruption(self):
+        for number in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            def cleanup(_process):
+                if number is not None:
+                    signal.raise_signal(number)
+                raise provider.SnapshotFailure("timeout", "Private cleanup detail", "unavailable")
+            with self.source(expect_cleanup=False), mock.patch.object(provider, "close_locale_process", side_effect=cleanup):
+                if number is not None:
+                    with self.assertRaises(SystemExit) as caught:
+                        provider.read_filesystem_information()
+                    self.assertEqual(caught.exception.code, 128 + number)
+                else:
+                    result = provider.read_filesystem_information()
+                    self.assertEqual(result.summary.error_code, "timeout")
+                    self.assertEqual(result.rows, ())
+                    self.assertNotIn("Private cleanup detail", repr(result))
+
+    def test_unavailable_child_ownership_prevents_launch(self):
+        with mock.patch.object(provider.signal, "getsignal", return_value=signal.SIG_IGN), \
+                mock.patch.object(provider.subprocess, "Popen") as launch:
+            self.assertEqual(provider.read_filesystem_information().summary.status, "unavailable")
+            launch.assert_not_called()
+        results = []
+        with mock.patch.object(provider.subprocess, "Popen") as launch:
+            thread = threading.Thread(target=lambda: results.append(provider.read_filesystem_information()))
+            thread.start()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results[0].summary.status, "unavailable")
+            launch.assert_not_called()
+
+
+class RootEncryptionProcessTests(unittest.TestCase):
+    source_command = ["/usr/bin/lsblk", "--json", "--output", "NAME,TYPE,FSTYPE,MOUNTPOINTS,PKNAME"]
+    source_fixture = "system-encryption-process.py"
+    source = FilesystemProcessTests.source
+
+    def test_fixed_fresh_command_and_exact_shared_output_budget(self):
+        with self.source() as processes, mock.patch.dict(os.environ, {"LC_ALL": "invalid"}), \
+                mock.patch.object(provider, "open_journal_directory") as journal:
+            for _ in range(2):
+                state = provider.read_root_encryption()
+                self.assertEqual((state.status, state.value), ("available", "unencrypted"))
+            self.assertEqual(len(processes), 2)
+            journal.assert_not_called()
+        with self.source("exact-budget"):
+            self.assertEqual(provider.read_root_encryption().value, "unencrypted")
+
+    def test_bad_missing_and_excess_evidence_never_claims_encryption(self):
+        for mode in ("bad-json", "empty-json", "invalid-utf8", "stdout-overflow", "stderr-overflow", "combined-overflow"):
+            with self.subTest(mode=mode), self.source(mode):
+                state = provider.read_root_encryption()
+                self.assertEqual((state.status, state.value, state.error_code), ("partial", "unknown", "malformed"))
+
+    def test_exit_status_is_required_and_stderr_is_not_disclosed(self):
+        for status, code in ((1, "internal"), (125, "internal"), (126, "internal"),
+                             (127, "missing-provider"), (124, "timeout"), (137, "timeout")):
+            with self.source("exit", str(status)):
+                state = provider.read_root_encryption()
+                self.assertEqual((state.status, state.value, state.error_code), ("unavailable", "unknown", code))
+                self.assertNotIn("private diagnostic", repr(state))
+
+    def test_missing_command_and_read_denial_restore_handlers(self):
+        handlers = {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        for error, status in ((FileNotFoundError(), "unavailable"), (PermissionError(errno.EACCES, "private"), "restricted")):
+            with mock.patch.object(provider.subprocess, "Popen", side_effect=error):
+                state = provider.read_root_encryption()
+            self.assertEqual((state.status, state.value), (status, "unknown"))
+            self.assertNotIn("private", repr(state))
+        self.assertEqual(handlers, {n: signal.getsignal(n) for n in handlers})
+
+    def test_monotonic_deadline_cleans_descendants_and_closed_pipes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = str(pathlib.Path(directory) / "child-pid")
+            started = time.monotonic()
+            with self.source("descendant", pid_file), mock.patch.object(provider.time, "time", side_effect=[9999, -9999]):
+                self.assertEqual(provider.read_root_encryption().error_code, "timeout")
+            self.assertLess(time.monotonic() - started, 5.5)
+            LocaleEnumerationTests().assert_process_stopped(int(pathlib.Path(pid_file).read_text()))
+        with self.source("closed-pipes"):
+            self.assertEqual(provider.read_root_encryption().error_code, "timeout")
+
+    def test_decoding_after_deadline_cannot_publish_a_result(self):
+        monotonic = time.monotonic
+        for malformed in (False, True):
+            offset = [0]
+            def decode(_data):
+                offset[0] = 4
+                if malformed:
+                    raise provider.SnapshotFailure("malformed", "Late failure")
+                return provider.InformationState("available", "encrypted", "Fixture")
+            with self.source(), mock.patch.object(provider.time, "monotonic", side_effect=lambda: monotonic() + offset[0]), \
+                    mock.patch.object(provider, "parse_root_encryption", side_effect=decode):
+                state = provider.read_root_encryption()
+            self.assertEqual((state.value, state.error_code), ("unknown", "timeout"))
+
+    def test_interruption_and_cleanup_failure_never_hide_termination(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous = signal.getsignal(number)
+            with self.source("closed-pipes", signal_number=number):
+                with self.assertRaises(SystemExit) as caught:
+                    provider.read_root_encryption()
+                self.assertEqual(caught.exception.code, 128 + number)
+            self.assertIs(signal.getsignal(number), previous)
+        for number in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            def cleanup(_process):
+                if number is not None:
+                    signal.raise_signal(number)
+                raise provider.SnapshotFailure("timeout", "Private cleanup detail", "unavailable")
+            with self.source(expect_cleanup=False), mock.patch.object(provider, "close_locale_process", side_effect=cleanup):
+                if number is not None:
+                    with self.assertRaises(SystemExit) as caught:
+                        provider.read_root_encryption()
+                    self.assertEqual(caught.exception.code, 128 + number)
+                else:
+                    state = provider.read_root_encryption()
+                    self.assertEqual((state.value, state.error_code), ("unknown", "timeout"))
+                    self.assertNotIn("Private cleanup detail", repr(state))
+
+    def test_closed_source_selector_and_unavailable_ownership_prevent_launch(self):
+        for kind in ("other", "/usr/bin/lsblk", [], None):
+            with mock.patch.object(provider.subprocess, "Popen") as launch, self.assertRaises(provider.SnapshotFailure):
+                provider.read_storage_information(kind)
+            launch.assert_not_called()
+        with mock.patch.object(provider.signal, "getsignal", return_value=signal.SIG_IGN), \
+                mock.patch.object(provider.subprocess, "Popen") as launch:
+            self.assertEqual(provider.read_root_encryption().status, "unavailable")
+            launch.assert_not_called()
+        result = []
+        with mock.patch.object(provider.subprocess, "Popen") as launch:
+            thread = threading.Thread(target=lambda: result.append(provider.read_root_encryption()))
+            thread.start()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result[0].status, "unavailable")
+            launch.assert_not_called()
+
+
+class RegionalPreflightTests(unittest.TestCase):
+    def time_state(self, **changes):
+        return replace(provider.RegionalTimeState("UTC", True, False, True), **changes)
+
+    def test_timezone_preview_requires_membership_and_binds_current_and_target(self):
+        preview = provider.make_regional_preview("timezone-set", "Etc/UTC", self.time_state(), ["UTC", "Etc/UTC"])
+        self.assertEqual(preview.fields()[:3], ("preview", "timezone-set", "Etc/UTC"))
+        self.assertEqual((preview.current, preview.target), ("UTC", "Etc/UTC"))
+        provider.require_regional_generation(preview, preview.generation)
+        for current, target in (("Etc/UTC", "Etc/UTC"), ("UTC", "UTC")):
+            changed = provider.make_regional_preview("timezone-set", target,
+                self.time_state(timezone=current), ["UTC", "Etc/UTC"])
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.require_regional_generation(changed, preview.generation)
+            self.assertEqual(caught.exception.code, "conflict")
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.make_regional_preview("timezone-set", "Etc/UTC", self.time_state(), ["UTC"])
+        same = provider.make_regional_preview("timezone-set", "Etc/UTC",
+            self.time_state(ntp_enabled=True), ["Etc/UTC", "UTC", "Europe/London"])
+        self.assertEqual(same.generation, preview.generation)
+
+    def test_ntp_generation_has_exact_framing_and_ignores_synchronization_samples(self):
+        preview = provider.make_regional_preview("ntp-set", "enabled", self.time_state())
+        framed = b"dwm-titus-regional-preview-v1"
+        for value in (b"ntp-set", b"enabled", b"yes", b"disabled"):
+            framed += len(value).to_bytes(8, "big") + value
+        self.assertEqual(preview.generation, hashlib.sha256(framed).hexdigest())
+        self.assertEqual(provider.make_regional_preview("ntp-set", "enabled",
+            self.time_state(ntp_synchronized=False)).generation, preview.generation)
+        self.assertNotEqual(provider.make_regional_preview("ntp-set", "enabled",
+            self.time_state(ntp_enabled=True)).generation, preview.generation)
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            provider.make_regional_preview("ntp-set", "enabled", self.time_state(can_ntp=False))
+        self.assertEqual(caught.exception.code, "unsupported")
+
+    def test_locale_generation_preserves_key_presence_order_and_complete_overrides(self):
+        assignments = ["LANG=C", "LANGUAGE=de:en", "LC_TIME=de_DE.utf8", "LC_NUMERIC=fr_FR.utf8"]
+        before = provider.parse_locale_configuration(assignments)
+        preview = provider.make_regional_preview("locale-set", "LANG=en_US.utf8", before, ["C", "en_US.utf8"])
+        self.assertEqual((preview.current, preview.target, preview.detail),
+                         ("C", "en_US.utf8", "LANGUAGE=de:en, LC_NUMERIC=fr_FR.utf8, LC_TIME=de_DE.utf8"))
+        reordered = provider.make_regional_preview("locale-set", "LANG=en_US.utf8",
+            provider.parse_locale_configuration(list(reversed(assignments))), ["en_US.utf8", "C"])
+        self.assertEqual(preview, reordered)
+        for changed in ([item for item in assignments if item != "LANGUAGE=de:en"],
+                        [item.replace("LANGUAGE=de:en", "LANGUAGE=en") for item in assignments],
+                        [item.replace("LC_TIME=de_DE.utf8", "LC_TIME=C") for item in assignments]):
+            other = provider.make_regional_preview("locale-set", "LANG=en_US.utf8",
+                provider.parse_locale_configuration(changed), ["C", "en_US.utf8"])
+            self.assertNotEqual(other.generation, preview.generation)
+        forged = replace(before, lang="forged", detail="forged")
+        self.assertEqual(provider.make_regional_preview("locale-set", "LANG=en_US.utf8",
+            forged, ["C", "en_US.utf8"]), preview)
+        absent, empty = [provider.make_regional_preview("locale-set", "LANG=en_US.utf8",
+            provider.parse_locale_configuration(values), ["en_US.utf8"]).generation
+            for values in (["LANG=C"], ["LANG=C", "LC_TIME="])]
+        self.assertNotEqual(absent, empty)
+
+    def test_invalid_selections_and_states_are_rejected_before_io(self):
+        for action, argument in (("timezone-set", "../UTC"), ("ntp-set", "yes"),
+                                 ("locale-set", "LC_TIME=C"), ("locale-set", "LANG=C\n"),
+                                 ("arbitrary", "command")):
+            with mock.patch.object(provider, "RegionalRead") as reader, \
+                    mock.patch.object(provider, "read_locale_choices") as locales:
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.read_regional_preview(action, argument)
+                reader.assert_not_called()
+                locales.assert_not_called()
+        for state in (None, self.time_state(can_ntp=1), self.time_state(timezone="../UTC")):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.make_regional_preview("ntp-set", "enabled", state)
+        for value in (None, "", "A" * 64, "a" * 63, "a" * 65):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.require_regional_generation(
+                    provider.make_regional_preview("ntp-set", "enabled", self.time_state()), value)
+            self.assertEqual(caught.exception.code, "malformed")
+
+    def test_locale_generation_counts_utf8_bytes_in_each_length_prefix(self):
+        preview = provider.make_regional_preview("locale-set", "LANG=en_US.utf8",
+            provider.parse_locale_configuration(["LANGUAGE=français", "LANG=C"]), ["en_US.utf8"])
+        self.assertEqual(preview.generation, "09ff64d6ea53aa4d497cec2d722b95701f913c40576c7024dfdc6377e9b8fd83")
+
+    def test_preflight_uses_only_fresh_fixed_readers(self):
+        states = {"time-state": self.time_state(), "timezone-choices": ("UTC", "Etc/UTC"),
+                  "locale-state": provider.parse_locale_configuration(["LANG=C"])}
+        with mock.patch.object(provider, "RegionalRead", side_effect=lambda kind: mock.Mock(
+                run=mock.Mock(return_value=states[kind]))) as reader, \
+                mock.patch.object(provider, "read_locale_choices", return_value=("C", "en_US.utf8")) as locales, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                mock.patch.object(provider, "open_journal_directory") as journal:
+            for _ in range(2):
+                provider.read_regional_preview("timezone-set", "Etc/UTC")
+                provider.read_regional_preview("ntp-set", "enabled")
+                provider.read_regional_preview("locale-set", "LANG=en_US.utf8")
+            self.assertEqual([call.args[0] for call in reader.call_args_list],
+                ["time-state", "timezone-choices", "time-state", "locale-state"] * 2)
+            self.assertEqual(locales.call_count, 2)
+            backend.assert_not_called()
+            journal.assert_not_called()
+
+    def test_choice_streams_are_sorted_complete_and_independently_versioned(self):
+        for kind in ("timezone", "locale"):
+            with mock.patch.object(provider, "regional_choices", return_value=("UTC", "C")):
+                output, code = provider.regional_preflight_output("regional-choices", [kind])
+            self.assertEqual(code, 0)
+            self.assertEqual(output.splitlines(), [f"regional-choices-protocol\t1\t0\t{kind}",
+                "choice\tC", "choice\tUTC", "complete\tregional-choices"])
+            self.assertLessEqual(len(output.encode()), provider.REGIONAL_CHOICE_STREAM_BYTES[kind])
+        self.assertEqual(provider.PROTOCOL_MINOR, 0)
+
+    def test_choice_catalog_limits_and_duplicates_are_rejected(self):
+        for values in (("C", "C"), ("bad\nlocale",), ("x" * 129,), tuple(f"x{i}" for i in range(4097))):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.validate_locale_catalog(values)
+        maximum = tuple(f"x{i}" for i in range(4096))
+        self.assertEqual(provider.validate_locale_catalog(maximum), maximum)
+        for kind, patch, value in (("locale", "read_locale_choices", ("C", "C")),
+                                   ("timezone", "RegionalRead", mock.Mock(run=mock.Mock(return_value=("UTC", "UTC"))))):
+            with mock.patch.object(provider, patch, return_value=value):
+                output, code = provider.regional_preflight_output("regional-choices", [kind])
+            self.assertEqual(code, 1)
+            self.assertIn("error\tregional\tmalformed\t", output)
+            self.assertNotIn("\nchoice\t", output)
+
+    def test_preview_stream_and_errors_never_publish_partial_evidence(self):
+        preview = provider.make_regional_preview("ntp-set", "enabled", self.time_state())
+        with mock.patch.object(provider, "read_regional_preview", return_value=preview):
+            output, code = provider.regional_preflight_output("regional-preview", ["ntp-set", "enabled"])
+        self.assertEqual((code, output.splitlines()), (0, ["regional-preview-protocol\t1\t0",
+            "\t".join(preview.fields()), "complete\tregional-preview"]))
+        for command, args, helper in (("regional-preview", ["ntp-set", "enabled"], "read_regional_preview"),
+                                     ("regional-choices", ["locale"], "regional_choices")):
+            for code in ("timeout", "permission-denied", "missing-provider", "malformed"):
+                with mock.patch.object(provider, helper, side_effect=provider.SnapshotFailure(code, "Fixture failure")):
+                    output, status = provider.regional_preflight_output(command, args)
+                self.assertEqual(status, 1)
+                self.assertEqual(len(output.splitlines()), 3)
+                self.assertEqual(output.splitlines()[1], f"error\tregional\t{code}\tFixture failure")
+                self.assertNotIn("\npreview\t", output)
+                self.assertNotIn("\nchoice\t", output)
+
+    def test_full_encoded_stream_limits_include_newlines(self):
+        preview = provider.make_regional_preview("ntp-set", "enabled", self.time_state())
+        with mock.patch.object(provider, "read_regional_preview", return_value=preview):
+            output, _ = provider.regional_preflight_output("regional-preview", ["ntp-set", "enabled"])
+            for limit, expected in ((len(output.encode()), 0), (len(output.encode()) - 1, 1)):
+                with mock.patch.object(provider, "REGIONAL_PREVIEW_STREAM_BYTES", limit):
+                    bounded, code = provider.regional_preflight_output("regional-preview", ["ntp-set", "enabled"])
+                self.assertEqual(code, expected)
+                if code:
+                    self.assertNotIn("\npreview\t", bounded)
+        with mock.patch.object(provider, "regional_choices", return_value=("UTC",)):
+            output, _ = provider.regional_preflight_output("regional-choices", ["timezone"])
+            for limit, expected in ((len(output.encode()), 0), (len(output.encode()) - 1, 1)):
+                with mock.patch.dict(provider.REGIONAL_CHOICE_STREAM_BYTES, timezone=limit):
+                    bounded, code = provider.regional_preflight_output("regional-choices", ["timezone"])
+                self.assertEqual(code, expected)
+                if code:
+                    self.assertNotIn("\nchoice\t", bounded)
+
+    def test_non_utf8_or_oversized_preview_fields_are_not_emitted(self):
+        preview = provider.make_regional_preview("ntp-set", "enabled", self.time_state())
+        for detail in ("x" * 513, "é" * 257, "bad\nfield", "bad\0field", "bad\ud800field", "bad\x1bfield", None):
+            with mock.patch.object(provider, "read_regional_preview", return_value=replace(preview, detail=detail)):
+                output, code = provider.regional_preflight_output("regional-preview", ["ntp-set", "enabled"])
+            self.assertEqual(code, 1)
+            self.assertNotIn("\npreview\t", output)
+        with mock.patch.object(provider, "read_regional_preview", side_effect=provider.SnapshotFailure(
+                "unrecognized\ncode", "bad\ud800\0detail")):
+            output, code = provider.regional_preflight_output("regional-preview", ["ntp-set", "enabled"])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.splitlines()[1], "error\tregional\tinternal\tbad  detail")
+        output.encode("utf-8")
+
+    def test_closed_preflight_consumer_exits_without_traceback_or_shutdown_flush(self):
+        program = """
+import io, runpy, sys
+if int(sys.argv[2]) > 8192:
+    sys.stdout = io.TextIOWrapper(io.FileIO(sys.stdout.fileno(), "w", closefd=False),
+                                encoding="utf-8", write_through=True)
+main = runpy.run_path(sys.argv[1])["main"]
+main.__globals__["regional_preflight_output"] = lambda *_: ("x" * int(sys.argv[2]), 0)
+raise SystemExit(main(["regional-choices", "locale"]))
+"""
+        for size in (32, 65536):
+            with self.subTest(size=size):
+                read_fd, write_fd = os.pipe()
+                os.close(read_fd)
+                try:
+                    result = subprocess.run([sys.executable, "-c", program, str(PROVIDER_PATH), str(size)],
+                        stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.PIPE, timeout=5)
+                finally:
+                    os.close(write_fd)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stderr, b"")
+
+    def test_preflight_cli_grammar_and_invalid_native_requests(self):
+        invalid = (["regional-choices"], ["regional-choices", "time"], ["regional-choices", "locale", "extra"],
+                   ["regional-preview"], ["regional-preview", "ntp-set"],
+                   ["regional-preview", "arbitrary", "value"], ["regional-preview", "ntp-set", "enabled", "extra"],
+                   ["timezone-set", "UTC"], ["ntp-set", "enabled", "A" * 64],
+                   ["locale-set", "LC_TIME=C", "a" * 64])
+        with mock.patch.object(provider, "RegionalRead") as reader, \
+                mock.patch.object(provider, "read_locale_choices") as locales, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                mock.patch.object(provider, "open_journal_directory") as journal, \
+                contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+            for args in invalid:
+                self.assertEqual(provider.main(args), 2, args)
+            self.assertEqual(output.getvalue(), "")
+            for mocked in (reader, locales, backend, journal):
+                mocked.assert_not_called()
+            for args in (["regional-preview", "timezone-set", "../UTC"],
+                         ["regional-preview", "ntp-set", "yes"],
+                         ["regional-preview", "locale-set", "LC_TIME=C"]):
+                output.seek(0)
+                output.truncate(0)
+                self.assertEqual(provider.main(args), 1, args)
+                self.assertEqual(len(output.getvalue().splitlines()), 3)
+                self.assertIn("error\tregional\tmalformed\t", output.getvalue())
+            for mocked in (reader, locales, backend, journal):
+                mocked.assert_not_called()
+        with mock.patch.object(provider, "regional_choices", return_value=("C",)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(provider.main(["regional-choices", "locale"]), 0)
+            self.assertIn("choice\tC\n", output.getvalue())
+
+
+class RepositoryReadTests(unittest.TestCase):
+    def reader(self):
+        _unused, connection, gio, glib, variant = RegionalReadTests.reader(self)
+        return provider.RepositoryRead(gio, glib), connection, gio, glib, variant
+
+    def collect(self, *, records=None, overrides=None, stall=None, before_ack=False,
+                terminal=None, no_terminal=False, transform=None, remote_error=None, activate=False):
+        read, connection, gio, glib, variant = self.reader()
+        calls = []
+        connection.call.side_effect = lambda *args: calls.append(args)
+        gio.dbus_error_get_remote_error.return_value = remote_error
+        replies = {"start": variant.Variant("(u)", (2,)),
+                   "owner": variant.Variant("(s)", (":1.42",)),
+                   "owner-after-start": variant.Variant("(s)", (":1.42",)),
+                   "verify-owner": variant.Variant("(s)", (":1.42",)),
+                   "create": variant.Variant("(o)", ("/12_fixture",))}
+        replies.update(overrides or {})
+        if activate:
+            replies["owner"] = variant.Error("no owner")
+        def signals():
+            for record in records if records is not None else (
+                    variant.Variant("(ssb)", ("z-disabled", "Disabled", False)),
+                    variant.Variant("(ssb)", ("a-enabled", "Enabled", True))):
+                read.received(connection, read.owner, read.path, provider.TRANSACTION_INTERFACE,
+                              "RepoDetail", record, None)
+            if not no_terminal:
+                member, values = terminal or ("Finished", variant.Variant("(uu)", (1, 4)))
+                read.received(connection, read.owner, read.path, provider.TRANSACTION_INTERFACE,
+                              member, values, None)
+        def during_loop():
+            if stall == "connect":
+                read.expire()
+            read.connected(None, object(), None)
+            for call in calls:
+                stage = call[-1]
+                if stage is None:
+                    continue  # Best-effort cleanup does not own a new read.
+                if transform:
+                    transform(read, connection, stage)
+                if stage == "fetch" and before_ack:
+                    signals()
+                if stall == stage:
+                    read.expire()
+                reply = replies.get(stage, variant.Variant("()", ()))
+                gio.dbus_error_get_remote_error.return_value = (
+                    "org.freedesktop.DBus.Error.NameHasNoOwner" if activate and stage == "owner" else remote_error)
+                connection.call_finish.side_effect = reply if isinstance(reply, Exception) else None
+                connection.call_finish.return_value = reply
+                call[-2](connection, object(), stage)
+                call[-2](connection, object(), stage)  # Duplicate callbacks are inert.
+                if stage == "fetch" and not before_ack:
+                    signals()
+            if not read.done:
+                read.expire()
+        read.loop.run.side_effect = during_loop
+        failure = None
+        try:
+            value = read.run()
+        except provider.SnapshotFailure as error:
+            value, failure = None, error
+        return value, failure, read, connection, gio, glib, calls
+
+    def test_complete_enabled_disabled_rows_and_exact_fixed_calls(self):
+        for before_ack in (False, True):
+            value, failure, read, connection, gio, glib, calls = self.collect(before_ack=before_ack)
+            self.assertIsNone(failure)
+            self.assertEqual([row.fields() for row in value], [
+                ("repository", "a-enabled", "enabled", "Enabled"),
+                ("repository", "z-disabled", "disabled", "Disabled")])
+            self.assertEqual([call[3] for call in calls], ["GetNameOwner",
+                "CreateTransaction", "AddMatch", "SetHints", "GetRepoList", "GetNameOwner", "RemoveMatch"])
+            for call in calls:
+                self.assertEqual(call[6], gio.DBusCallFlags.NONE)
+                self.assertGreater(call[7], 0)
+                self.assertLessEqual(call[7], 30000)
+            fetch = next(call for call in calls if call[3] == "GetRepoList")
+            self.assertEqual(fetch[:4], (":1.42", "/12_fixture", provider.TRANSACTION_INTERFACE, "GetRepoList"))
+            self.assertEqual(fetch[4].get_type_string(), "(t)")
+            self.assertEqual(fetch[4].unpack(), (2,))
+            hints = next(call for call in calls if call[3] == "SetHints")
+            self.assertEqual(hints[4].unpack(), (["background=true", "interactive=false", "cache-age=4294967295"],))
+            self.assertEqual(connection.signal_subscribe.call_args.args[5], gio.DBusSignalFlags.NO_MATCH_RULE)
+            connection.signal_unsubscribe.assert_called_once()
+            connection.disconnect.assert_called_once()
+            connection.close_sync.assert_not_called()
+            glib.source_remove.assert_called_once_with(17)
+            self.assertTrue(read.cancellable.cancel.called)
+            self.assertEqual(read.rows, {})
+            with self.assertRaises(RuntimeError):
+                read.run()
+
+    def test_empty_success_requires_both_method_ack_and_finished(self):
+        value, failure, *_ = self.collect(records=[])
+        self.assertEqual(value, ())
+        self.assertIsNone(failure)
+        value, failure, *_ = self.collect(records=[], no_terminal=True)
+        self.assertIsNone(value)
+        self.assertEqual(failure.code, "timeout")
+        for before_ack in (False, True):
+            _read, _connection, _gio, _glib, variant = self.reader()
+            value, failure, *_ = self.collect(before_ack=before_ack,
+                overrides={"fetch": variant.Error("lost acknowledgment")})
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "internal")
+
+    def test_every_stage_timeout_discards_rows_and_late_callbacks(self):
+        for stage in ("connect", "start", "owner", "owner-after-start", "create", "match", "hints", "fetch", "verify-owner"):
+            value, failure, read, connection, gio, _glib, calls = self.collect(
+                stall=stage, activate=stage in ("start", "owner-after-start"))
+            self.assertIsNone(value, stage)
+            self.assertEqual(failure.code, "timeout", stage)
+            self.assertEqual(read.rows, {})
+            before = connection.call_finish.call_count
+            read.replied(connection, object(), stage)
+            read.connected(None, object(), None)
+            self.assertEqual(connection.call_finish.call_count, before)
+            if stage == "connect":
+                gio.bus_get_finish.assert_not_called()
+            canceled = [call for call in calls if call[3] == "Cancel"]
+            self.assertEqual(len(canceled), int(stage == "fetch"))
+            if canceled:
+                self.assertEqual(canceled[0][:4], (":1.42", "/12_fixture", provider.TRANSACTION_INTERFACE, "Cancel"))
+            self.assertEqual(sum(call[3] == "RemoveMatch" for call in calls),
+                             int(stage in ("match", "hints", "fetch", "verify-owner")))
+
+    def test_bus_failures_and_replacement_are_provider_scoped(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for stage, remote, code, status in (
+                ("owner", "org.freedesktop.DBus.Error.ServiceUnknown", "missing-provider", "unavailable"),
+                ("match", "org.freedesktop.DBus.Error.AccessDenied", "permission-denied", "restricted"),
+                ("fetch", "org.freedesktop.PackageKit.Transaction.RefusedByPolicy", "permission-denied", "restricted"),
+                ("fetch", "org.freedesktop.PackageKit.Transaction.NotSupported", "unsupported", "unsupported")):
+            value, failure, *_ = self.collect(overrides={stage: variant.Error("fixture")}, remote_error=remote)
+            self.assertIsNone(value)
+            self.assertEqual((failure.code, failure.status), (code, status))
+        value, failure, *_ = self.collect(overrides={"verify-owner": variant.Variant("(s)", (":1.43",))})
+        self.assertIsNone(value)
+        self.assertEqual(failure.code, "conflict")
+
+    def test_typed_reply_validation_rejects_invalid_setup(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for stage, reply in (("start", variant.Variant("(u)", (0,))),
+                ("owner", variant.Variant("(s)", ("org.freedesktop.PackageKit",))),
+                ("owner", variant.Variant("(s)", (":" + "1" * 255 + ".1",))),
+                ("create", variant.Variant("(o)", ("/unrelated",))),
+                ("match", variant.Variant("(b)", (True,))),
+                ("hints", variant.Variant("(s)", ("bad",))),
+                ("fetch", variant.Variant("(b)", (True,)))):
+            value, failure, *_ = self.collect(overrides={stage: reply}, activate=stage == "start")
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "malformed", stage)
+
+    def test_absent_daemon_activation_is_bounded_and_attempted_only_once(self):
+        value, failure, _read, _connection, _gio, _glib, calls = self.collect(activate=True)
+        self.assertIsNone(failure)
+        self.assertEqual(len(value), 2)
+        self.assertEqual([call[3] for call in calls[:3]], ["GetNameOwner", "StartServiceByName", "GetNameOwner"])
+        self.assertEqual(calls[1][4].unpack(), (provider.PACKAGEKIT_NAME, 0))
+        _read, _connection, _gio, _glib, variant = self.reader()
+        value, failure, *_rest, calls = self.collect(activate=True,
+            overrides={"owner-after-start": variant.Error("still absent")},
+            remote_error="org.freedesktop.DBus.Error.NameHasNoOwner")
+        self.assertIsNone(value)
+        self.assertEqual(failure.code, "missing-provider")
+        self.assertEqual(sum(call[3] == "StartServiceByName" for call in calls), 1)
+
+    def test_repository_fields_are_bounded_before_unpacking(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        row = provider.decode_repository_row(variant.Variant("(ssb)", ("x" * 512, "é" * 256, True)))
+        self.assertEqual(len(row.repository_id), 512)
+        self.assertEqual(len(row.description.encode()), 512)
+        for record in (variant.Variant("(ssb)", ("", "description", True)),
+                       variant.Variant("(ssb)", ("bad\tid", "description", True)),
+                       variant.Variant("(ssb)", ("id", "é" * 257, True)),
+                       variant.Variant("(ssb)", ("x" * 513, "description", True)),
+                       variant.Variant("(sss)", ("id", "description", "true"))):
+            value, failure, *_ = self.collect(records=[record])
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "malformed")
+        oversized = mock.Mock()
+        oversized.get_type_string.return_value = "(ssb)"
+        oversized.get_size.return_value = 1000000
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.decode_repository_row(oversized)
+        oversized.unpack.assert_not_called()
+        self.assertEqual(provider.decode_repository_row(variant.Variant("(ssb)",
+            ("id", "one\ntwo\tthree", False))).description, "one two three")
+
+    def test_duplicate_count_and_encoded_byte_overflow_discard_complete_result(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        record = lambda index: variant.Variant("(ssb)", (f"repo-{index}", "description", True))
+        value, failure, *_ = self.collect(records=[record(index) for index in range(512)])
+        self.assertIsNone(failure)
+        self.assertEqual(len(value), 512)
+        for records in ([record(0), record(0)], [record(index) for index in range(513)]):
+            value, failure, read, *_ = self.collect(records=records)
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "malformed")
+            self.assertEqual(read.rows, {})
+        records = [variant.Variant("(ssb)", (f"{index:03d}" + "i" * 509, "d" * 512, True)) for index in range(512)]
+        value, failure, *_ = self.collect(records=records)
+        self.assertIsNone(value)
+        self.assertEqual(failure.code, "malformed")
+        size = provider.encoded_record_size(provider.decode_repository_row(record(0)).fields())
+        for limit, success in ((size, True), (size - 1, False)):
+            with mock.patch.object(provider, "REPOSITORY_MAX_BYTES", limit):
+                value, failure, *_ = self.collect(records=[record(0)])
+            self.assertEqual(failure is None, success)
+
+    def test_transaction_errors_and_malformed_terminal_signals_never_succeed(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for terminal, code in (
+                (("ErrorCode", variant.Variant("(us)", (18, "private details"))), "repository"),
+                (("ErrorCode", variant.Variant("(us)", (48, "private details"))), "permission-denied"),
+                (("ErrorCode", variant.Variant("(us)", (2, "private details"))), "network"),
+                (("ErrorCode", variant.Variant("(us)", (18, "x" * 513))), "malformed"),
+                (("Finished", variant.Variant("(uu)", (2, 4))), "internal"),
+                (("Finished", variant.Variant("(u)", (1,))), "malformed"),
+                (("Destroy", variant.Variant("()", ())), "missing-provider"),
+                (("Destroy", variant.Variant("(b)", (True,))), "malformed")):
+            value, failure, *_ = self.collect(terminal=terminal)
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, code)
+            self.assertNotIn("private details", str(failure))
+
+    def test_wrong_peer_and_unrelated_signals_are_ignored_without_unpacking(self):
+        def unrelated(read, connection, stage):
+            if stage != "fetch":
+                return
+            values = mock.Mock()
+            for sender, path, interface, member in ((":1.99", read.path, provider.TRANSACTION_INTERFACE, "RepoDetail"),
+                    (read.owner, "/99_other", provider.TRANSACTION_INTERFACE, "Finished"),
+                    (read.owner, read.path, "other.Interface", "ErrorCode"),
+                    (read.owner, read.path, provider.TRANSACTION_INTERFACE, "Package")):
+                read.received(connection, sender, path, interface, member, values, None)
+            values.unpack.assert_not_called()
+            values.get_type_string.assert_not_called()
+        value, failure, *_ = self.collect(transform=unrelated)
+        self.assertIsNone(failure)
+        self.assertEqual(len(value), 2)
+
+    def test_premature_signal_and_unexpected_loop_exit_fail_closed(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        def premature(read, connection, stage):
+            if stage == "match":
+                read.received(connection, read.owner, read.path, provider.TRANSACTION_INTERFACE,
+                    "Finished", variant.Variant("(uu)", (1, 0)), None)
+        value, failure, *_ = self.collect(transform=premature)
+        self.assertIsNone(value)
+        self.assertEqual(failure.code, "malformed")
+        read, *_ = self.reader()
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "internal")
+
+    def test_real_repository_reads_use_an_isolated_private_bus(self):
+        process = subprocess.Popen(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-repository-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            output, error = process.communicate(timeout=50)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+        self.assertEqual(process.returncode, 0, error.decode(errors="replace"))
+        self.assertIn(b"Private-bus repository reads: PASS", output)
+
+    def test_expired_decoding_never_publishes_a_value_or_late_error(self):
+        for raises in (False, True):
+            def decode_late(_values):
+                current.deadline = 0
+                if raises:
+                    raise provider.SnapshotFailure("malformed", "late decoding error")
+                return provider.RepositoryRow("late", True, "Late")
+            def capture(read, _connection, _stage):
+                nonlocal current
+                current = read
+            current = None
+            with mock.patch.object(provider, "decode_repository_row", side_effect=decode_late):
+                value, failure, read, *_ = self.collect(transform=capture)
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "timeout")
+            self.assertEqual(read.rows, {})
+
+    def test_bus_close_is_bounded_and_cannot_override_terminal_evidence(self):
+        for expired in (False, True):
+            def close(read, _connection, stage):
+                if stage == "fetch":
+                    if expired:
+                        read.deadline = 0
+                    read.connection_closed()
+            value, failure, read, *_ = self.collect(transform=close)
+            self.assertIsNone(value)
+            self.assertEqual(failure.code, "timeout" if expired else "missing-provider")
+            read.connection_closed()
+            self.assertIs(read.failure, failure)
+        value, failure, read, *_ = self.collect()
+        read.connection_closed()
+        self.assertIs(read.value, value)
+        self.assertIsNone(read.failure)
+
+    def test_synchronous_dispatch_and_cleanup_failures_remain_bounded(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        connection.call.side_effect = variant.Error("send failed")
+        read.loop.run.side_effect = lambda: read.connected(None, object(), None)
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "internal")
+        connection.close_sync.assert_not_called()
+        def reject_cleanup(_read, connection, stage):
+            if stage == "verify-owner":
+                connection.call.side_effect = variant.Error("cleanup failed")
+        value, failure, *_ = self.collect(transform=reject_cleanup)
+        self.assertIsNone(failure)
+        self.assertEqual(len(value), 2)
+
+
+class CupsReadTests(unittest.TestCase):
+    def state(self, load="loaded", active="inactive", sub="dead"):
+        return provider.UnitState("/org/freedesktop/systemd1/unit/fixture", load, active, sub)
+
+    def reply(self, variant, state=None, **overrides):
+        state = self.state() if state is None else state
+        row = ["cups.service", "Fixture", state.load, state.active, state.sub, "", state.path, 0, "", "/"]
+        for index, value in overrides.items():
+            row[int(index)] = value
+        return variant.Variant(provider.UNIT_REPLY_TYPE, ([tuple(row)],))
+
+    def reader(self):
+        _unused, connection, gio, glib, variant = RegionalReadTests.reader(self)
+        return provider.CupsRead(gio, glib), connection, gio, glib, variant
+
+    def collect(self, replies=None, *, mode="normal", remote_error=None, transform=None):
+        read, connection, gio, glib, variant = self.reader()
+        gio.dbus_error_get_remote_error.return_value = remote_error
+        calls = []
+        connection.call.side_effect = lambda *args: calls.append(args)
+        def during_loop():
+            if mode == "connection-timeout":
+                read.expire()
+                return
+            if mode == "connection-error":
+                gio.bus_get_finish.side_effect = variant.Error("fixture")
+            read.connected(None, object(), None)
+            if mode == "method-timeout":
+                read.expire()
+            for call in calls:
+                unit = call[-1]
+                if mode == "socket-timeout" and unit == "cups.socket":
+                    read.expire()
+                reply = (replies or {}).get(unit, self.reply(variant))
+                if isinstance(reply, Exception):
+                    connection.call_finish.side_effect = reply
+                else:
+                    connection.call_finish.side_effect = None
+                    connection.call_finish.return_value = reply
+                if transform:
+                    transform(read, connection, unit)
+                read.replied(connection, object(), unit)
+        read.loop.run.side_effect = during_loop
+        result = read.run()
+        return result, read, connection, gio, glib, calls
+
+    def test_cups_status_matrix_preserves_running_service_and_socket_activation(self):
+        absent = self.state("not-found")
+        stopped = self.state()
+        running = self.state(active="active", sub="running")
+        listening = self.state(active="active", sub="listening")
+        failed = self.state(active="failed", sub="failed")
+        cases = [(running, listening, "available", "running"),
+                 (running, absent, "available", "running"),
+                 (running, failed, "available", "running"),
+                 (stopped, listening, "available", "socket-ready"),
+                 (stopped, absent, "available", "stopped"),
+                 (stopped, stopped, "available", "stopped"),
+                 (absent, absent, "unsupported", "unknown"),
+                 (absent, listening, "partial", "unknown"),
+                 (failed, listening, "partial", "unknown"),
+                 (stopped, failed, "partial", "unknown"),
+                 (stopped, self.state(active="active", sub="running"), "partial", "unknown"),
+                 (self.state(active="activating", sub="start"), listening, "partial", "unknown"),
+                 (stopped, self.state(active="deactivating", sub="stop-pre"), "partial", "unknown"),
+                 (self.state("masked"), listening, "partial", "unknown")]
+        for service, socket, status, value in cases:
+            with self.subTest(service=service, socket=socket):
+                result = provider.classify_cups(dict(zip(provider.CUPS_UNITS, (service, socket))))
+                self.assertEqual((result.status, result.value), (status, value))
+
+    def test_only_fixed_read_queries_are_sent_with_one_aggregate_lifetime(self):
+        result, read, connection, gio, glib, calls = self.collect()
+        self.assertEqual((result.status, result.value), ("available", "stopped"))
+        self.assertEqual(len(calls), 2)
+        for call, unit in zip(calls, provider.CUPS_UNITS):
+            self.assertEqual(call[:4], (provider.SYSTEMD_NAME, provider.SYSTEMD_PATH,
+                             provider.SYSTEMD_MANAGER, "ListUnitsByNames"))
+            self.assertEqual(call[4].unpack(), ([unit],))
+            self.assertEqual(call[5].dup_string(), provider.UNIT_REPLY_TYPE)
+            self.assertEqual(call[6], gio.DBusCallFlags.NO_AUTO_START)
+            self.assertGreater(call[7], 0)
+            self.assertLessEqual(call[7], 10000)
+            self.assertIs(call[8], read.cancellable)
+        glib.timeout_add.assert_called_once_with(10000, read.expire)
+        glib.source_remove.assert_called_once_with(17)
+        connection.close_sync.assert_not_called()
+        self.assertTrue(read.cancellable.cancel.called)
+        with self.assertRaises(RuntimeError):
+            read.run()
+
+    def test_decoder_checks_structure_and_bounds_before_unpacking(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for reply in (variant.Variant("(s)", ("bad",)),
+                      variant.Variant(provider.UNIT_REPLY_TYPE, ([],)),
+                      variant.Variant(provider.UNIT_REPLY_TYPE, ([self.reply(variant).unpack()[0][0]] * 2,)),
+                      self.reply(variant, **{"1": "x" * provider.UNIT_REPLY_BYTES}),
+                      self.reply(variant, **{"2": "x" * 513}),
+                      self.reply(variant, **{"3": "active\n"}),
+                      self.reply(variant, **{"4": ""}),
+                      self.reply(variant, **{"6": "/wrong/unit"})):
+            with self.subTest(reply_type=reply.get_type_string()):
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    provider.decode_unit_state(reply)
+                self.assertEqual(caught.exception.code, "malformed")
+        oversized = mock.Mock()
+        oversized.get_type_string.return_value = provider.UNIT_REPLY_TYPE
+        oversized.get_size.return_value = provider.UNIT_REPLY_BYTES + 1
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.decode_unit_state(oversized)
+        oversized.get_child_value.assert_not_called()
+        # Canonical aliases need not equal the fixed query name or a guessed path.
+        self.assertEqual(provider.decode_unit_state(self.reply(variant, **{"0": "org.cups.cupsd.service"})),
+                         self.state())
+
+    def test_connection_and_method_deadlines_cancel_and_ignore_late_replies(self):
+        for mode in ("connection-timeout", "method-timeout"):
+            result, read, connection, gio, glib, _calls = self.collect(mode=mode)
+            self.assertEqual((result.status, result.value), ("unavailable", "unknown"))
+            self.assertEqual([error.code for error in result.errors], ["timeout"])
+            self.assertTrue(read.cancellable.cancel.called)
+            glib.source_remove.assert_not_called()
+            connection.call_finish.assert_not_called()
+            before = tuple(result.units)
+            read.connected(None, object(), None)
+            read.replied(connection, object(), "cups.service")
+            self.assertEqual(result.units, before)
+            if mode == "connection-timeout":
+                gio.bus_get_finish.assert_not_called()
+
+    def test_active_service_survives_socket_timeout_but_inactive_does_not(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for active in (False, True):
+            state = self.state(active="active", sub="running") if active else self.state()
+            result, read, _connection, _gio, _glib, _calls = self.collect(
+                {"cups.service": self.reply(variant, state)}, mode="socket-timeout")
+            self.assertEqual((result.status, result.value),
+                             ("available", "running") if active else ("unavailable", "unknown"))
+            self.assertEqual([error.code for error in result.errors], ["timeout"])
+            self.assertEqual(result.units, (("cups.service", state),))
+            self.assertIs(read.value, result)
+
+    def test_error_and_malformed_socket_cannot_downgrade_running_service(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for bad in (variant.Error("fixture"), variant.Variant("(s)", ("bad",))):
+            result, *_ = self.collect({"cups.service": self.reply(variant, self.state(active="active")),
+                                      "cups.socket": bad}, remote_error="org.freedesktop.DBus.Error.AccessDenied")
+            self.assertEqual((result.status, result.value), ("available", "running"))
+            self.assertEqual(len(result.errors), 1)
+
+    def test_denial_absence_and_malformed_states_are_distinct(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for remote, code in (("org.freedesktop.DBus.Error.AccessDenied", "permission-denied"),
+                             ("org.freedesktop.DBus.Error.ServiceUnknown", "missing-provider")):
+            result, *_ = self.collect(mode="connection-error", remote_error=remote)
+            self.assertEqual((result.status, result.value), ("unavailable", "unknown"))
+            self.assertEqual([error.code for error in result.errors], [code])
+        result, *_ = self.collect({unit: variant.Error("fixture") for unit in provider.CUPS_UNITS},
+                                 remote_error="org.freedesktop.systemd1.NoSuchUnit")
+        self.assertEqual((result.status, result.value, result.errors), ("unsupported", "unknown", ()))
+        for remote in ("org.freedesktop.DBus.Error.UnknownObject", "org.freedesktop.DBus.Error.UnknownMethod"):
+            result, *_ = self.collect({unit: variant.Error("fixture") for unit in provider.CUPS_UNITS},
+                                     remote_error=remote)
+            self.assertEqual(result.status, "unavailable")
+        result, *_ = self.collect({"cups.service": variant.Variant("(s)", ("bad",))})
+        self.assertEqual((result.status, result.value), ("partial", "unknown"))
+
+    def test_decoder_result_or_error_after_deadline_is_discarded(self):
+        for raises in (False, True):
+            read, connection, _gio, _glib, variant = self.reader()
+            read.deadline = 10
+            state = self.state(active="active")
+            def late(_reply):
+                read.deadline = 1
+                if raises:
+                    raise provider.SnapshotFailure("malformed", "late")
+                return state
+            with mock.patch.object(provider.time, "monotonic", return_value=2), \
+                    mock.patch.object(provider, "decode_unit_state", side_effect=late):
+                read.replied(connection, object(), "cups.service")
+            self.assertEqual(read.value.units, ())
+            self.assertEqual([error.code for error in read.value.errors], ["timeout"])
+            read.unit_failed("cups.socket", variant.Error("late"))
+            self.assertEqual(len(read.value.errors), 1)
+
+    def test_unexpected_loop_exit_and_duplicate_callbacks_do_not_fake_success(self):
+        read, connection, _gio, _glib, _variant = self.reader()
+        result = read.run()
+        self.assertEqual((result.status, result.value), ("unavailable", "unknown"))
+        self.assertEqual([error.code for error in result.errors], ["internal"])
+        result, read, connection, *_ = self.collect()
+        calls = connection.call_finish.call_count
+        read.replied(connection, object(), "cups.service")
+        self.assertEqual(connection.call_finish.call_count, calls)
+        self.assertIs(result, read.value)
+
+    def test_reversed_replies_and_synchronous_dispatch_errors_keep_both_units_bounded(self):
+        for reverse, synchronous_error in ((True, False), (False, True)):
+            read, connection, gio, _glib, variant = self.reader()
+            calls = []
+            def sent(*args):
+                calls.append(args)
+                if synchronous_error:
+                    raise variant.Error("dispatch failure")
+            connection.call.side_effect = sent
+            gio.dbus_error_get_remote_error.return_value = "org.freedesktop.systemd1.NoSuchUnit"
+            def during_loop():
+                read.connected(None, object(), None)
+                if not synchronous_error:
+                    for call in reversed(calls) if reverse else calls:
+                        connection.call_finish.return_value = self.reply(variant)
+                        read.replied(connection, object(), call[-1])
+                        read.replied(connection, object(), call[-1])
+            read.loop.run.side_effect = during_loop
+            result = read.run()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result.status, "unsupported" if synchronous_error else "available")
+            self.assertEqual(result.errors, ())
+            self.assertEqual(len(result.units), 2)
+            self.assertEqual(connection.call_finish.call_count, 0 if synchronous_error else 2)
+
+    def test_elapsed_deadline_prevents_dispatch_and_normalizes_late_bus_failure(self):
+        for during_finish in (False, True):
+            read, connection, gio, _glib, variant = self.reader()
+            read.deadline = 10 if during_finish else 1
+            def late(_result):
+                read.deadline = 1
+                raise variant.Error("late failure")
+            connection.call_finish.side_effect = late
+            with mock.patch.object(provider.time, "monotonic", return_value=2):
+                if during_finish:
+                    read.replied(connection, object(), "cups.service")
+                else:
+                    read.connected(None, object(), None)
+                    gio.bus_get_finish.assert_not_called()
+            self.assertEqual(read.value.units, ())
+            self.assertEqual([error.code for error in read.value.errors], ["timeout"])
+            connection.call.assert_not_called()
+
+    def test_real_cups_reads_use_an_isolated_private_bus(self):
+        process = subprocess.Popen(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-cups-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=35)
+            self.assertEqual(process.returncode, 0, stderr.decode("utf-8", "replace"))
+            self.assertIn(b"Private-bus printer reads: PASS", stdout)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+                process.communicate(timeout=3)
+
+
+class AccountReadTests(unittest.TestCase):
+    current_path = "/org/freedesktop/Accounts/Current"
+
+    def collect(self, paths=(), *, current=None, values=None, transform=None,
+                stop_when=None, remote_error=None, connection_error=False):
+        _unused, connection, gio, glib, variant = RegionalReadTests.reader(self)
+        read = provider.AccountRead(gio, glib)
+        current = self.current_path if current is None else current
+        calls, queued = [], []
+        peaks = []
+        gio.dbus_error_get_remote_error.return_value = remote_error
+        error = variant.Error("fixture service error")
+        if connection_error:
+            gio.bus_get_finish.side_effect = error
+
+        def sent(*args):
+            self.assertEqual(args[0], provider.ACCOUNTS_NAME)
+            self.assertEqual(args[6], gio.DBusCallFlags.NONE)
+            self.assertGreater(args[7], 0)
+            self.assertLessEqual(args[7], 3000)
+            self.assertIn(args[3], ("ListCachedUsers", "FindUserById", "Get"))
+            if args[3] == "Get":
+                self.assertEqual(args[2], provider.PROPERTIES_INTERFACE)
+                interface, name = args[4].unpack()
+                self.assertEqual(interface, provider.ACCOUNT_INTERFACE)
+                self.assertIn(name, provider.ACCOUNT_PROPERTIES)
+                self.assertLessEqual(read.outstanding, 8)
+            else:
+                self.assertEqual(args[1:3], (provider.ACCOUNTS_PATH, provider.ACCOUNTS_NAME))
+                if args[3] == "FindUserById":
+                    self.assertEqual(args[4].unpack(), (os.getuid(),))
+                    self.assertEqual(args[4].get_type_string(), "(x)")
+            calls.append(args)
+            queued.append(args)
+            peaks.append(len(queued))
+
+        def finish(reply):
+            if isinstance(reply, variant.Error):
+                raise reply
+            return reply
+
+        def reply_for(args):
+            method = args[3]
+            if method == "ListCachedUsers":
+                reply = variant.Variant("(ao)", (list(paths),))
+            elif method == "FindUserById":
+                reply = variant.Variant("(o)", (current,))
+            else:
+                name = args[4].unpack()[1]
+                default = {"UserName": "login", "RealName": "", "SystemAccount": False, "LocalAccount": True}[name]
+                field = (values or {}).get(args[1], {}).get(name, default)
+                inner = field if isinstance(field, variant.Variant) else variant.Variant(provider.ACCOUNT_PROPERTIES[name], field)
+                reply = variant.Variant("(v)", (inner,))
+            return transform(args, reply, variant, error) if transform else reply
+
+        def drive():
+            read.connected(None, object(), None)
+            while queued and not read.done:
+                args = queued.pop(0)
+                args[9](connection, reply_for(args), args[10])
+                if stop_when and stop_when(read):
+                    read.expire()
+
+        connection.call.side_effect = sent
+        connection.call_finish.side_effect = finish
+        read.loop.run.side_effect = drive
+        result = read.run()
+        self.assertTrue(read.cancellable.cancel.called)
+        connection.close_sync.assert_not_called()
+        return result, read, calls, queued, connection, max(peaks, default=0)
+
+    def codes(self, result):
+        return {error.code for error in result.errors}
+
+    def test_fixed_reads_reserve_current_user_and_cap_concurrency(self):
+        result, read, calls, _queued, _connection, peak = self.collect(
+            ["/users/z", self.current_path, "/users/a", "/users/a"])
+        self.assertEqual(result.status, "available")
+        self.assertEqual(result.candidates, (self.current_path, "/users/a", "/users/z"))
+        self.assertEqual([row.scope for row in result.records], ["current", "other", "other"])
+        self.assertEqual(result.current_path, self.current_path)
+        self.assertEqual((len(calls), peak), (14, 8))
+        self.assertEqual(read.outstanding, 0)
+        self.assertEqual(result.records[0].display_name, "login")
+        with self.assertRaises(RuntimeError):
+            read.run()
+
+    def test_filtering_preserves_current_system_account_and_remote_accounts(self):
+        result, *_ = self.collect(["/system", "/remote"], values={
+            self.current_path: {"SystemAccount": True, "RealName": "Current User"},
+            "/system": {"SystemAccount": True}, "/remote": {"LocalAccount": False}})
+        self.assertEqual(result.status, "available")
+        self.assertEqual([row.path for row in result.records], [self.current_path, "/remote"])
+        self.assertEqual(result.records[0].display_name, "Current User")
+        self.assertFalse(result.records[1].local_account)
+        self.assertIn("/system", result.candidates)
+
+    def test_overflow_keeps_current_and_lowest_255_other_paths(self):
+        paths = [f"/users/u{index:04}" for index in range(300, -1, -1)]
+        result, read, *_ = self.collect(paths)
+        self.assertEqual((result.status, len(result.records)), ("partial", 256))
+        self.assertEqual(result.candidates, (self.current_path, *sorted(paths)[:255]))
+        self.assertEqual(self.codes(result), {"malformed"})
+        self.assertLessEqual(len(read.seen), 257)
+        self.assertLessEqual(len(read.selected), 256)
+
+    def test_256_including_current_is_complete_but_256_plus_current_is_partial(self):
+        others = [f"/users/u{index:04}" for index in range(256)]
+        result, *_ = self.collect([*others[:255], self.current_path])
+        self.assertEqual((result.status, len(result.records)), ("available", 256))
+        result, *_ = self.collect(others)
+        self.assertEqual((result.status, len(result.records)), ("partial", 256))
+
+    def test_repeated_paths_do_not_create_false_overflow(self):
+        result, *_ = self.collect(["/same"] * 300)
+        self.assertEqual((result.status, len(result.records)), ("available", 2))
+
+    def test_bad_account_properties_do_not_hide_valid_rows(self):
+        from gi.repository import GLib
+        for fields in ({"UserName": ""}, {"RealName": "x" * 513},
+                       {"SystemAccount": GLib.Variant("u", 0)}, {"LocalAccount": GLib.Variant("s", "yes")}):
+            with self.subTest(fields=fields):
+                result, *_ = self.collect(["/bad", "/good"], values={"/bad": fields})
+                self.assertEqual(result.status, "partial")
+                self.assertEqual([row.path for row in result.records], [self.current_path, "/good"])
+                self.assertEqual(self.codes(result), {"malformed"})
+
+    def test_field_bounds_are_utf8_and_do_not_truncate_display_text(self):
+        result, *_ = self.collect(values={self.current_path: {"RealName": "é" * 256, "UserName": "a\tb\nc"}})
+        self.assertEqual(result.records[0].display_name, "é" * 256)
+        self.assertEqual(result.records[0].login_name, "a b c")
+        result, *_ = self.collect(values={self.current_path: {"RealName": "é" * 257}})
+        self.assertEqual(result.records, ())
+        self.assertEqual(self.codes(result), {"malformed"})
+
+    def test_oversized_encoded_list_discards_all_rows(self):
+        paths = [f"/users/u{index:04}" for index in range(255)]
+        values = {path: {"RealName": "x" * 512, "UserName": "y" * 512}
+                  for path in [self.current_path, *paths]}
+        result, *_ = self.collect(paths, values=values)
+        self.assertEqual((result.status, result.records), ("partial", ()))
+        self.assertEqual(self.codes(result), {"malformed"})
+
+    def test_oversized_object_path_is_rejected_before_unpacking(self):
+        value = mock.Mock()
+        value.get_type_string.return_value = "o"
+        value.get_size.return_value = 514
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.account_object_path(value)
+        value.unpack.assert_not_called()
+        result, *_ = self.collect(["/" + "x" * 512, "/good"])
+        self.assertEqual([row.path for row in result.records], [self.current_path, "/good"])
+        self.assertEqual(self.codes(result), {"malformed"})
+
+    def test_bad_list_still_allows_a_valid_current_user_lookup(self):
+        def corrupt(args, reply, variant, _error):
+            return variant.Variant("(s)", ("bad",)) if args[3] == "ListCachedUsers" else reply
+        result, *_ = self.collect(transform=corrupt)
+        self.assertEqual((result.status, len(result.records)), ("partial", 1))
+        self.assertEqual(result.records[0].scope, "current")
+
+    def test_failed_current_lookup_never_infers_current_scope_from_a_path(self):
+        def fail(args, reply, _variant, error):
+            return error if args[3] == "FindUserById" else reply
+        result, *_ = self.collect([self.current_path], transform=fail)
+        self.assertIsNone(result.current_path)
+        self.assertEqual(result.records[0].scope, "other")
+        self.assertEqual(result.status, "partial")
+
+    def test_connection_denial_or_missing_service_is_scoped(self):
+        for name, code, status in (("AccessDenied", "permission-denied", "restricted"),
+                                   ("ServiceUnknown", "missing-provider", "unavailable")):
+            with self.subTest(name=name):
+                result, _read, calls, *_ = self.collect(connection_error=True,
+                    remote_error=f"org.freedesktop.DBus.Error.{name}")
+                self.assertEqual((result.status, result.records, calls), (status, (), []))
+                self.assertEqual(self.codes(result), {code})
+
+    def test_deadline_preserves_completed_rows_and_ignores_late_replies(self):
+        result, read, calls, queued, connection, _peak = self.collect(
+            ["/users/a", "/users/b"], stop_when=lambda reader: len(reader.records) == 1)
+        self.assertEqual((result.status, len(result.records)), ("partial", 1))
+        self.assertEqual(self.codes(result), {"timeout"})
+        self.assertTrue(queued)
+        count = len(calls)
+        for args in queued[:]:
+            args[9](connection, object(), args[10])
+        self.assertIs(read.value, result)
+        self.assertEqual(len(calls), count)
+
+    def test_missing_property_excludes_only_its_account(self):
+        def missing(args, reply, _variant, error):
+            return error if args[1] == "/bad" and args[3] == "Get" else reply
+        result, *_ = self.collect(["/bad", "/good"], transform=missing,
+            remote_error="org.freedesktop.DBus.Error.UnknownProperty")
+        self.assertEqual([row.path for row in result.records], [self.current_path, "/good"])
+        self.assertEqual((result.status, self.codes(result)), ("partial", {"malformed"}))
+
+    def test_late_path_decoding_and_errors_cannot_publish_state(self):
+        original = provider.account_object_path
+        for late_call in (1, 2):
+            for malformed in (False, True):
+                with self.subTest(late_call=late_call, malformed=malformed):
+                    count = 0
+                    with mock.patch.object(provider.time, "monotonic", return_value=0) as clock:
+                        def decode(value):
+                            nonlocal count
+                            count += 1
+                            if count == late_call:
+                                clock.return_value = 4
+                                if malformed:
+                                    raise provider.SnapshotFailure("malformed", "late decode")
+                            return original(value)
+                        with mock.patch.object(provider, "account_object_path", side_effect=decode):
+                            result, read, calls, *_ = self.collect(["/cached"])
+                    self.assertEqual((result.status, self.codes(result)), ("partial", {"timeout"}))
+                    self.assertEqual(result.records, ())
+                    self.assertIsNone(result.current_path)
+                    self.assertLessEqual(len(calls), 2)
+                    self.assertEqual(len(read.selected), late_call - 1)
+
+    def test_late_property_decoding_and_errors_cannot_publish_a_row(self):
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed):
+                with mock.patch.object(provider.time, "monotonic", return_value=0) as clock:
+                    def late(args, reply, _variant, _error):
+                        if args[3] != "Get":
+                            return reply
+                        wrapped = mock.Mock(wraps=reply)
+                        inner = mock.Mock(wraps=reply.get_child_value(0).get_variant())
+                        child = mock.Mock()
+                        child.get_variant.return_value = inner
+                        wrapped.get_child_value.return_value = child
+                        def unpack():
+                            clock.return_value = 4
+                            if malformed:
+                                raise provider.SnapshotFailure("malformed", "late property")
+                            return "login"
+                        inner.unpack.side_effect = unpack
+                        return wrapped
+                    result, *_ = self.collect(transform=late)
+                self.assertEqual((result.records, self.codes(result)), ((), {"timeout"}))
+
+    def test_connection_deadline_and_unexpected_loop_exit_do_not_fake_success(self):
+        for expires in (False, True):
+            with self.subTest(expires=expires):
+                _unused, connection, gio, glib, _variant = RegionalReadTests.reader(self)
+                read = provider.AccountRead(gio, glib)
+                if expires:
+                    read.loop.run.side_effect = read.expire
+                result = read.run()
+                self.assertEqual(result.records, ())
+                self.assertEqual(self.codes(result), {"timeout" if expires else "internal"})
+                self.assertEqual(result.status, "partial" if expires else "unavailable")
+                connection.call.assert_not_called()
+                self.assertTrue(read.cancellable.cancel.called)
+
+    def test_real_account_reads_use_an_isolated_private_bus(self):
+        process = subprocess.Popen(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-account-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, 0, stderr.decode("utf-8", "replace"))
+            self.assertIn(b"Private-bus account reads: PASS", stdout)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+                process.communicate(timeout=3)
+
+
+class RegionalValidationTests(unittest.TestCase):
+    def malformed(self, function, *args):
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            function(*args)
+        self.assertEqual(caught.exception.code, "malformed")
+
+    def test_timezone_names_are_exact_bounded_ascii_paths(self):
+        for name in ("UTC", "America/Chicago", "Etc/GMT+5", "x" * 255):
+            self.assertEqual(provider.validate_timezone_name(name), name)
+        for name in (None, 1, "", "x" * 256, "/UTC", "UTC/", "A//B",
+                     ".", "..", "A/../B", "A/./B", "A\nB", "A\x7fB", "é"):
+            with self.subTest(name=name):
+                self.malformed(provider.validate_timezone_name, name)
+
+    def test_timezone_choices_preserve_order_and_reject_duplicates(self):
+        self.assertEqual(provider.validate_timezone_choices(["UTC", "Etc/UTC"]),
+                         ("UTC", "Etc/UTC"))
+        self.assertEqual(provider.validate_timezone_choices([]), ())
+        for values in ("UTC", {"UTC"}, ["UTC", "UTC"], ["UTC", None]):
+            self.malformed(provider.validate_timezone_choices, values)
+        self.assertEqual(len(provider.validate_timezone_choices(
+            [f"Zone/{index}" for index in range(2048)])), 2048)
+        self.malformed(provider.validate_timezone_choices,
+                       [f"Zone/{index}" for index in range(2049)])
+
+    def test_timezone_reply_byte_limit_is_inclusive(self):
+        values = [f"{index:04d}" + "x" * 124 for index in range(2048)]
+        self.assertEqual(sum(len(value) for value in values), 256 * 1024)
+        self.assertEqual(len(provider.validate_timezone_choices(values)), 2048)
+        values[-1] += "x"
+        self.malformed(provider.validate_timezone_choices, values)
+
+    def test_timezone_choice_requires_exact_fresh_membership(self):
+        self.assertEqual(provider.prepare_timezone_change("UTC", ["UTC"]), "UTC")
+        for choices in ([], ["Etc/UTC"], ["utc"]):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.prepare_timezone_change("UTC", choices)
+            self.assertEqual(caught.exception.code, "conflict")
+        self.malformed(provider.prepare_timezone_change, "UTC", ["UTC", "UTC"])
+
+    def test_locale_names_and_output_are_strict_and_not_normalized(self):
+        for name in ("C", "C.utf8", "en_US.utf8", "sr_RS@latin", "x" * 128):
+            self.assertEqual(provider.validate_locale_name(name), name)
+        for name in (None, "", "x" * 129, "en US", "C\t", "C\r", "C\n",
+                     "C\x00", "C\x7f", "é", "\ud800"):
+            self.malformed(provider.validate_locale_name, name)
+        self.assertEqual(provider.validate_locale_choices(b"C\nen_US.utf8\n"),
+                         ("C", "en_US.utf8"))
+        self.assertEqual(provider.validate_locale_choices(b"C"), ("C",))
+        self.assertEqual(provider.validate_locale_choices(b""), ())
+        for output in ("C\n", b"\n", b"C\n\n", b"C\r\n", b"C\nC\n",
+                       b"C\n\xff", b"x" * (2 * 1024 * 1024 + 1)):
+            self.malformed(provider.validate_locale_choices, output)
+
+    def test_locale_record_count_and_name_limits_are_inclusive(self):
+        names = [f"{index:04d}" + "x" * 124 for index in range(4096)]
+        self.assertEqual(provider.validate_locale_choices(
+            ("\n".join(names) + "\n").encode("ascii")), tuple(names))
+        self.malformed(provider.validate_locale_choices,
+                       ("\n".join(names) + "\nextra\n").encode("ascii"))
+
+    def test_locale_configuration_preserves_and_orders_all_allowlisted_keys(self):
+        values = [f"{key}=C" for key in reversed(provider.REGIONAL_LOCALE_KEYS)]
+        parsed = provider.parse_locale_configuration(values)
+        self.assertEqual(parsed.assignments,
+                         tuple(f"{key}=C" for key in provider.REGIONAL_LOCALE_KEYS))
+        self.assertEqual(parsed.lang, "C")
+        self.assertEqual(parsed.detail, ", ".join(parsed.assignments[1:]))
+        empty = provider.parse_locale_configuration(["LC_TIME=", "LANGUAGE="])
+        self.assertEqual(empty.lang, "unknown")
+        self.assertEqual(empty.detail, "none")
+        self.assertEqual(empty.assignments, ("LANGUAGE=", "LC_TIME="))
+        self.assertEqual(provider.parse_locale_configuration([]).assignments, ())
+        self.assertEqual(provider.parse_locale_configuration(["LANG="]).lang, "")
+
+    def test_locale_configuration_rejects_malformed_arrays_without_sanitizing(self):
+        for values in ("LANG=C", {"LANG=C"}, [None], ["LANG"], ["=C"],
+                       ["LC_ALL=C"], ["PATH=/tmp"], ["LANG=C", "LANG=C"],
+                       ["LANG=C\n"], ["LANG=\x00"], ["LANG=\x85"],
+                       ["LANG=C\u2028x"], ["LANG=C\u2029x"], ["LANG=C\u202ex"],
+                       ["LANG=\ud800"], ["LANG=C"] * 15):
+            with self.subTest(values=values):
+                self.malformed(provider.parse_locale_configuration, values)
+
+    def test_locale_assignment_and_detail_utf8_limits_are_inclusive(self):
+        # LANG is not an override, so its assignment limit can be tested alone.
+        self.assertEqual(len(provider.parse_locale_configuration(
+            ["LANG=" + "é" * 253 + "x"]).lang.encode("utf-8")), 507)
+        self.malformed(provider.parse_locale_configuration, ["LANG=" + "é" * 254])
+        values = ["LANG=C", "LC_TIME=" + "é" * 250, "LC_NUMERIC=x"]
+        self.malformed(provider.parse_locale_configuration, values)
+        values = ["LC_TIME=" + "x" * 493, "LC_NAME=x"]
+        self.assertEqual(len(provider.parse_locale_configuration(values).detail), 512)
+        values[-1] += "x"
+        self.malformed(provider.parse_locale_configuration, values)
+
+    def test_locale_change_requires_exact_fresh_choice_and_preserves_overrides(self):
+        before = ["LC_TIME=de_DE.utf8", "LANG=en_US.utf8", "LANGUAGE=de:en"]
+        result = provider.prepare_locale_change(before, "LANG=fr_FR.utf8",
+                                                b"C\nfr_FR.utf8\n")
+        self.assertEqual(result.assignments,
+                         ("LANG=fr_FR.utf8", "LANGUAGE=de:en", "LC_TIME=de_DE.utf8"))
+        self.assertEqual(before[1], "LANG=en_US.utf8")
+        for argument in ("fr_FR.utf8", "LC_TIME=fr_FR.utf8", "LANG=", None):
+            self.malformed(provider.prepare_locale_change, before, argument,
+                           b"fr_FR.utf8\n")
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            provider.prepare_locale_change(before, "LANG=fr_FR.utf8", b"C\n")
+        self.assertEqual(caught.exception.code, "conflict")
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.prepare_locale_change(before, "LANG=fr_FR.UTF-8", b"fr_FR.utf8\n")
+
+    def test_effective_locale_comparison_preserves_overrides_not_array_spelling(self):
+        expected = ["LANG=C", "LC_TIME=C", "LC_NUMERIC=de_DE.utf8", "LANGUAGE=de:en"]
+        self.assertTrue(provider.locale_change_matches(expected,
+            ["LANGUAGE=de:en", "LC_NUMERIC=de_DE.utf8", "LANG=C"]))
+        for observed in (["LANG=C", "LANGUAGE=de:en"],
+                         ["LANG=C", "LC_NUMERIC=de_DE.utf8"],
+                         ["LANG=C", "LC_NUMERIC=de_DE.utf8", "LANGUAGE=en:de"],
+                         ["LANG=C", "LC_NUMERIC=de_DE.utf8", "LANGUAGE=de:en", "LC_TIME=fr"],
+                         ["LANG=fr", "LC_NUMERIC=de_DE.utf8", "LANGUAGE=de:en"]):
+            self.assertFalse(provider.locale_change_matches(expected, observed))
+        self.assertTrue(provider.locale_change_matches(["LANG=C", "LC_TIME="], ["LANG=C"]))
+        self.assertTrue(provider.locale_change_matches(["LANG=C"], ["LANG=C", "LANGUAGE=en"]))
+        self.assertFalse(provider.locale_change_matches(["LANG=C", "LANGUAGE="],
+                                                        ["LANG=C", "LANGUAGE=en"]))
+        self.assertFalse(provider.locale_change_matches(["LANG=C", "LANGUAGE="],
+                                                        ["LANG=C"]))
+        self.malformed(provider.locale_change_matches, ["LANG=C"], ["LC_ALL=C"])
+
+    def test_locale_confirmation_rejects_known_language_preservation_loss(self):
+        for language in ("", "C"):
+            before = provider.parse_locale_configuration(["LANG=en_US.utf8", "LANGUAGE=" + language])
+            self.assertIn("LANGUAGE=" + language, before.assignments)
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.make_regional_preview("locale-set", "LANG=C", before, ["C"])
+            self.assertEqual(caught.exception.code, "conflict")
+            self.assertIn("cannot preserve", caught.exception.detail)
+        for values in (["LANG=en_US.utf8"], ["LANG=en_US.utf8", "LANGUAGE=de:en"]):
+            self.assertEqual(provider.make_regional_preview("locale-set", "LANG=C",
+                provider.parse_locale_configuration(values), ["C"]).target, "C")
+
+    def test_locale_service_grammar_does_not_narrow_readable_state_or_drop_overrides(self):
+        for value in ("C", "POSIX", "en_US.UTF-8", "sr_RS@latin", "x" * 127):
+            provider.require_locale_service_arguments(provider.parse_locale_configuration(["LANG=" + value]))
+        for key, value in (("LANGUAGE", "de:en"), ("LANGUAGE", "français"),
+                           ("LC_TIME", ""), ("LC_TIME", "."), ("LC_TIME", ".."),
+                           ("LC_TIME", "a/b"), ("LANG", "x" * 128), ("LC_NUMERIC", "C+")):
+            state = provider.parse_locale_configuration([key + "=" + value])
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.require_locale_service_arguments(state)
+            self.assertEqual(caught.exception.code, "unsupported")
+            self.assertEqual(state.assignments, (key + "=" + value,))
+
+
+class RegionalMutationTests(unittest.TestCase):
+    def client(self, action="timezone-set", argument="Etc/UTC"):
+        from gi.repository import Gio, GLib
+        self.GLib = GLib
+        self.clock = 1.0
+        self.methods = []
+        self.events = []
+        self.owner = ":1.42"
+        self.time_state = provider.RegionalTimeState("UTC", True, False, True)
+        self.locale_state = provider.parse_locale_configuration(["LANG=C", "LANGUAGE=C", "LC_TIME=C"])
+        self.before_request = lambda _method: None
+        self.before_hook = lambda: None
+        self.after_hook = lambda: None
+        self.replies = {}
+        self.context = mock.Mock()
+        self.context.pending.return_value = False
+        loop = mock.Mock()
+        loop.get_context.return_value = self.context
+        glib = types.SimpleNamespace(Error=GLib.Error, Variant=GLib.Variant,
+            VariantType=GLib.VariantType, MainLoop=mock.Mock(return_value=loop),
+            timeout_add=mock.Mock(side_effect=range(17, 100)), source_remove=mock.Mock(), SOURCE_REMOVE=False)
+        gio = mock.Mock()
+        gio.BusType, gio.DBusCallFlags, gio.DBusSignalFlags = Gio.BusType, Gio.DBusCallFlags, Gio.DBusSignalFlags
+        gio.dbus_is_unique_name = Gio.dbus_is_unique_name
+        gio.dbus_error_get_remote_error = Gio.dbus_error_get_remote_error
+        gio.io_error_quark = Gio.io_error_quark
+        gio.IOErrorEnum = Gio.IOErrorEnum
+        self.connection = mock.Mock()
+        gio.bus_get_finish.return_value = self.connection
+        self.connection.signal_subscribe.side_effect = range(1, 10)
+        def finish(result):
+            if isinstance(result, Exception):
+                raise result
+            return result
+        self.connection.call_finish.side_effect = finish
+        state = self.locale_state if action == "locale-set" else self.time_state
+        choices = ("C", "en_US.utf8") if action == "locale-set" else ("UTC", "Etc/UTC")
+        preview = provider.make_regional_preview(action, argument, state, choices)
+
+        def before(preflight):
+            self.events.append(("authorizing", preflight))
+            self.before_hook()
+
+        def after():
+            self.events.append(("running", None))
+            self.after_hook()
+
+        client = provider.RegionalMutation(action, argument, preview.generation, before, after, gio, glib)
+        self.current = client
+
+        def call(name, path, interface, method, args, reply_type, flags, timeout, cancellable, callback, data):
+            self.methods.append((name, path, interface, method, None if args is None else args.unpack(), flags, timeout))
+            if method == "RemoveMatch":
+                return
+            self.before_request(method)
+            if method in self.replies:
+                result = self.replies[method]
+            elif method == "GetNameOwner":
+                result = GLib.Variant("(s)", (self.owner,))
+            elif method == "GetAll":
+                values = {"Timezone": GLib.Variant("s", self.time_state.timezone),
+                          "CanNTP": GLib.Variant("b", self.time_state.can_ntp),
+                          "NTP": GLib.Variant("b", self.time_state.ntp_enabled),
+                          "NTPSynchronized": GLib.Variant("b", self.time_state.ntp_synchronized)}
+                result = GLib.Variant("(a{sv})", (values,))
+            elif method == "Get":
+                result = GLib.Variant("(v)", (GLib.Variant("as", self.locale_state.assignments),))
+            elif method == "ListTimezones":
+                result = GLib.Variant("(as)", (["UTC", "Etc/UTC"],))
+            else:
+                if method == "SetTimezone":
+                    self.time_state = replace(self.time_state, timezone=args.unpack()[0])
+                elif method == "SetNTP":
+                    self.time_state = replace(self.time_state, ntp_enabled=args.unpack()[0])
+                elif method == "SetLocale":
+                    self.locale_state = provider.parse_locale_configuration(args.unpack()[0])
+                result = GLib.Variant("()", ())
+            if result is not None:
+                callback(self.connection, result, data)
+        self.connection.call.side_effect = call
+        gio.bus_get.side_effect = lambda *_args: client.connected(None, object(), None)
+        self.gio, self.glib = gio, glib
+        return client
+
+    def run_client(self, client, *, interruptible=False):
+        with mock.patch.object(provider, "read_fedora_identity", return_value={"ID": "fedora"}), \
+                mock.patch.object(provider, "read_locale_choices", return_value=("C", "en_US.utf8")), \
+                mock.patch.object(provider.time, "monotonic", side_effect=lambda: self.clock):
+            if interruptible:
+                with contextlib.ExitStack() as retained:
+                    return provider.run_interruptible_regional(client, retained)
+            return client.run()
+
+    def failure(self, client, code):
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            self.run_client(client)
+        self.assertEqual(caught.exception.code, code)
+        return caught.exception
+
+    def mutations(self):
+        return [method for method in self.methods if method[3].startswith("Set")]
+
+    def notify(self, values, invalidated=(), sender=":1.42"):
+        client = self.current
+        args = self.GLib.Variant("(sa{sv}as)", (client.name, values, invalidated))
+        client.properties_changed(None, sender, client.path, provider.PROPERTIES_INTERFACE,
+                                  "PropertiesChanged", args, None)
+
+    def test_fixed_methods_full_arguments_and_acknowledged_subscription_order(self):
+        for action, argument, method, signature_args in (
+            ("timezone-set", "Etc/UTC", "SetTimezone", ("Etc/UTC", True)),
+            ("ntp-set", "enabled", "SetNTP", (True, True)),
+            ("ntp-set", "disabled", "SetNTP", (False, True)),
+            ("locale-set", "LANG=en_US.utf8", "SetLocale",
+             (["LANG=en_US.utf8", "LANGUAGE=C", "LC_TIME=C"], True)),
+        ):
+            with self.subTest(action=action, argument=argument):
+                client = self.client(action, argument)
+                self.assertIsNotNone(self.run_client(client))
+                calls = self.mutations()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][:6], (":1.42", client.path, client.name, method,
+                    signature_args, self.gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION))
+                self.assertEqual(calls[0][6], 60000)
+                methods = [row[3] for row in self.methods]
+                final_read = methods.index("AddMatch") + 3
+                self.assertEqual(methods[final_read], "ListTimezones" if action == "timezone-set" else
+                                 "Get" if action == "locale-set" else "GetAll")
+                self.assertEqual([event[0] for event in self.events], ["authorizing", "running"])
+                self.assertTrue(client.sent and client.acknowledged and client.done)
+                self.assertEqual(len(client.subscriptions), 2)
+                self.assertEqual(self.connection.signal_unsubscribe.call_count, 2)
+                self.assertEqual(methods[-2:], ["RemoveMatch", "RemoveMatch"])
+                self.connection.close_sync.assert_not_called()
+                self.glib.timeout_add.assert_any_call(60000, client.expire)
+                self.assertEqual(provider.PROTOCOL_MINOR, 0)
+                with self.assertRaises(RuntimeError):
+                    self.run_client(client)
+
+    def test_validation_and_fedora_rejection_precede_connection_or_admission(self):
+        client = self.client()
+        for action, argument, generation in (("SetTime", "UTC", "a" * 64),
+                                            ("timezone-set", "../UTC", "a" * 64),
+                                            ("ntp-set", "true", "a" * 64),
+                                            ("locale-set", "LC_TIME=C", "a" * 64),
+                                            ("timezone-set", "UTC", "A" * 64)):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.RegionalMutation(action, argument, generation, mock.Mock(), mock.Mock(), self.gio, self.glib)
+        with mock.patch.object(provider, "read_fedora_identity", side_effect=provider.SnapshotFailure("unsupported", "Not Fedora")):
+            with self.assertRaises(provider.SnapshotFailure):
+                client.run()
+        self.gio.bus_get.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_fresh_state_and_catalog_reject_stale_generation_before_admission(self):
+        for change in ("state", "catalog", "language"):
+            client = self.client("locale-set", "LANG=en_US.utf8") if change == "language" else self.client()
+            if change == "state":
+                self.time_state = replace(self.time_state, timezone="Etc/UTC")
+            elif change == "catalog":
+                self.replies["ListTimezones"] = self.GLib.Variant("(as)", (["UTC"],))
+            else:
+                self.locale_state = provider.parse_locale_configuration(["LANG=C", "LANGUAGE="])
+            self.failure(client, "conflict")
+            self.assertFalse(client.sent)
+            self.assertEqual(self.events, [])
+            self.assertEqual(self.mutations(), [])
+
+    def test_pre_send_configuration_events_and_journal_delay_prevent_dispatch(self):
+        for scenario in ("changed", "invalidated", "deadline", "flood", "checkpoint"):
+            client = self.client()
+            def before():
+                if scenario == "changed":
+                    self.notify({"Timezone": self.GLib.Variant("s", "Etc/UTC")})
+                elif scenario == "invalidated":
+                    self.notify({}, ["Timezone"])
+                elif scenario == "deadline":
+                    self.clock = 12
+                elif scenario == "flood":
+                    self.context.pending.return_value = True
+                else:
+                    raise OSError("journal sync failed")
+            self.before_hook = before
+            self.failure(client, {"deadline": "timeout", "checkpoint": "interrupted"}.get(scenario, "conflict"))
+            self.assertEqual(self.mutations(), [])
+            self.assertFalse(client.sent)
+            self.assertLessEqual(self.context.iteration.call_count, provider.REGIONAL_CALLBACK_LIMIT)
+            if scenario == "checkpoint":
+                self.assertIsInstance(client.hook_error, OSError)
+
+    def test_stop_after_final_drain_prevents_mutating_request(self):
+        for action, argument in (("timezone-set", "Etc/UTC"), ("ntp-set", "enabled"),
+                                 ("locale-set", "LANG=en_US.utf8")):
+            for stage in ("arguments", "timer", "request"):
+                for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                    with self.subTest(action=action, stage=stage, signum=signum):
+                        client = self.client(action, argument)
+                        self.glib.idle_add = mock.Mock(return_value=1000)
+                        self.glib.PRIORITY_HIGH = -100
+                        variant, timer = self.glib.Variant, self.glib.timeout_add.side_effect
+                        variant_type = self.glib.VariantType
+                        def arguments(signature, values):
+                            if stage == "arguments" and signature in ("(sb)", "(bb)", "(asb)"):
+                                signal.raise_signal(signum)
+                            return variant(signature, values)
+                        def arm(milliseconds, callback):
+                            if stage == "timer" and milliseconds == 60000:
+                                signal.raise_signal(signum)
+                            return next(timer)
+                        def expected_type(signature):
+                            if stage == "request" and client.sent:
+                                signal.raise_signal(signum)
+                            return variant_type.new(signature)
+                        self.glib.Variant = arguments
+                        self.glib.VariantType = types.SimpleNamespace(new=expected_type)
+                        self.glib.timeout_add.side_effect = arm
+                        with self.assertRaises(provider.RegionalCommandInterrupted):
+                            self.run_client(client, interruptible=True)
+                        self.assertEqual(self.mutations(), [])
+                        # Once handoff has begun, a stopped request remains
+                        # conservatively unconfirmed even if the bus was not called.
+                        self.assertEqual(client.sent, stage == "request")
+                        self.assertEqual([event[0] for event in self.events], ["authorizing"])
+
+    def test_matching_notifications_are_accepted_but_conflict_history_is_retained(self):
+        for conflict in (False, True):
+            client = self.client()
+            def after():
+                if conflict:
+                    self.notify({"Timezone": self.GLib.Variant("s", "UTC")})
+                self.notify({"Timezone": self.GLib.Variant("s", "Etc/UTC")})
+            self.after_hook = after
+            if conflict:
+                self.failure(client, "conflict")
+            else:
+                self.assertEqual(self.run_client(client).timezone, "Etc/UTC")
+            self.assertEqual(len(self.mutations()), 1)
+
+    def test_irrelevant_signals_do_not_invalidate_or_extend_the_deadline(self):
+        client = self.client("ntp-set", "enabled")
+        def before():
+            self.notify({"NTPSynchronized": self.GLib.Variant("b", False)})
+            self.notify({"NTP": self.GLib.Variant("b", True)}, sender=":1.99")
+        self.before_hook = before
+        self.after_hook = lambda: self.notify({"NTPSynchronized": self.GLib.Variant("b", True)})
+        self.assertTrue(self.run_client(client).ntp_enabled)
+        self.assertEqual(self.glib.timeout_add.call_count, 2)
+
+    def test_invalidated_malformed_and_mismatched_final_state_cannot_report_success(self):
+        for scenario in ("invalidated", "signature", "duplicate", "final"):
+            client = self.client()
+            def after():
+                if scenario == "invalidated":
+                    self.notify({}, ["Timezone"])
+                elif scenario == "signature":
+                    self.notify({"Timezone": self.GLib.Variant("b", True)})
+                elif scenario == "duplicate":
+                    value = self.GLib.Variant.parse(None,
+                        "('org.freedesktop.timedate1', {'Timezone': <'UTC'>, 'Timezone': <'Etc/UTC'>}, @as [])", None, None)
+                    client.properties_changed(None, client.owner, client.path, provider.PROPERTIES_INTERFACE,
+                        "PropertiesChanged", value, None)
+                else:
+                    self.time_state = replace(self.time_state, timezone="UTC")
+            self.after_hook = after
+            self.failure(client, "conflict")
+            self.assertTrue(client.sent and client.acknowledged)
+
+    def test_effective_locale_notifications_allow_lc_elision_but_not_language_loss(self):
+        for lost in (False, True):
+            client = self.client("locale-set", "LANG=en_US.utf8")
+            self.locale_state = provider.parse_locale_configuration(["LANG=C", "LANGUAGE=C", "LC_TIME=en_US.utf8"])
+            client.generation = provider.make_regional_preview(client.action, client.argument,
+                self.locale_state, ["en_US.utf8"]).generation
+            def after():
+                values = ["LANG=en_US.utf8"] + ([] if lost else ["LANGUAGE=C"])
+                self.locale_state = provider.parse_locale_configuration(values)
+                self.notify({"Locale": self.GLib.Variant("as", values)})
+            self.after_hook = after
+            if lost:
+                self.failure(client, "conflict")
+            else:
+                self.assertEqual(self.run_client(client).lang, "en_US.utf8")
+
+    def test_owner_changes_before_and_after_dispatch_never_retarget_or_retry(self):
+        for after_dispatch in (False, True):
+            client = self.client()
+            def changed():
+                client.owner_changed(None, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "NameOwnerChanged", self.GLib.Variant("(sss)",
+                        (client.name, client.owner, ":1.99")), None)
+            if after_dispatch:
+                self.after_hook = changed
+            else:
+                self.before_hook = changed
+            self.failure(client, "interrupted" if after_dispatch else "conflict")
+            self.assertEqual(len(self.mutations()), int(after_dispatch))
+            self.assertTrue(all(row[0] == ":1.42" for row in self.mutations()))
+        client = self.client()
+        self.after_hook = lambda: setattr(self, "owner", ":1.99")
+        self.failure(client, "conflict")
+
+    def test_unsupported_preserved_locale_values_reject_before_admission(self):
+        for assignment in ("LANGUAGE=de:en", "LANGUAGE=français", "LC_TIME=", "LC_TIME=" + "x" * 128):
+            client = self.client("locale-set", "LANG=en_US.utf8")
+            self.locale_state = provider.parse_locale_configuration(["LANG=C", assignment])
+            client.generation = provider.make_regional_preview(client.action, client.argument,
+                self.locale_state, ["en_US.utf8"]).generation
+            before = self.locale_state.assignments
+            self.failure(client, "unsupported")
+            self.assertEqual(self.locale_state.assignments, before)
+            self.assertEqual(self.events, [])
+            self.assertEqual(self.mutations(), [])
+            self.assertFalse(client.sent)
+
+    def test_aggregate_deadline_covers_reply_verification_and_discards_late_callbacks(self):
+        for stage in ("reply", "verify", "final-owner"):
+            client = self.client()
+            def delay(method):
+                if ((stage == "reply" and method == "SetTimezone")
+                    or (stage == "verify" and method == "GetAll" and client.acknowledged)
+                    or (stage == "final-owner" and method == "GetNameOwner" and client.acknowledged)):
+                    self.clock = 61
+            self.before_request = delay
+            error = self.failure(client, "timeout")
+            self.assertIn("outcome is unknown", error.detail)
+            self.assertTrue(client.sent)
+            self.assertEqual(client.deadline, 61)
+            self.assertIsNone(client.value)
+            before = list(self.methods)
+            client.connected(None, object(), None)
+            client.properties_changed(None, client.owner, client.path, "", "", None, None)
+            self.assertEqual(before, self.methods)
+            self.assertEqual(len(self.mutations()), 1)
+
+    def test_post_reply_checkpoint_failure_cannot_publish_success(self):
+        client = self.client()
+        def fail():
+            raise OSError("journal storage unavailable")
+        self.after_hook = fail
+        self.failure(client, "interrupted")
+        self.assertTrue(client.sent and client.acknowledged)
+        self.assertIsInstance(client.hook_error, OSError)
+        self.assertIsNone(client.value)
+        self.assertEqual(len(self.mutations()), 1)
+
+    def test_rejected_matches_and_typed_method_errors_never_remove_unowned_rules(self):
+        from gi.repository import Gio
+        for method, remote, expected in (
+            ("AddMatch", "AccessDenied", "permission-denied"),
+            ("SetTimezone", "AccessDenied", "permission-denied"),
+            ("SetTimezone", "InteractiveAuthorizationRequired", "permission-denied"),
+            ("SetTimezone", "InvalidArgs", "malformed"),
+            ("SetTimezone", "NoReply", "timeout"),
+        ):
+            client = self.client()
+            self.replies[method] = Gio.DBusError.new_for_dbus_error(
+                "org.freedesktop.DBus.Error." + remote, "fixture error")
+            failure = self.failure(client, expected)
+            if remote == "NoReply":
+                self.assertIn("outcome is unknown", failure.detail)
+            self.assertEqual(len(self.mutations()), int(method.startswith("Set")))
+            self.assertFalse(client.acknowledged)
+            removed = [row for row in self.methods if row[3] == "RemoveMatch"]
+            self.assertEqual(len(removed), 0 if method == "AddMatch" else 2)
+
+    def test_late_match_acknowledgment_only_cleans_up_and_never_resumes(self):
+        client = self.client()
+        self.replies["AddMatch"] = None
+        client.loop.run.side_effect = client.expire
+        self.failure(client, "timeout")
+        call = [call for call in self.connection.call.call_args_list if call.args[3] == "AddMatch"][0]
+        self.assertEqual([row[3] for row in self.methods].count("RemoveMatch"), 0)
+        callback, data = call.args[-2:]
+        callback(self.connection, self.GLib.Variant("()", ()), data)
+        self.assertEqual([row[3] for row in self.methods].count("RemoveMatch"), 1)
+        self.assertEqual(self.events, [])
+        self.assertFalse(client.sent)
+        self.assertEqual(self.mutations(), [])
+
+    def test_local_transport_failure_after_dispatch_is_unknown_not_rejection(self):
+        from gi.repository import Gio, GLib
+        client = self.client()
+        self.replies["SetTimezone"] = GLib.Error.new_literal(
+            Gio.io_error_quark(), "fixture connection closed", Gio.IOErrorEnum.CLOSED)
+        failure = self.failure(client, "interrupted")
+        self.assertIn("outcome is unknown", failure.detail)
+        self.assertTrue(client.sent)
+        self.assertFalse(client.acknowledged)
+        self.assertEqual(len(self.mutations()), 1)
+
+    def test_queued_confirmation_change_is_drained_before_dispatch(self):
+        client = self.client()
+        def before():
+            self.context.pending.side_effect = [True, False]
+            self.context.iteration.side_effect = lambda _block: self.notify(
+                {"Timezone": self.GLib.Variant("s", "UTC")})
+        self.before_hook = before
+        self.failure(client, "conflict")
+        self.context.iteration.assert_called_once_with(False)
+        self.assertEqual(self.mutations(), [])
+
+    def test_private_bus_fixed_execution_and_failure_paths(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-regional-mutation-bus.py"), str(PROVIDER_PATH)],
+            capture_output=True, text=True, timeout=90, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Private-bus regional mutations: PASS", result.stdout)
+
+
+class RegionalReadTests(unittest.TestCase):
+    def reader(self, kind="time-state"):
+        from gi.repository import Gio, GLib
+        loop, cancellable, connection = mock.Mock(), mock.Mock(), mock.Mock()
+        glib = types.SimpleNamespace(Error=GLib.Error, Variant=GLib.Variant,
+            VariantType=GLib.VariantType, MainLoop=mock.Mock(return_value=loop),
+            timeout_add=mock.Mock(return_value=17), source_remove=mock.Mock(),
+            SOURCE_REMOVE=False)
+        gio = mock.Mock()
+        gio.Cancellable.return_value = cancellable
+        gio.bus_get_finish.return_value = connection
+        gio.dbus_error_get_remote_error.return_value = None
+        gio.io_error_quark.return_value = Gio.io_error_quark()
+        gio.IOErrorEnum.TIMED_OUT = Gio.IOErrorEnum.TIMED_OUT
+        read = provider.RegionalRead(kind, gio, glib)
+        return read, connection, gio, glib, GLib
+
+    def time_reply(self, glib, **overrides):
+        values = {"Timezone": glib.Variant("s", "UTC"),
+                  "CanNTP": glib.Variant("b", True),
+                  "NTP": glib.Variant("b", False),
+                  "NTPSynchronized": glib.Variant("b", True)}
+        values.update(overrides)
+        return glib.Variant("(a{sv})", (values,))
+
+    def deliver(self, read, connection):
+        read.connected(None, object(), None)
+        read.replied(connection, object(), None)
+
+    def test_only_three_fixed_read_requests_are_sent(self):
+        expected = {
+            "time-state": ("org.freedesktop.timedate1", "/org/freedesktop/timedate1",
+                           "org.freedesktop.DBus.Properties", "GetAll"),
+            "locale-state": ("org.freedesktop.locale1", "/org/freedesktop/locale1",
+                             "org.freedesktop.DBus.Properties", "Get"),
+            "timezone-choices": ("org.freedesktop.timedate1", "/org/freedesktop/timedate1",
+                                 "org.freedesktop.timedate1", "ListTimezones"),
+        }
+        for kind, target in expected.items():
+            read, connection, gio, glib, variant = self.reader(kind)
+            connection.call_finish.return_value = {
+                "time-state": self.time_reply(variant),
+                "locale-state": variant.Variant("(v)", (variant.Variant("as", ["LANG=C"]),)),
+                "timezone-choices": variant.Variant("(as)", (["UTC"],)),
+            }[kind]
+            read.loop.run.side_effect = lambda: self.deliver(read, connection)
+            result = read.run()
+            self.assertIsNotNone(result)
+            self.assertEqual(connection.call.call_args.args[:4], target)
+            self.assertEqual(connection.call.call_args.args[6], gio.DBusCallFlags.NONE)
+            self.assertGreater(connection.call.call_args.args[7], 0)
+            self.assertLessEqual(connection.call.call_args.args[7], 10000)
+            self.assertEqual(gio.bus_get.call_args.args[0], gio.BusType.SYSTEM)
+            glib.source_remove.assert_called_once_with(17)
+            self.assertTrue(read.cancellable.cancel.called)
+            connection.close_sync.assert_not_called()
+            if kind == "time-state":
+                self.assertEqual(result, provider.RegionalTimeState("UTC", True, False, True))
+            elif kind == "locale-state":
+                self.assertEqual(result.assignments, ("LANG=C",))
+            else:
+                self.assertEqual(result, ("UTC",))
+
+    def test_unknown_read_is_rejected_before_connecting(self):
+        for kind in ("SetNTP", "SetLocale", "Get", "", None, []):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.RegionalRead(kind, mock.Mock(), mock.Mock())
+
+    def test_time_property_types_and_required_fields_are_strict(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for name in ("Timezone", "CanNTP", "NTP", "NTPSynchronized"):
+            reply = self.time_reply(variant, **{name: variant.Variant("u", 1)})
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.decode_regional_reply("time-state", reply)
+            self.assertEqual(caught.exception.code, "malformed")
+        for reply in (variant.Variant("(a{sv})", ({},)),
+                      variant.Variant("(s)", ("UTC",)),
+                      self.time_reply(variant, Timezone=variant.Variant("s", "../UTC"))):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.decode_regional_reply("time-state", reply)
+        result = provider.decode_regional_reply("time-state", self.time_reply(
+            variant, FutureProperty=variant.Variant("s", "ignored")))
+        self.assertEqual(result.timezone, "UTC")
+
+    def test_locale_and_timezone_replies_use_existing_bounds(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        for kind, reply in (
+            ("locale-state", variant.Variant("(v)", (variant.Variant("s", "LANG=C"),))),
+            ("locale-state", variant.Variant("(v)", (variant.Variant("as", ["LC_ALL=C"]),))),
+            ("timezone-choices", variant.Variant("(as)", (["UTC", "UTC"],))),
+            ("timezone-choices", variant.Variant("(as)", (["x" * 256],))),
+            ("timezone-choices", variant.Variant("(as)", (["UTC"] * 2049,))),
+            ("locale-state", variant.Variant("(v)", (variant.Variant("as", ["LANG=C"] * 15),))),
+            ("locale-state", variant.Variant("(v)", (variant.Variant("as", ["LANG=" + "x" * 508]),))),
+        ):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.decode_regional_reply(kind, reply)
+
+    def test_serialized_string_array_bounds_count_utf8_before_unpacking(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        self.assertEqual(provider.regional_string_array(variant.Variant("as", ["é"]),
+                                                       1, 2, 2), ("é",))
+        for field_bytes, total_bytes, separators in ((1, 2, False), (2, 1, False), (2, 2, True)):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.regional_string_array(variant.Variant("as", ["é"]),
+                    1, field_bytes, total_bytes, separators=separators)
+        oversized = mock.Mock()
+        oversized.get_type_string.return_value = "as"
+        oversized.n_children.return_value = 1
+        child = oversized.get_child_value.return_value
+        child.get_size.return_value = 1000
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.regional_string_array(oversized, 1, 10, 10)
+        child.unpack.assert_not_called()
+
+    def test_oversized_or_duplicate_timedate_properties_are_rejected(self):
+        _read, _connection, _gio, _glib, variant = self.reader()
+        extra = {f"Extra{index}": variant.Variant("b", True) for index in range(61)}
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.decode_regional_reply("time-state", self.time_reply(variant, **extra))
+        duplicate = variant.Variant.parse(None,
+            "({'Timezone': <'UTC'>, 'Timezone': <'Etc/UTC'>},)", None, None)
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.decode_regional_reply("time-state", duplicate)
+
+    def test_deadline_covers_connection_and_ignores_late_callbacks(self):
+        read, connection, gio, glib, _variant = self.reader()
+        read.loop.run.side_effect = read.expire
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "timeout")
+        read.connected(None, object(), None)
+        read.replied(connection, object(), None)
+        gio.bus_get_finish.assert_not_called()
+        connection.call_finish.assert_not_called()
+        connection.call.assert_not_called()
+        glib.source_remove.assert_not_called()
+
+    def test_deadline_covers_method_and_cannot_publish_a_late_reply(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        connection.call_finish.return_value = self.time_reply(variant)
+        def during_loop():
+            read.connected(None, object(), None)
+            read.expire()
+            read.replied(connection, object(), None)
+        read.loop.run.side_effect = during_loop
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "timeout")
+        connection.call.assert_called_once()
+        connection.call_finish.assert_not_called()
+        self.assertIsNone(read.value)
+
+    def test_elapsed_deadline_before_connection_dispatch_is_rejected(self):
+        read, connection, gio, _glib, _variant = self.reader()
+        read.deadline = 10
+        with mock.patch.object(provider.time, "monotonic", return_value=10):
+            read.connected(None, object(), None)
+        self.assertEqual(read.failure.code, "timeout")
+        gio.bus_get_finish.assert_not_called()
+        connection.call.assert_not_called()
+
+    def test_decoding_that_crosses_deadline_cannot_publish_success(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        read.deadline = 10
+        connection.call_finish.return_value = self.time_reply(variant)
+        with mock.patch.object(provider.time, "monotonic", side_effect=[9, 10]):
+            read.replied(connection, object(), None)
+        self.assertEqual(read.failure.code, "timeout")
+        self.assertIsNone(read.value)
+
+    def test_malformed_decode_after_deadline_still_reports_timeout(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        read.deadline = 10
+        connection.call_finish.return_value = variant.Variant("(s)", ("wrong",))
+        with mock.patch.object(provider.time, "monotonic", side_effect=[9, 10]):
+            read.replied(connection, object(), None)
+        self.assertEqual(read.failure.code, "timeout")
+
+    def test_synchronous_callback_completion_does_not_enter_a_dead_loop(self):
+        read, connection, gio, _glib, variant = self.reader()
+        connection.call_finish.return_value = self.time_reply(variant)
+        gio.bus_get.side_effect = lambda *_args: self.deliver(read, connection)
+        self.assertEqual(read.run().timezone, "UTC")
+        read.loop.run.assert_not_called()
+
+    def test_typed_bus_failures_preserve_capability_scope(self):
+        names = {
+            "ServiceUnknown": ("missing-provider", "unavailable"),
+            "AccessDenied": ("permission-denied", "restricted"),
+            "InvalidArgs": ("malformed", "partial"),
+            "UnknownMethod": ("unsupported", "unsupported"),
+            "NoReply": ("timeout", "unavailable"),
+            "Unexpected": ("internal", "unavailable"),
+        }
+        for name, expected in names.items():
+            read, connection, gio, _glib, variant = self.reader()
+            gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error." + name
+            connection.call_finish.side_effect = variant.Error("fixture failure")
+            read.loop.run.side_effect = lambda: self.deliver(read, connection)
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                read.run()
+            self.assertEqual((caught.exception.code, caught.exception.status), expected)
+
+    def test_bus_connect_failure_and_local_timeout_are_typed(self):
+        from gi.repository import Gio
+        read, connection, gio, _glib, variant = self.reader()
+        gio.bus_get_finish.side_effect = variant.Error.new_literal(
+            Gio.io_error_quark(), "fixture timeout", Gio.IOErrorEnum.TIMED_OUT)
+        read.loop.run.side_effect = lambda: read.connected(None, object(), None)
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "timeout")
+        connection.call.assert_not_called()
+
+    def test_single_use_and_unexpected_loop_exit_cannot_fake_a_result(self):
+        read, _connection, gio, glib, _variant = self.reader()
+        with self.assertRaises(provider.SnapshotFailure) as caught:
+            read.run()
+        self.assertEqual(caught.exception.code, "internal")
+        with self.assertRaises(RuntimeError):
+            read.run()
+        gio.bus_get.assert_called_once()
+        glib.source_remove.assert_called_once_with(17)
+
+    def test_real_regional_reads_use_an_isolated_private_bus(self):
+        process = subprocess.Popen(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-regional-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=45)
+            self.assertEqual(process.returncode, 0, stderr.decode("utf-8", "replace"))
+            self.assertIn(b"Private-bus regional reads: PASS", stdout)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+                process.communicate(timeout=3)
+
+
+class LocaleEnumerationTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def catalog(self, mode="success", *arguments, signal_number=None):
+        popen = subprocess.Popen
+        processes = []
+
+        def launch(command, **options):
+            self.assertEqual(command, ["/usr/bin/timeout", "--signal=TERM",
+                "--kill-after=1", "3", "/usr/bin/locale", "-a"])
+            self.assertEqual(options["env"], {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+            self.assertTrue(options["start_new_session"])
+            self.assertNotIn("preexec_fn", options)
+            process = popen(command[:4] + ["/usr/bin/python3",
+                str(REPO / "tests/fixtures/system-locale-process.py"), mode, *arguments], **options)
+            processes.append(process)
+            if signal_number is not None:
+                signal.raise_signal(signal_number)
+            return process
+
+        try:
+            with mock.patch.object(provider.subprocess, "Popen", side_effect=launch):
+                yield processes
+        finally:
+            for process in processes:
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+                if process.stdout:
+                    process.stdout.close()
+                if process.stderr:
+                    process.stderr.close()
+
+    def failure(self, code, mode, *arguments):
+        with self.catalog(mode, *arguments) as processes:
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.read_locale_choices()
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn("private diagnostic", str(caught.exception))
+            self.assertTrue(all(p.returncode is not None for p in processes))
+
+    def test_fixed_catalog_is_fresh_and_preserves_exact_names(self):
+        handlers = {number: signal.getsignal(number)
+                    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        with mock.patch.dict(os.environ, {"LOCPATH": "/untrusted", "LC_ALL": "invalid"}), \
+                self.catalog() as processes:
+            for _ in range(2):
+                self.assertEqual(provider.read_locale_choices(), ("C", "C.utf8", "POSIX", "en_US.utf8"))
+            self.assertEqual(len(processes), 2)
+            self.assertTrue(all(p.returncode == 0 and p.stdout.closed and p.stderr.closed for p in processes))
+        self.assertEqual(handlers, {number: signal.getsignal(number) for number in handlers})
+
+    def test_missing_supervisor_is_a_scoped_failure(self):
+        handlers = {number: signal.getsignal(number)
+                    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        with mock.patch.object(provider.subprocess, "Popen", side_effect=FileNotFoundError):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.read_locale_choices()
+        self.assertEqual(caught.exception.code, "missing-provider")
+        self.assertEqual(handlers, {number: signal.getsignal(number) for number in handlers})
+
+    def test_exit_status_is_required_and_diagnostics_are_not_exposed(self):
+        for status, code in ((1, "internal"), (125, "internal"), (126, "internal"),
+                             (127, "missing-provider"), (124, "timeout"), (137, "timeout")):
+            with self.subTest(status=status):
+                self.failure(code, "exit", str(status))
+
+    def test_catalog_validates_complete_stdout(self):
+        for mode in ("duplicate", "nonascii", "blank", "oversized-name", "too-many"):
+            with self.subTest(mode=mode):
+                self.failure("malformed", mode)
+
+    def test_stdout_and_stderr_share_one_bounded_budget(self):
+        for mode in ("stdout-overflow", "stderr-overflow", "combined-overflow"):
+            with self.subTest(mode=mode):
+                self.failure("malformed", mode)
+
+    def test_exact_output_budget_and_empty_catalog_are_accepted(self):
+        with self.catalog("exact-budget"):
+            self.assertEqual(provider.read_locale_choices(), ("C",))
+        with self.catalog("empty"):
+            self.assertEqual(provider.read_locale_choices(), ())
+
+    def test_decoding_cannot_publish_success_or_malformed_after_deadline(self):
+        monotonic = time.monotonic
+        for malformed in (False, True):
+            offset = [0]
+            def decode(_output):
+                offset[0] = 4
+                if malformed:
+                    raise provider.SnapshotFailure("malformed", "Late parser failure")
+                return ("C",)
+            with self.subTest(malformed=malformed), self.catalog(), \
+                    mock.patch.object(provider.time, "monotonic", side_effect=lambda: monotonic() + offset[0]), \
+                    mock.patch.object(provider, "validate_locale_choices", side_effect=decode):
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    provider.read_locale_choices()
+            self.assertEqual(caught.exception.code, "timeout")
+
+    def test_eof_without_process_exit_still_times_out(self):
+        started = time.monotonic()
+        self.failure("timeout", "closed-pipes")
+        self.assertLess(time.monotonic() - started, 5.5)
+
+    def test_timeout_kills_a_term_resistant_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = str(pathlib.Path(directory) / "child-pid")
+            self.failure("timeout", "descendant", pid_file)
+            child = int(pathlib.Path(pid_file).read_text())
+            self.assert_process_stopped(child)
+
+    def assert_process_stopped(self, pid, *, seconds=2):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                state = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            if state == "Z":
+                return
+            time.sleep(0.02)
+        self.fail(f"Owned locale fixture {pid} remained running")
+
+    def test_stopped_process_assertion_accepts_disappearance_during_read(self):
+        for error in (FileNotFoundError, ProcessLookupError):
+            with self.subTest(error=error), \
+                    mock.patch.object(pathlib.Path, "read_text", side_effect=error):
+                self.assert_process_stopped(123)
+
+    def test_stopped_process_assertion_preserves_other_read_errors(self):
+        with mock.patch.object(pathlib.Path, "read_text", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                self.assert_process_stopped(123)
+
+    def test_non_main_thread_cannot_install_process_signal_handlers(self):
+        errors = []
+        def run():
+            try:
+                provider.read_locale_choices()
+            except provider.SnapshotFailure as error:
+                errors.append(error.code)
+        with mock.patch.object(provider.subprocess, "Popen") as launch:
+            thread = threading.Thread(target=run)
+            thread.start()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ["internal"])
+        launch.assert_not_called()
+
+    def test_auto_reaped_children_are_rejected_before_launch(self):
+        with mock.patch.object(provider.signal, "getsignal", return_value=signal.SIG_IGN), \
+                mock.patch.object(provider.subprocess, "Popen") as launch:
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.read_locale_choices()
+        self.assertEqual(caught.exception.code, "internal")
+        launch.assert_not_called()
+
+    def test_termination_during_launch_cleans_up_before_exit_and_restores_handlers(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            handler = signal.getsignal(number)
+            with self.subTest(number=number), self.catalog("closed-pipes", signal_number=number) as processes:
+                with self.assertRaises(SystemExit) as caught:
+                    provider.read_locale_choices()
+                self.assertEqual(caught.exception.code, 128 + number)
+                self.assertTrue(all(p.returncode is not None for p in processes))
+            self.assertEqual(signal.getsignal(number), handler)
+
+    def test_cleanup_failure_cannot_publish_a_valid_catalog(self):
+        with self.catalog(), mock.patch.object(provider, "close_locale_process",
+                side_effect=provider.SnapshotFailure("timeout", "Fixture cleanup failure")):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.read_locale_choices()
+        self.assertEqual(caught.exception.code, "timeout")
+
+    def test_cleanup_failure_cannot_hide_pending_process_termination(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            for during_cleanup in (False, True):
+                handler = signal.getsignal(number)
+                def cleanup(_process):
+                    if during_cleanup:
+                        signal.raise_signal(number)
+                    raise provider.SnapshotFailure("timeout", "Fixture cleanup failure")
+                with self.subTest(number=number, during_cleanup=during_cleanup), \
+                        self.catalog(signal_number=None if during_cleanup else number), \
+                        mock.patch.object(provider, "close_locale_process", side_effect=cleanup):
+                    with self.assertRaises(SystemExit) as caught:
+                        provider.read_locale_choices()
+                    self.assertEqual(caught.exception.code, 128 + number)
+                self.assertEqual(signal.getsignal(number), handler)
+
+    def test_lost_child_ownership_never_signals_a_possibly_reused_group(self):
+        process = mock.Mock(pid=123)
+        with mock.patch.object(provider, "locale_process_status", side_effect=ChildProcessError), \
+                mock.patch.object(provider.os, "killpg") as kill:
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.close_locale_process(process)
+        self.assertEqual(caught.exception.code, "timeout")
+        kill.assert_not_called()
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    def test_killed_collector_leaves_a_bounded_independent_supervisor(self):
+        self.interrupt_collector(signal.SIGKILL)
+
+    def test_terminated_collector_cleans_up_a_running_descendant_group(self):
+        self.interrupt_collector(signal.SIGTERM)
+
+    def interrupt_collector(self, number):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = pathlib.Path(directory) / "child-pid"
+            supervisor_file = pathlib.Path(directory) / "supervisor-pid"
+            process = subprocess.Popen(["/usr/bin/python3",
+                str(REPO / "tests/fixtures/system-locale-process.py"), "collector",
+                str(PROVIDER_PATH), str(pid_file), str(supervisor_file)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            supervisor = None
+            try:
+                deadline = time.monotonic() + 3
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pid_file.exists(), "Locale child did not become ready")
+                supervisor = int(supervisor_file.read_text())
+                child = int(pid_file.read_text())
+                process.send_signal(number)
+                process.communicate(timeout=3)
+                self.assertEqual(process.returncode, -signal.SIGKILL if number == signal.SIGKILL else 143)
+                self.assert_process_stopped(supervisor, seconds=5)
+                self.assert_process_stopped(child)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=2)
+                if supervisor is None and supervisor_file.exists():
+                    supervisor = int(supervisor_file.read_text())
+                if supervisor is not None:
+                    # Fixture-only cleanup if an assertion failed while the
+                    # known supervisor and its group are still running.
+                    try:
+                        command = pathlib.Path(f"/proc/{supervisor}/cmdline").read_bytes()
+                        if command.startswith(b"/usr/bin/timeout\0"):
+                            os.killpg(supervisor, signal.SIGKILL)
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
+
+
+class DelegatedToolTests(unittest.TestCase):
+    environment = {"HOME": "/fixture-home", "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+    @contextlib.contextmanager
+    def selection(self, program="import os; os.write(1, b'kitty\\n')", *, mode=None, signal_number=None):
+        popen, processes = subprocess.Popen, []
+        def launch(command, **options):
+            self.assertEqual(command, ["/usr/bin/timeout", "--signal=TERM", "--kill-after=1", "3",
+                "/usr/bin/bash", "/usr/local/bin/dwm-terminal", "--print-command"])
+            self.assertEqual(options["env"], self.environment)
+            self.assertTrue(options["start_new_session"])
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            replacement = (["/usr/bin/python3", "-c", program] if mode is None else
+                           ["/usr/bin/python3", str(REPO / "tests/fixtures/system-locale-process.py"), mode])
+            process = popen(command[:4] + replacement, **options)
+            processes.append(process)
+            if signal_number is not None:
+                signal.raise_signal(signal_number)
+            return process
+        try:
+            with mock.patch.object(provider.subprocess, "Popen", side_effect=launch):
+                yield processes
+        finally:
+            for process in processes:
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
+                process.stdout.close()
+                process.stderr.close()
+
+    def read_selection(self):
+        return provider.read_terminal_selection("/usr/local/bin/dwm-terminal", self.environment)
+
+    def test_fixed_tool_paths_and_password_argv(self):
+        expected = {"accounts-open": "/usr/bin/lxqt-admin-user", "printers-open": "/usr/bin/system-config-printer",
+                    "sources-open": "/usr/bin/dnfdragora"}
+        for action, path in expected.items():
+            with self.subTest(action=action), mock.patch.object(provider, "trusted_delegated_executable", side_effect=lambda path, _name: path) as trusted, \
+                    mock.patch.object(provider, "read_terminal_selection") as selector:
+                self.assertEqual(provider.delegated_command(action)[0], (path,))
+                trusted.assert_called_once_with(path, os.path.basename(path))
+                selector.assert_not_called()
+        for name, arguments in provider.PASSWORD_TERMINALS.items():
+            with self.subTest(name=name), \
+                    mock.patch.object(provider, "trusted_delegated_executable", side_effect=lambda path, _name: path), \
+                    mock.patch.object(provider, "terminal_selection_environment", return_value=self.environment), \
+                    mock.patch.object(provider, "read_terminal_selection", return_value=name), \
+                    mock.patch.object(provider.shutil, "which", side_effect=["/usr/local/bin/dwm-terminal", "/usr/bin/" + name]):
+                self.assertEqual(provider.delegated_command("password-open"),
+                    (("/usr/bin/" + name, *arguments, "/usr/bin/passwd"), "Password change"))
+
+    def test_unknown_actions_and_unsupported_terminals_never_launch_or_fall_back(self):
+        for action in ("health-open", "password-open user", "accounts-open --root", None, []):
+            with self.subTest(action=action), mock.patch.object(provider, "trusted_delegated_executable") as target:
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.delegated_command(action)
+                target.assert_not_called()
+        for selected in ("warp-terminal", "kitty -e sh", "bash", "/usr/bin/foot"):
+            with self.subTest(selected=selected), \
+                    mock.patch.object(provider, "trusted_delegated_executable", side_effect=lambda path, _name: path), \
+                    mock.patch.object(provider, "terminal_selection_environment", return_value=self.environment), \
+                    mock.patch.object(provider, "read_terminal_selection", return_value=selected), \
+                    mock.patch.object(provider.shutil, "which", return_value="/usr/local/bin/dwm-terminal") as which:
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    provider.delegated_command("password-open")
+                self.assertEqual(caught.exception.code, "unsupported")
+                which.assert_called_once()
+
+    def test_trust_checks_resolved_executable_and_every_parent(self):
+        path = "/usr/bin/passwd"
+        def metadata(current, **_options):
+            return types.SimpleNamespace(st_uid=0, st_mode=(stat.S_IFREG | 0o4755) if current == path else stat.S_IFDIR | 0o755)
+        with mock.patch.object(provider.os.path, "realpath", return_value=path), \
+                mock.patch.object(provider.os, "stat", side_effect=metadata) as inspected, \
+                mock.patch.object(provider.os, "access", return_value=True):
+            self.assertEqual(provider.trusted_delegated_executable("/alias/passwd", "passwd"), path)
+            self.assertEqual([call.args[0] for call in inspected.call_args_list], [path, "/usr/bin", "/usr", "/"])
+        for target in (path, "/usr/bin", "/usr", "/"):
+            for field in ("owner", "writable", "type"):
+                def unsafe(current, **options):
+                    value = metadata(current, **options)
+                    if current == target:
+                        if field == "owner":
+                            value.st_uid = 1000
+                        elif field == "writable":
+                            value.st_mode |= 0o020
+                        else:
+                            value.st_mode = stat.S_IFLNK | 0o777
+                    return value
+                with self.subTest(target=target, field=field), mock.patch.object(provider.os.path, "realpath", return_value=path), \
+                        mock.patch.object(provider.os, "stat", side_effect=unsafe):
+                    with self.assertRaises(provider.SnapshotFailure) as caught:
+                        provider.trusted_delegated_executable(path, "passwd")
+                    self.assertEqual(caught.exception.code, "unsupported")
+        with mock.patch.object(provider.os.path, "realpath", return_value="/usr/bin/sh"):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.trusted_delegated_executable(path, "passwd")
+
+    def test_selection_environment_excludes_startup_and_loader_inputs(self):
+        source = {**self.environment, "DWM_TERMINAL": "kitty", "XDG_CONFIG_HOME": "/fixture/config",
+                  "BASH_ENV": "/private", "LD_PRELOAD": "/private", "LOCPATH": "/private", "BASH_FUNC_x%%": "() { false; }"}
+        with mock.patch.dict(os.environ, source, clear=True):
+            self.assertEqual(provider.terminal_selection_environment(),
+                {**self.environment, "DWM_TERMINAL": "kitty", "XDG_CONFIG_HOME": "/fixture/config"})
+        for value in ("x" * 4097, "\udcff"):
+            with mock.patch.dict(os.environ, {**self.environment, "DWM_TERMINAL": value}, clear=True):
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.terminal_selection_environment()
+
+    def test_selection_is_fresh_bounded_and_reaped(self):
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        with self.selection() as children:
+            self.assertEqual(self.read_selection(), "kitty")
+            self.assertEqual(self.read_selection(), "kitty")
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(child.returncode == 0 and child.stdout.closed and child.stderr.closed for child in children))
+        self.assertEqual(handlers, {number: signal.getsignal(number) for number in handlers})
+
+    def test_selector_rejects_partial_malformed_and_excess_output(self):
+        for output in (b"", b"kitty", b"kitty\nxterm\n", b"kitty\n\xff", b"kitty\t\n", b"x" * 4096 + b"\n"):
+            with self.subTest(output=output[:20]), self.selection("import os; os.write(1, " + repr(output) + ")"):
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    self.read_selection()
+                self.assertEqual(caught.exception.code, "malformed")
+        with self.selection("import os; os.write(1, b'kitty\\n'); os.write(2, b'x' * 4091)"):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                self.read_selection()
+            self.assertEqual(caught.exception.code, "malformed")
+        with self.selection("import os; os.write(1, b'kitty\\n'); os.write(2, b'x' * 4090)"):
+            self.assertEqual(self.read_selection(), "kitty")
+
+    def test_selector_exit_status_and_real_deadline_are_required(self):
+        for status, code in ((1, "internal"), (127, "missing-provider"), (124, "timeout")):
+            with self.subTest(status=status), self.selection("import os; os.write(1, b'kitty\\n'); os._exit(" + str(status) + ")"):
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    self.read_selection()
+                self.assertEqual(caught.exception.code, code)
+        started = time.monotonic()
+        with self.selection(mode="closed-pipes") as children:
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                self.read_selection()
+            self.assertEqual(caught.exception.code, "timeout")
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+            self.assertIsNotNone(children[0].returncode)
+        self.assertLess(time.monotonic() - started, 5.5)
+
+    def test_missing_closefrom_fails_before_open_or_spawn(self):
+        unavailable = types.SimpleNamespace(open=mock.Mock(), posix_spawn=mock.Mock())
+        with mock.patch.object(provider, "os", unavailable):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.launch_delegated_tool(("/usr/bin/kitty", "/usr/bin/passwd"))
+        self.assertEqual(caught.exception.code, "unsupported")
+        unavailable.open.assert_not_called()
+        unavailable.posix_spawn.assert_not_called()
+
+    def test_launch_uses_new_session_null_stdio_and_closefrom(self):
+        command = ("/usr/bin/kitty", "/usr/bin/passwd")
+        with mock.patch.object(provider.os, "posix_spawn", return_value=1234) as spawn:
+            provider.launch_delegated_tool(command)
+        args, options = spawn.call_args
+        self.assertEqual(args[:2], (command[0], command))
+        self.assertTrue(options["setsid"])
+        self.assertEqual(options["setsigmask"], ())
+        actions = options["file_actions"]
+        self.assertEqual([action[2] for action in actions[:3]], [0, 1, 2])
+        self.assertEqual(actions[-1], (os.POSIX_SPAWN_CLOSEFROM, 3))
+        with self.assertRaises(OSError):
+            os.fstat(actions[0][1])
+        for error, code in ((FileNotFoundError(), "missing-provider"), (PermissionError(), "permission-denied"),
+                            (OSError(errno.ENOEXEC, "Fixture"), "internal"), (InterruptedError(), "interrupted"),
+                            (NotImplementedError(), "unsupported")):
+            with self.subTest(code=code), mock.patch.object(provider.os, "posix_spawn", side_effect=error):
+                with self.assertRaises(provider.SnapshotFailure) as caught:
+                    provider.launch_delegated_tool(command)
+                self.assertEqual(caught.exception.code, code)
+
+
+    def test_selector_signals_and_cleanup_failure_cannot_publish_selection(self):
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        for number in handlers:
+            with self.subTest(number=number), self.selection(mode="closed-pipes", signal_number=number) as children:
+                with self.assertRaises(SystemExit) as caught:
+                    self.read_selection()
+                self.assertEqual(caught.exception.code, 128 + number)
+                self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+                self.assertIsNotNone(children[0].returncode)
+        self.assertEqual(handlers, {number: signal.getsignal(number) for number in handlers})
+        original = provider.close_locale_process
+        def cleanup(process):
+            original(process)
+            raise provider.SnapshotFailure("timeout", "Fixture cleanup failed")
+        with self.selection(), mock.patch.object(provider, "close_locale_process", side_effect=cleanup):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                self.read_selection()
+            self.assertEqual(caught.exception.code, "timeout")
+            self.assertIn("Terminal selection cleanup", caught.exception.detail)
+
+    def test_kernel_exec_failure_and_post_acceptance_cleanup_are_distinguished(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.launch_delegated_tool((str(pathlib.Path(directory) / "absent"),))
+            self.assertEqual(caught.exception.code, "missing-provider")
+        original = os.close
+        def close(descriptor):
+            original(descriptor)
+            raise OSError(errno.EIO, "Fixture close failure")
+        with mock.patch.object(provider.os, "posix_spawn", return_value=1234) as launch, \
+                mock.patch.object(provider.os, "close", side_effect=close):
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                provider.launch_delegated_tool(("/usr/bin/kitty", "/usr/bin/passwd"))
+            self.assertEqual(caught.exception.code, "interrupted")
+            self.assertIn("may already be open", caught.exception.detail)
+            launch.assert_called_once()
+
+
+class MountMonitorTests(unittest.TestCase):
+    def start(self, body, *, delay=0, baseline=True, pass_fds=()):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "child"
+        fixture = (f"import time\nwith open({str(path) + '.tmp'!r}, 'w') as marker: marker.write(str(os.getpid()))\n"
+                   f"os.replace({str(path) + '.tmp'!r}, {str(path)!r})\n"
+                   f"time.sleep({delay!r})\n"
+                   + ("baseline = open('/proc/self/mountinfo')\nos.set_inheritable(baseline.fileno(), True)\n" if baseline else "")
+                   + body + "\ntime.sleep(60)\n")
+        code = provider.MOUNT_MONITOR_EXEC.replace(
+            "os.execv('/usr/bin/findmnt', ['findmnt', '--poll', '--raw', '--noheadings', '--output', 'ACTION'])",
+            fixture)
+        runner = (f"import runpy,sys\np=runpy.run_path({str(PROVIDER_PATH)!r})\n"
+                  f"p['watch_mount_events'].__globals__['MOUNT_MONITOR_EXEC']={code!r}\n"
+                  "sys.exit(p['watch_mount_events']())\n")
+        process = subprocess.Popen([sys.executable, "-c", runner], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, pass_fds=pass_fds, bufsize=0)
+        self.addCleanup(self.stop, process)
+        deadline = time.monotonic() + 2
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists())
+        child = int(path.read_text())
+        return process, child
+
+    @staticmethod
+    def stop(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        process.stdout.close()
+        process.stderr.close()
+
+    def row(self, process, timeout=2):
+        self.assertTrue(select.select([process.stdout], [], [], timeout)[0], "monitor output timed out")
+        return process.stdout.readline()
+
+    def gone(self, child):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                state = pathlib.Path(f"/proc/{child}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                return
+            if state == "Z":  # An orphan awaits the host's reaper after parent KILL.
+                return
+            time.sleep(0.01)
+        self.fail("mount child remains running")
+
+    def test_readiness_precedes_queued_events_and_all_fixed_actions_are_preserved(self):
+        process, child = self.start("os.write(1, b'mount\\numount\\nmove\\nremount\\n')")
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        for action in (b"mount", b"umount", b"move", b"remount"):
+            self.assertEqual(self.row(process), b"mount-change\t" + action + b"\n")
+        process.terminate()
+        self.assertEqual(process.wait(timeout=3), 143)
+        self.gone(child)
+
+    def test_delayed_baseline_emits_nothing_early(self):
+        process, child = self.start("", delay=0.3)
+        self.assertFalse(select.select([process.stdout], [], [], 0.1)[0])
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        self.stop(process)
+        self.gone(child)
+
+    def test_real_findmnt_parsing_open_is_not_its_polling_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            source, library, marker = directory / "pause.c", directory / "pause.so", directory / "parsing"
+            source.write_text(r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+FILE *fopen64(const char *path, const char *mode) {
+    FILE *(*original)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen64");
+    FILE *result = original(path, mode);
+    if (result && strstr(path, "/mountinfo") && strchr(mode, 'e')) {
+        int fd = open(getenv("DWM_MOUNT_PARSE_MARKER"), O_WRONLY | O_CREAT, 0600);
+        if (fd >= 0) close(fd);
+        usleep(350000);
+    }
+    return result;
+}
+""")
+            subprocess.run(["cc", "-shared", "-fPIC", "-o", str(library), str(source), "-ldl"],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LD_PRELOAD": str(library),
+                           "DWM_MOUNT_PARSE_MARKER": str(marker)}
+            process, child = self.start("os.execve('/usr/bin/findmnt', "
+                "['findmnt', '--poll', '--raw', '--noheadings', '--output', 'ACTION'], "
+                + repr(environment) + ")", baseline=False)
+            deadline = time.monotonic() + 1
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(marker.exists(), "real findmnt did not reach its initial parsing open")
+            self.assertFalse(select.select([process.stdout], [], [], 0.15)[0])
+            self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+            self.stop(process)
+            self.gone(child)
+
+    def test_temporary_parsing_descriptor_cannot_acknowledge_readiness(self):
+        process, child = self.start("baseline = open('/proc/self/mountinfo')\n"
+            "time.sleep(0.35)\nbaseline.close()\n"
+            "baseline = open('/proc/self/mountinfo')\nos.set_inheritable(baseline.fileno(), True)", baseline=False)
+        self.assertFalse(select.select([process.stdout], [], [], 0.2)[0])
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        self.stop(process)
+        self.gone(child)
+
+    def test_missing_baseline_has_one_second_deadline_and_cleanup(self):
+        started = time.monotonic()
+        process, child = self.start("", baseline=False)
+        self.assertEqual(process.wait(timeout=3), 1)
+        self.assertLess(time.monotonic() - started, 2.8)
+        self.assertEqual(process.stdout.read(), b"")
+        self.assertIn(b"reload storage status explicitly", process.stderr.read())
+        self.gone(child)
+
+    def test_bad_output_and_unexpected_exit_fail_closed(self):
+        for body in ("os.write(1, b'unknown\\n')", "os.write(1, b'\\n')",
+                     "os.write(1, b'x' * 257)", "os.write(2, b'failure')",
+                     "sys.exit(0)"):
+            with self.subTest(body=body):
+                process, child = self.start(body)
+                self.assertEqual(process.wait(timeout=3), 1)
+                self.assertNotIn(b"mount-change", process.stdout.read())
+                self.gone(child)
+
+    def test_signal_cleanup_and_parent_death(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGKILL):
+            with self.subTest(number=number):
+                process, child = self.start("")
+                self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+                process.send_signal(number)
+                expected = -number if number == signal.SIGKILL else 128 + number
+                self.assertEqual(process.wait(timeout=3), expected)
+                self.gone(child)
+
+    def test_nonstandard_descriptors_do_not_reach_child(self):
+        with tempfile.TemporaryFile() as inherited:
+            identity = os.fstat(inherited.fileno())
+            body = ("for name in os.listdir('/proc/self/fd'):\n"
+                    "    try: item = os.fstat(int(name))\n"
+                    "    except OSError: continue\n"
+                    f"    if (item.st_dev, item.st_ino) == {(identity.st_dev, identity.st_ino)!r}:\n"
+                    "        os.write(2, b'inherited descriptor')\n"
+                    "os.write(1, b'mount\\n')\n")
+            process, child = self.start(body, pass_fds=(inherited.fileno(),))
+            self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+            self.assertEqual(self.row(process), b"mount-change\tmount\n")
+            self.stop(process)
+            self.gone(child)
+
+    def test_lost_output_consumer_stops_child(self):
+        process, child = self.start("time.sleep(0.15)\nos.write(1, b'mount\\n')")
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        process.stdout.close()
+        self.assertEqual(process.wait(timeout=3), 1)
+        self.gone(child)
+
+    def test_socket_outputs_are_rejected_before_starting_a_child(self):
+        for mode in ("plain", "input", "read-half", "write-half", "full-buffer"):
+            with self.subTest(mode=mode):
+                sender, reader = socket.socketpair()
+                with sender, reader, tempfile.TemporaryFile() as diagnostics, \
+                        os.fdopen(os.dup(sender.fileno()), "wb", buffering=0) as output:
+                    if mode == "input":
+                        reader.sendall(b"not a closure")
+                    elif mode == "read-half":
+                        reader.shutdown(socket.SHUT_RD)
+                    elif mode == "write-half":
+                        reader.shutdown(socket.SHUT_WR)
+                    elif mode == "full-buffer":
+                        sender.setblocking(False)
+                        try:
+                            while True:
+                                sender.send(b"x" * 4096)
+                        except BlockingIOError:
+                            pass
+                    blocking = os.get_blocking(sender.fileno())
+                    with mock.patch.object(provider.sys, "stdout", output), \
+                            mock.patch.object(provider.sys, "stderr", diagnostics), \
+                            mock.patch.object(provider.subprocess, "Popen", side_effect=AssertionError("Child started")) as spawn:
+                        self.assertEqual(provider.watch_mount_events(), 1)
+                    spawn.assert_not_called()
+                    self.assertEqual(os.get_blocking(sender.fileno()), blocking)
+                    diagnostics.seek(0)
+                    self.assertIn(b"requires write-only pipe output", diagnostics.read())
+
+    def test_regular_and_read_write_fifo_outputs_are_rejected_before_child(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as regular:
+            fifo = pathlib.Path(directory) / "output"
+            os.mkfifo(fifo, 0o600)
+            with os.fdopen(os.open(fifo, os.O_RDWR | os.O_NONBLOCK), "wb", buffering=0) as retained_reader:
+                for output in (regular, retained_reader):
+                    with self.subTest(mode=os.fstat(output.fileno()).st_mode), tempfile.TemporaryFile() as diagnostics, \
+                            mock.patch.object(provider.sys, "stdout", output), \
+                            mock.patch.object(provider.sys, "stderr", diagnostics), \
+                            mock.patch.object(provider.subprocess, "Popen", side_effect=AssertionError("Child started")) as spawn:
+                        self.assertEqual(provider.watch_mount_events(), 1)
+                        spawn.assert_not_called()
+                        diagnostics.seek(0)
+                        self.assertIn(b"requires write-only pipe output", diagnostics.read())
+
+    def test_idle_output_liveness_watch_does_not_spin(self):
+        process, child = self.start("")
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        def ticks():
+            fields = pathlib.Path(f"/proc/{process.pid}/stat").read_text().rsplit(") ", 1)[1].split()
+            return int(fields[11]) + int(fields[12])
+        before = ticks()
+        time.sleep(0.3)
+        self.assertLessEqual(ticks() - before, 1, "Idle mount supervisor consumed CPU ticks")
+        self.stop(process)
+        self.gone(child)
+
+    def test_idle_lost_output_consumer_stops_child_without_mount_events(self):
+        process, child = self.start("")
+        self.assertEqual(self.row(process), b"mount-monitor-ready\n")
+        process.stdout.close()
+        self.assertEqual(process.wait(timeout=3), 1)
+        self.gone(child)
+
+    def test_proc_identity_change_and_exited_child_are_rejected(self):
+        process = types.SimpleNamespace(pid=123)
+        with mock.patch.object(provider, "locale_process_status", return_value=None), \
+                mock.patch.object(provider.os, "stat", return_value=types.SimpleNamespace(st_dev=1, st_ino=3)):
+            with self.assertRaises(OSError):
+                provider.mount_baseline_ready(process, (1, 2))
+        with mock.patch.object(provider, "locale_process_status", return_value=object()):
+            with self.assertRaises(OSError):
+                provider.mount_baseline_ready(process, (1, 2))
+
+    def test_fixed_command_rejects_arguments(self):
+        result = subprocess.run([str(PROVIDER_PATH), "watch-mounts", "other"], capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+
+
+class UpdateEventMonitorTests(unittest.TestCase):
+    def monitor(self):
+        class BusError(Exception):
+            pass
+
+        glib = mock.Mock(Error=BusError, SOURCE_REMOVE=False, SOURCE_CONTINUE=True,
+            PRIORITY_DEFAULT=0)
+        gio = mock.Mock()
+        unix = mock.Mock()
+        emitted = []
+        monitor = provider.UpdateEventMonitor(gio, glib, unix, emitted.append)
+        monitor.deadline = time.monotonic() + 10
+        monitor.deadline_source = 7
+        monitor.match_rules = ["fixture"]
+        monitor.connection = mock.Mock()
+        return monitor, emitted, gio, glib, unix
+
+    def test_subscriptions_are_fixed_and_setup_never_calls_packagekit(self):
+        monitor, emitted, gio, _glib, _unix = self.monitor()
+        monitor.match_rules = []
+        connection = gio.bus_get_finish.return_value
+        monitor.connected(None, object(), None)
+        calls = connection.signal_subscribe.call_args_list
+        self.assertEqual([call.args[:4] for call in calls], [
+            (None, provider.PACKAGEKIT_INTERFACE, member, provider.PACKAGEKIT_PATH)
+            for member in ("UpdatesChanged", "InstalledChanged", "RepoListChanged")
+        ] + [("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus")])
+        self.assertEqual(calls[-1].args[4], provider.PACKAGEKIT_NAME)
+        self.assertEqual(connection.call.call_args.args[:4],
+            ("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch"))
+        self.assertTrue(all(call.args[5] == gio.DBusSignalFlags.NO_MATCH_RULE for call in calls))
+        self.assertEqual(len(monitor.match_rules), 4)
+        self.assertEqual(emitted, [])
+
+    def test_setup_events_coalesce_and_ready_precedes_pending_invalidation(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        for _ in range(1000):
+            monitor.changed()
+        self.assertEqual(emitted, [])
+        monitor.match_finished(mock.Mock(), object(), "fixture")
+        self.assertEqual(emitted, [])
+        connection = mock.Mock()
+        connection.call_finish.return_value.unpack.return_value = (":1.2",)
+        monitor.owner_resolved(connection, object(), 0)
+        self.assertEqual(emitted, ["update-event\tready", "update-event\tchanged"])
+        glib.source_remove.assert_called_once_with(7)
+        self.assertFalse(monitor.dirty)
+        self.assertEqual(monitor.deadline_source, 0)
+        monitor.changed()
+        self.assertEqual(len(emitted), 3)
+
+    def test_readiness_requires_all_four_successful_match_replies(self):
+        monitor, emitted, gio, _glib, _unix = self.monitor()
+        monitor.match_rules = []
+        monitor.connected(None, object(), None)
+        connection = gio.bus_get_finish.return_value
+        for index, rule in enumerate(monitor.match_rules):
+            self.assertEqual(emitted, [])
+            monitor.changed()
+            monitor.match_finished(connection, object(), rule)
+            self.assertEqual(len(monitor.installed_rules), index + 1)
+        self.assertEqual(connection.call.call_count, 5)
+        self.assertEqual(connection.call.call_args.args[3], "GetNameOwner")
+        self.assertEqual(emitted, [])
+        connection.call_finish.return_value.unpack.return_value = (":1.2",)
+        monitor.owner_resolved(connection, object(), 0)
+        self.assertEqual(emitted, ["update-event\tready", "update-event\tchanged"])
+
+    def test_denied_match_after_partial_setup_never_reports_ready(self):
+        monitor, emitted, gio, glib, _unix = self.monitor()
+        monitor.match_rules = []
+        monitor.connected(None, object(), None)
+        connection = gio.bus_get_finish.return_value
+        monitor.match_finished(connection, object(), monitor.match_rules[0])
+        connection.call_finish.side_effect = glib.Error("Policy denied subscription")
+        monitor.match_finished(connection, object(), monitor.match_rules[1])
+        self.assertTrue(monitor.stopped)
+        self.assertEqual(len(monitor.installed_rules), 1)
+        self.assertEqual(emitted, [])
+
+    def test_expired_setup_and_late_callbacks_cannot_publish_ready(self):
+        for callback in ("connected", "match_finished", "owner_resolved"):
+            with self.subTest(callback=callback):
+                monitor, emitted, gio, _glib, _unix = self.monitor()
+                monitor.deadline = time.monotonic() - 1
+                getattr(monitor, callback)(mock.Mock(), object(), None)
+                self.assertTrue(monitor.stopped)
+                self.assertEqual(monitor.exit_code, 1)
+                monitor.changed()
+                monitor.match_finished(mock.Mock(), object(), None)
+                monitor.connected(None, object(), None)
+                self.assertEqual(emitted, [])
+                gio.bus_get_finish.assert_not_called()
+
+    def test_connection_barrier_and_output_failures_stop_without_success(self):
+        for stage in ("connection", "barrier", "output"):
+            with self.subTest(stage=stage):
+                monitor, emitted, gio, glib, _unix = self.monitor()
+                connection = mock.Mock()
+                if stage == "connection":
+                    gio.bus_get_finish.side_effect = glib.Error("private error")
+                    monitor.connected(None, object(), None)
+                elif stage == "barrier":
+                    connection.call_finish.side_effect = glib.Error("private error")
+                    monitor.match_finished(connection, object(), "fixture")
+                else:
+                    monitor.emit = mock.Mock(side_effect=BrokenPipeError())
+                    connection.call_finish.return_value.unpack.return_value = (":1.2",)
+                    monitor.owner_resolved(connection, object(), 0)
+                self.assertTrue(monitor.stopped)
+                self.assertEqual(monitor.exit_code, 1)
+                self.assertEqual(emitted, [])
+                monitor.stop(0)
+                self.assertEqual(monitor.exit_code, 1)
+
+    def test_owner_resolution_absence_is_not_authorization_denial(self):
+        for missing in (True, False):
+            monitor, emitted, gio, glib, _unix = self.monitor()
+            connection = mock.Mock()
+            connection.call_finish.side_effect = glib.Error("Owner lookup failed")
+            gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error." + (
+                "NameHasNoOwner" if missing else "AccessDenied")
+            monitor.owner_resolved(connection, object(), 0)
+            self.assertEqual(monitor.ready, missing)
+            self.assertEqual(monitor.stopped, not missing)
+            self.assertEqual(emitted, ["update-event\tready"] if missing else [])
+
+    def test_owner_notification_wins_lookup_race_and_filters_old_senders(self):
+        monitor, emitted, _gio, _glib, _unix = self.monitor()
+        parameters = mock.Mock()
+        parameters.unpack.return_value = (provider.PACKAGEKIT_NAME, ":1.2", ":1.3")
+        monitor.owner_changed(None, None, None, None, None, parameters, None)
+        connection = mock.Mock()
+        connection.call_finish.return_value.unpack.return_value = (":1.2",)
+        monitor.owner_resolved(connection, object(), 0)
+        self.assertEqual(monitor.owner, ":1.3")
+        self.assertEqual(emitted, ["update-event\tready", "update-event\tchanged"])
+        monitor.global_changed(None, ":1.2", None, None, None, None, None)
+        self.assertEqual(len(emitted), 2)
+        monitor.global_changed(None, ":1.3", None, None, None, None, None)
+        self.assertEqual(len(emitted), 3)
+
+    def test_run_cleanup_cancels_callbacks_and_removes_all_sources(self):
+        monitor, _emitted, gio, glib, unix = self.monitor()
+        monitor.match_rules = []
+        connection = gio.bus_get_finish.return_value
+        connection.signal_subscribe.side_effect = [20, 21, 22, 23]
+        connection.connect.return_value = 24
+        glib.timeout_add.return_value = 10
+        unix.signal_add.side_effect = [11, 12, 13]
+        def run():
+            monitor.connected(None, object(), None)
+            monitor.match_finished(connection, object(), monitor.match_rules[0])
+            monitor.stop(0)
+        monitor.loop.run.side_effect = run
+        self.assertEqual(monitor.run(), 0)
+        self.assertEqual([call.args[0] for call in connection.signal_unsubscribe.call_args_list], [20, 21, 22, 23])
+        connection.disconnect.assert_called_once_with(24)
+        self.assertEqual(connection.call.call_args.args[3], "RemoveMatch")
+        self.assertEqual([call.args[0] for call in glib.source_remove.call_args_list], [11, 12, 13, 10])
+        self.assertTrue(monitor.cancellable.cancel.called)
+        self.assertEqual(gio.bus_get.call_args.args[0], gio.BusType.SYSTEM)
+
+    def test_watch_cli_is_argument_free_and_does_not_open_the_backend(self):
+        with mock.patch.object(provider, "watch_update_events", return_value=0) as watch, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(provider.main(["watch-updates"]), 0)
+            for arguments in (["watch-updates", "extra"], ["watch-updates", "--system"]):
+                self.assertEqual(provider.main(arguments), 2)
+            watch.assert_called_once_with()
+            backend.assert_not_called()
+
+    def test_real_private_bus_signals_lifecycle_and_lost_output(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-update-events-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "PackageKit private-bus event monitor: PASS\n")
+
+
+class RegionalEventMonitorTests(unittest.TestCase):
+    def monitor(self, kind="time"):
+        from gi.repository import Gio, GLib
+        glib = mock.Mock(Error=GLib.Error, Variant=GLib.Variant,
+            VariantType=GLib.VariantType, SOURCE_REMOVE=False, SOURCE_CONTINUE=True,
+            PRIORITY_DEFAULT=0)
+        gio = mock.Mock(dbus_is_unique_name=Gio.dbus_is_unique_name)
+        unix, emitted = mock.Mock(), []
+        monitor = provider.RegionalEventMonitor(kind, gio, glib, unix, emitted.append)
+        monitor.deadline = time.monotonic() + 10
+        monitor.deadline_source = 7
+        monitor.connection = gio.bus_get_finish.return_value
+        monitor.connection.call_finish.return_value = GLib.Variant("()", ())
+        return monitor, emitted, gio, glib, unix
+
+    def owner(self, monitor, glib, old, new, sender="org.freedesktop.DBus"):
+        monitor.owner_changed(None, sender, "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "NameOwnerChanged", glib.Variant("(sss)", (monitor.name, old, new)), None)
+
+    def properties(self, monitor, glib, fields=(), invalidated=(), sender=":1.2"):
+        monitor.properties_changed(None, sender, monitor.path, provider.PROPERTIES_INTERFACE,
+            "PropertiesChanged", glib.Variant("(sa{sv}as)", (monitor.name,
+                {field: glib.Variant("b", True) for field in fields}, list(invalidated))), None)
+
+    def test_fixed_subscriptions_require_both_acknowledgements_and_owner_barrier(self):
+        for kind in ("time", "locale"):
+            monitor, emitted, gio, glib, _unix = self.monitor(kind)
+            connection = monitor.connection
+            monitor.connected(None, object(), None)
+            subscriptions = connection.signal_subscribe.call_args_list
+            self.assertEqual(len(subscriptions), 2)
+            self.assertEqual(subscriptions[1].args[:5], (None, provider.PROPERTIES_INTERFACE,
+                "PropertiesChanged", monitor.path, monitor.name))
+            self.assertTrue(all(call.args[5] == gio.DBusSignalFlags.NO_MATCH_RULE for call in subscriptions))
+            for index, rule in enumerate(monitor.match_rules):
+                connection.call_finish.return_value = glib.Variant("()", ())
+                monitor.match_finished(connection, object(), rule)
+                self.assertEqual(emitted, [])
+                if index == 0:
+                    connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+                    monitor.owner_initialized(connection, object(), 0)
+            self.assertEqual([call.args[3] for call in connection.call.call_args_list],
+                ["AddMatch", "GetNameOwner", "AddMatch", "GetNameOwner"])
+            self.assertTrue(all(call.args[0] == "org.freedesktop.DBus" for call in connection.call.call_args_list))
+            self.assertEqual(connection.call.call_args.args[4].unpack(), (monitor.name,))
+            connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+            monitor.owner_resolved(connection, object(), 0)
+            self.assertEqual(emitted, ["regional-event\tready"])
+            self.assertEqual(monitor.deadline_source, 0)
+
+    def test_absence_is_ready_but_denial_and_malformed_owner_are_not(self):
+        for error in ("NameHasNoOwner", "AccessDenied", "NoReply", None):
+            monitor, emitted, gio, glib, _unix = self.monitor()
+            if error:
+                monitor.connection.call_finish.side_effect = glib.Error("fixture failure")
+                gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error." + error
+            else:
+                monitor.connection.call_finish.return_value = glib.Variant("(s)", (monitor.name,))
+            monitor.owner_resolved(monitor.connection, object(), 0)
+            self.assertEqual(monitor.ready, error == "NameHasNoOwner")
+            self.assertEqual(emitted, ["regional-event\tready"] if error == "NameHasNoOwner" else [])
+
+    def test_owner_epoch_race_coalescing_departure_and_forged_sender(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        monitor.owner = ":1.2"
+        for _ in range(100):
+            self.properties(monitor, glib, ["NTP"])
+        self.owner(monitor, glib, ":1.2", ":1.3")
+        monitor.connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.owner_resolved(monitor.connection, object(), 0)
+        self.assertEqual(monitor.owner, ":1.3")
+        self.assertEqual(emitted, ["regional-event\tready", "regional-event\tchanged"])
+        self.properties(monitor, glib, ["NTP"], sender=":1.2")
+        self.owner(monitor, glib, ":1.3", ":1.8", sender=":1.8")
+        self.assertEqual(monitor.owner, ":1.3")
+        self.owner(monitor, glib, ":1.3", "")
+        self.assertEqual(monitor.owner, "")
+        self.assertEqual(len(emitted), 2, "Idle departure must not reactivate a service")
+        self.properties(monitor, glib, ["NTP"], sender=":1.3")
+        self.assertEqual(len(emitted), 2)
+        self.owner(monitor, glib, "", ":1.4")
+        self.owner(monitor, glib, ":1.4", ":1.5")
+        self.assertEqual(len(emitted), 4)
+
+    def test_only_relevant_properties_invalidate_and_bounds_fail_closed(self):
+        for kind in ("time", "locale"):
+            monitor, emitted, _gio, glib, _unix = self.monitor(kind)
+            monitor.ready, monitor.owner = True, ":1.2"
+            self.properties(monitor, glib, ["Unrelated"])
+            self.assertEqual(emitted, [])
+            for field in monitor.relevant:
+                self.properties(monitor, glib, [field])
+                self.properties(monitor, glib, invalidated=[field])
+            self.assertEqual(len(emitted), len(monitor.relevant) * 2)
+            self.properties(monitor, glib, ["x" * 513])
+            self.assertTrue(monitor.stopped)
+        for fields, invalidated in (([str(i) for i in range(65)], []), ([], ["x" * 513])):
+            monitor, _emitted, _gio, glib, _unix = self.monitor()
+            monitor.owner = ":1.2"
+            self.properties(monitor, glib, fields, invalidated)
+            self.assertTrue(monitor.stopped)
+
+    def test_setup_rejects_unicast_senders_before_parsing_or_dirtying(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        self.properties(monitor, glib, ["Timezone"])
+        self.properties(monitor, glib, ["x" * 20000])
+        self.assertFalse(monitor.stopped)
+        self.assertFalse(monitor.dirty)
+        monitor.owner = ":1.2"
+        self.properties(monitor, glib, ["x" * 20000], sender=":1.8")
+        self.assertFalse(monitor.stopped)
+        self.assertFalse(monitor.dirty)
+        self.properties(monitor, glib, ["Timezone"])
+        self.assertTrue(monitor.dirty)
+        self.assertEqual(emitted, [])
+
+    def test_real_setup_unicast_is_authenticated_before_readiness(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-regional-setup-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Regional setup unicast authentication: PASS\n")
+
+    def test_expired_setup_late_ack_and_denial_never_report_ready(self):
+        for callback in ("connected", "match_finished", "owner_resolved"):
+            monitor, emitted, _gio, _glib, _unix = self.monitor()
+            monitor.deadline = time.monotonic() - 1
+            getattr(monitor, callback)(monitor.connection, object(), "fixture")
+            self.assertTrue(monitor.stopped)
+            self.assertEqual(emitted, [])
+        for denied in (True, False):
+            monitor, emitted, _gio, glib, _unix = self.monitor()
+            monitor.stop(0)
+            if denied:
+                monitor.connection.call_finish.side_effect = glib.Error("denied")
+            monitor.match_finished(monitor.connection, object(), "owned-rule")
+            self.assertEqual(monitor.exit_code, 0)
+            self.assertEqual(emitted, [])
+            if denied:
+                monitor.connection.call.assert_not_called()
+            else:
+                self.assertEqual(monitor.connection.call.call_args.args[3], "RemoveMatch")
+                self.assertEqual(monitor.connection.call.call_args.args[4].unpack(), ("owned-rule",))
+
+    def test_cleanup_is_single_use_and_removes_only_acknowledged_rules(self):
+        monitor, _emitted, gio, glib, unix = self.monitor()
+        connection = monitor.connection
+        connection.signal_subscribe.side_effect = [20, 21]
+        connection.connect.return_value = 24
+        glib.timeout_add.return_value = 10
+        unix.signal_add.side_effect = [11, 12, 13]
+        def run():
+            monitor.connected(None, object(), None)
+            monitor.match_finished(connection, object(), monitor.match_rules[0])
+            connection.call_finish.side_effect = glib.Error("second match denied")
+            monitor.match_finished(connection, object(), monitor.match_rules[1])
+        monitor.loop.run.side_effect = run
+        self.assertEqual(monitor.run(), 1)
+        self.assertEqual([call.args[0] for call in connection.signal_unsubscribe.call_args_list], [20, 21])
+        removals = [call for call in connection.call.call_args_list if call.args[3] == "RemoveMatch"]
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals[0].args[4].unpack(), (monitor.match_rules[0],))
+        self.assertEqual([call.args[0] for call in glib.source_remove.call_args_list], [11, 12, 13, 10])
+        connection.close_sync.assert_not_called()
+        self.assertTrue(monitor.cancellable.cancel.called)
+        with self.assertRaises(RuntimeError):
+            monitor.run()
+        self.assertEqual(gio.bus_get.call_count, 1)
+
+    def test_closed_cli_and_real_private_bus_lifecycle(self):
+        with mock.patch.object(provider, "watch_regional_events", return_value=0) as watch, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                contextlib.redirect_stderr(io.StringIO()):
+            for kind in ("time", "locale"):
+                self.assertEqual(provider.main(["watch-regional", kind]), 0)
+            self.assertEqual(watch.call_args_list, [mock.call("time"), mock.call("locale")])
+            for args in ([], ["other"], ["time", "extra"], ["--system"]):
+                self.assertEqual(provider.main(["watch-regional", *args]), 2)
+            backend.assert_not_called()
+        for kind in ("time", "locale"):
+            result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+                str(REPO / "tests/fixtures/system-update-events-bus.py"), str(PROVIDER_PATH), kind],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, kind + " private-bus event monitor: PASS\n")
+
+
+class TimeEventMonitorTests(unittest.TestCase):
+    owner = RegionalEventMonitorTests.owner
+    properties = RegionalEventMonitorTests.properties
+
+    def monitor(self):
+        _regional, emitted, gio, glib, unix = RegionalEventMonitorTests().monitor()
+        monitor = provider.TimeEventMonitor(gio, glib, unix, emitted.append)
+        monitor.deadline = time.monotonic() + 10
+        monitor.deadline_source = 7
+        monitor.connection = gio.bus_get_finish.return_value
+        return monitor, emitted, gio, glib
+
+    def test_arrivals_are_distinct_but_departure_and_untrusted_signals_are_quiet(self):
+        monitor, emitted, _gio, glib = self.monitor()
+        monitor.ready, monitor.owner = True, ":1.2"
+        self.owner(monitor, glib, ":1.2", "")
+        self.properties(monitor, glib, ["NTP"])
+        self.owner(monitor, glib, "", ":1.8", sender=":1.8")
+        self.assertEqual(emitted, [])
+        self.owner(monitor, glib, "", ":1.3")
+        self.owner(monitor, glib, ":1.3", ":1.4")
+        self.assertEqual(emitted, ["time-event\towner-arrived"] * 2)
+        self.properties(monitor, glib, ["NTP"], sender=":1.3")
+        self.properties(monitor, glib, ["Timezone"], sender=":1.4")
+        self.properties(monitor, glib, invalidated=["NTPSynchronized"], sender=":1.4")
+        self.assertEqual(emitted[2:], ["time-event\tchanged"] * 2)
+        monitor.stop(0)
+        self.owner(monitor, glib, ":1.4", ":1.5")
+        self.assertEqual(len(emitted), 4)
+
+    def test_setup_arrivals_and_properties_coalesce_without_losing_owner_epoch(self):
+        monitor, emitted, _gio, glib = self.monitor()
+        self.owner(monitor, glib, "", ":1.2")
+        self.properties(monitor, glib, ["NTP"])
+        self.owner(monitor, glib, ":1.2", ":1.3")
+        self.assertEqual(emitted, [])
+        monitor.connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.owner_resolved(monitor.connection, object(), 0)
+        self.assertEqual(monitor.owner, ":1.3")
+        self.assertEqual(emitted, ["time-event\tready", "time-event\tchanged"])
+        self.assertFalse(monitor.dirty)
+
+    def test_failed_arrival_output_stops_monitor(self):
+        monitor, _emitted, _gio, glib = self.monitor()
+        monitor.ready = True
+        monitor.emit = mock.Mock(side_effect=BlockingIOError())
+        self.owner(monitor, glib, "", ":1.2")
+        self.assertTrue(monitor.stopped)
+        self.assertEqual(monitor.exit_code, 1)
+
+    def test_fixed_cli_and_real_private_bus_lifecycle(self):
+        with mock.patch.object(provider, "watch_service_events", return_value=0) as watch, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(provider.main(["watch-time"]), 0)
+            for args in (["time"], ["locale"], ["--system"], ["extra", "argument"]):
+                self.assertEqual(provider.main(["watch-time", *args]), 2)
+            watch.assert_called_once_with("time-discovery")
+            backend.assert_not_called()
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-update-events-bus.py"), str(PROVIDER_PATH), "time-discovery"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "time-discovery private-bus event monitor: PASS\n")
+
+
+class AccountEventMonitorTests(unittest.TestCase):
+    def monitor(self):
+        _regional, emitted, gio, glib, unix = RegionalEventMonitorTests().monitor()
+        monitor = provider.AccountEventMonitor(gio, glib, unix, emitted.append)
+        monitor.deadline = time.monotonic() + 10
+        monitor.deadline_source = 7
+        monitor.connection = gio.bus_get_finish.return_value
+        return monitor, emitted, gio, glib, unix
+
+    def setup(self, monitor, glib):
+        connection = monitor.connection
+        monitor.connected(None, object(), None)
+        for index, rule in enumerate(monitor.match_rules):
+            connection.call_finish.return_value = glib.Variant("()", ())
+            monitor.match_finished(connection, object(), rule)
+            if index == 0:
+                connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+                monitor.owner_initialized(connection, object(), 0)
+
+    def test_four_fixed_matches_precede_ready_without_account_enumeration(self):
+        monitor, emitted, gio, glib, _unix = self.monitor()
+        self.setup(monitor, glib)
+        connection = monitor.connection
+        subscriptions = connection.signal_subscribe.call_args_list
+        self.assertEqual(len(subscriptions), 4)
+        self.assertEqual([call.args[2] for call in subscriptions],
+            ["NameOwnerChanged", "UserAdded", "UserDeleted", "Changed"])
+        self.assertEqual(subscriptions[-1].args[:5], (None, provider.ACCOUNT_INTERFACE,
+            "Changed", None, None))
+        self.assertTrue(all(call.args[5] == gio.DBusSignalFlags.NO_MATCH_RULE for call in subscriptions))
+        self.assertEqual([call.args[3] for call in connection.call.call_args_list],
+            ["AddMatch", "GetNameOwner", "AddMatch", "AddMatch", "AddMatch", "GetNameOwner"])
+        self.assertTrue(all(call.args[0] == "org.freedesktop.DBus" for call in connection.call.call_args_list))
+        self.assertEqual(emitted, [])
+        connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.owner_resolved(connection, object(), 0)
+        self.assertEqual(emitted, ["accounts-event\tready"])
+
+    def test_every_valid_candidate_path_is_covered_before_and_after_ready(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        monitor.owner = ":1.2"
+        for path in ("/users/Excluded", "/future/New", "/org/freedesktop/Accounts/User1000"):
+            monitor.user_changed(None, ":1.2", path, provider.ACCOUNT_INTERFACE,
+                "Changed", glib.Variant("()", ()), None)
+        self.assertTrue(monitor.dirty)
+        self.assertEqual(emitted, [])
+        monitor.connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.owner_resolved(monitor.connection, object(), 0)
+        self.assertEqual(emitted, ["accounts-event\tready", "accounts-event\tchanged"])
+        for member in ("UserAdded", "UserDeleted"):
+            monitor.users_changed(None, ":1.2", provider.ACCOUNTS_PATH, provider.ACCOUNTS_NAME,
+                member, glib.Variant("(o)", ("/users/New",)), None)
+        self.assertEqual(len(emitted), 4)
+
+    def test_untrusted_unicast_never_reaches_payload_parsing(self):
+        for owner, sender in (("", ":1.2"), (":1.2", ":1.8")):
+            monitor, emitted, _gio, _glib, _unix = self.monitor()
+            monitor.owner = owner
+            payload = mock.Mock()
+            monitor.users_changed(None, sender, provider.ACCOUNTS_PATH, provider.ACCOUNTS_NAME,
+                "UserAdded", payload, None)
+            monitor.user_changed(None, sender, "/users/Unknown", provider.ACCOUNT_INTERFACE,
+                "Changed", payload, None)
+            payload.get_type_string.assert_not_called()
+            self.assertFalse(monitor.stopped)
+            self.assertFalse(monitor.dirty)
+            self.assertEqual(emitted, [])
+
+    def test_notifications_are_typed_bounded_and_scope_checked(self):
+        for manager in (True, False):
+            monitor, emitted, _gio, glib, _unix = self.monitor()
+            monitor.owner, monitor.ready = ":1.2", True
+            callback = monitor.users_changed if manager else monitor.user_changed
+            interface = provider.ACCOUNTS_NAME if manager else provider.ACCOUNT_INTERFACE
+            path = provider.ACCOUNTS_PATH if manager else "/users/Changed"
+            member = "UserAdded" if manager else "Changed"
+            callback(None, ":1.2", path, "org.example.Unrelated", member, mock.Mock(), None)
+            callback(None, ":1.2", path, interface, "Unrelated", mock.Mock(), None)
+            self.assertEqual(emitted, [])
+            callback(None, ":1.2", path, interface, member, glib.Variant("(s)", ("wrong",)), None)
+            self.assertTrue(monitor.stopped)
+        for manager in (True, False):
+            monitor, _emitted, _gio, glib, _unix = self.monitor()
+            monitor.owner = ":1.2"
+            path = "/" + "x" * 513
+            if manager:
+                monitor.users_changed(None, ":1.2", provider.ACCOUNTS_PATH, provider.ACCOUNTS_NAME,
+                    "UserDeleted", glib.Variant("(o)", (path,)), None)
+            else:
+                monitor.user_changed(None, ":1.2", path, provider.ACCOUNT_INTERFACE,
+                    "Changed", glib.Variant("()", ()), None)
+            self.assertTrue(monitor.stopped)
+
+    def test_owner_replacement_rejects_old_senders_and_departure_is_quiet(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        monitor.owner, monitor.ready = ":1.2", True
+        owner = RegionalEventMonitorTests().owner
+        owner(monitor, glib, ":1.2", ":1.3")
+        self.assertEqual(emitted, ["accounts-event\tchanged"])
+        monitor.user_changed(None, ":1.2", "/users/Old", provider.ACCOUNT_INTERFACE,
+            "Changed", glib.Variant("()", ()), None)
+        self.assertEqual(len(emitted), 1)
+        owner(monitor, glib, ":1.3", "")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(monitor.owner, "")
+
+    def test_denied_partial_setup_removes_only_owned_rules_and_all_local_sources(self):
+        monitor, emitted, gio, glib, unix = self.monitor()
+        connection = monitor.connection
+        connection.signal_subscribe.side_effect = [20, 21, 22, 23]
+        connection.connect.return_value = 24
+        glib.timeout_add.return_value = 10
+        unix.signal_add.side_effect = [11, 12, 13]
+        def run():
+            monitor.connected(None, object(), None)
+            monitor.match_finished(connection, object(), monitor.match_rules[0])
+            connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+            monitor.owner_initialized(connection, object(), 0)
+            connection.call_finish.side_effect = glib.Error("denied service match")
+            monitor.match_finished(connection, object(), monitor.match_rules[1])
+        monitor.loop.run.side_effect = run
+        self.assertEqual(monitor.run(), 1)
+        self.assertEqual(emitted, [])
+        self.assertEqual([call.args[0] for call in connection.signal_unsubscribe.call_args_list], [20, 21, 22, 23])
+        self.assertEqual([call.args[0] for call in glib.source_remove.call_args_list], [11, 12, 13, 10])
+        removals = [call for call in connection.call.call_args_list if call.args[3] == "RemoveMatch"]
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals[0].args[4].unpack(), (monitor.match_rules[0],))
+        connection.close_sync.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            monitor.run()
+        self.assertEqual(gio.bus_get.call_count, 1)
+
+    def test_cli_is_argument_free_and_private_bus_lifecycle_and_unicast_pass(self):
+        with mock.patch.object(provider, "watch_account_events", return_value=0) as watch, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(provider.main(["watch-accounts"]), 0)
+            for extra in ("user", "--system", "/users/Selected"):
+                self.assertEqual(provider.main(["watch-accounts", extra]), 2)
+            watch.assert_called_once_with()
+            backend.assert_not_called()
+        for fixture, expected in (("system-update-events-bus.py", "accounts private-bus event monitor: PASS\n"),
+                                  ("system-regional-setup-bus.py", "Account setup unicast authentication: PASS\n")):
+            result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+                str(REPO / "tests/fixtures" / fixture), str(PROVIDER_PATH), "accounts"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+
+
+class UnitEventMonitorTests(unittest.TestCase):
+    def monitor(self, kind="printers"):
+        _regional, emitted, gio, glib, unix = RegionalEventMonitorTests().monitor()
+        monitor = provider.UnitEventMonitor(kind, gio, glib, unix, emitted.append)
+        monitor.deadline = time.monotonic() + 10
+        monitor.deadline_source = 7
+        monitor.connection = mock.Mock()
+        gio.DBusConnection.new_for_address_finish.return_value = monitor.connection
+        return monitor, emitted, gio, glib, unix
+
+    def resolve(self, monitor, glib):
+        identity = (monitor.resolution_epoch, monitor.resolve_round)
+        for index, name in enumerate(monitor.units):
+            monitor.connection.call_finish.return_value = glib.Variant("(o)",
+                (provider.SYSTEMD_PATH + "/unit/Alias" + str(index),))
+            monitor.unit_resolved(monitor.connection, object(), (*identity, name))
+
+    def setup(self, monitor, glib, finish=True):
+        connection = monitor.connection
+        monitor.connected(None, object(), None)
+        for index, rule in enumerate(monitor.match_rules):
+            connection.call_finish.return_value = glib.Variant("()", ())
+            monitor.match_finished(connection, object(), rule)
+            if index == 0:
+                connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+                monitor.owner_initialized(connection, object(), 0)
+        connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.owner_resolved(connection, object(), 0)
+        connection.call_finish.return_value = glib.Variant("()", ())
+        monitor.subscribed(connection, object(), None)
+        self.resolve(monitor, glib)
+        if finish:
+            connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+            monitor.final_owner(connection, object(), (0, monitor.resolution_epoch))
+
+    def manager(self, monitor, glib, member="UnitNew", sender=":1.2"):
+        monitor.manager_event(None, sender, monitor.path, provider.SYSTEMD_MANAGER, member,
+            glib.Variant("(so)", ("unrelated.service", provider.SYSTEMD_PATH + "/unit/Unknown")), None)
+
+    def test_private_connection_fixed_calls_and_all_barriers_precede_readiness(self):
+        for kind, count in (("printers", 2), ("security", 1)):
+            monitor, emitted, gio, glib, _unix = self.monitor(kind)
+            self.setup(monitor, glib)
+            self.assertEqual(emitted, ["units-event\tready"])
+            gio.bus_get.assert_not_called()
+            gio.bus_get_finish.assert_not_called()
+            calls = monitor.connection.call.call_args_list
+            self.assertEqual([call.args[3] for call in calls],
+                ["AddMatch", "GetNameOwner", *(["AddMatch"] * 5), "GetNameOwner",
+                 "Subscribe", *(["GetUnit"] * count), "GetNameOwner"])
+            system_calls = [call for call in calls if call.args[0] == ":1.2"]
+            self.assertEqual([call.args[3] for call in system_calls], ["Subscribe", *(["GetUnit"] * count)])
+            self.assertEqual([call.args[4].unpack()[0] for call in system_calls[1:]], list(monitor.units))
+            self.assertTrue(all(call.args[6] == gio.DBusCallFlags.NO_AUTO_START for call in system_calls))
+            subscriptions = monitor.connection.signal_subscribe.call_args_list
+            self.assertEqual(len(subscriptions), 6)
+            self.assertEqual(subscriptions[-1].args[3:5], (None, provider.SYSTEMD_NAME + ".Unit"))
+            self.assertEqual(set(monitor.paths), set(monitor.units))
+
+    def test_authentication_precedes_decoding_during_setup_and_after_readiness(self):
+        for ready in (False, True):
+            monitor, emitted, _gio, glib, _unix = self.monitor()
+            monitor.ready = ready
+            for owner in ("", ":1.2"):
+                monitor.owner = owner
+                bad = glib.Variant("(s)", ("x" * 70000,))
+                monitor.manager_event(None, ":1.9", monitor.path, provider.SYSTEMD_MANAGER, "UnitNew", bad, None)
+                monitor.properties_changed(None, ":1.9", provider.SYSTEMD_PATH + "/unit/Alias",
+                    provider.PROPERTIES_INTERFACE, "PropertiesChanged", bad, None)
+            self.assertFalse(monitor.stopped)
+            self.assertFalse(monitor.dirty)
+            self.assertEqual(emitted, [])
+
+    def test_reconciliation_has_one_settling_pass_and_rejects_late_epochs(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        self.setup(monitor, glib)
+        monitor.connection.call.reset_mock()
+        self.manager(monitor, glib)
+        old_identity = (monitor.resolution_epoch - 1, 0, monitor.units[0])
+        monitor.unit_resolved(monitor.connection, object(), old_identity)
+        self.assertEqual(monitor.waiting, set(monitor.units))
+        for _ in range(100):
+            self.manager(monitor, glib)
+        self.resolve(monitor, glib)
+        self.assertEqual(monitor.resolve_round, 1)
+        for _ in range(100):
+            self.manager(monitor, glib)
+        self.resolve(monitor, glib)
+        self.assertTrue(monitor.stopped)
+        self.assertEqual(monitor.exit_code, 1)
+        self.assertEqual(len(monitor.connection.call.call_args_list), 4)
+        self.assertEqual(emitted, ["units-event\tready"])
+
+    def test_event_during_final_barrier_cannot_publish_stale_or_duplicate_ready(self):
+        monitor, emitted, _gio, glib, _unix = self.monitor()
+        self.setup(monitor, glib, finish=False)
+        old = (0, monitor.resolution_epoch)
+        self.manager(monitor, glib)
+        monitor.connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        monitor.final_owner(monitor.connection, object(), old)
+        self.assertEqual(emitted, [])
+        self.resolve(monitor, glib)
+        monitor.connection.call_finish.return_value = glib.Variant("(s)", (":1.2",))
+        current = (0, monitor.resolution_epoch)
+        monitor.final_owner(monitor.connection, object(), current)
+        monitor.final_owner(monitor.connection, object(), old)
+        monitor.final_owner(monitor.connection, object(), current)
+        self.assertEqual(emitted, ["units-event\tready"])
+
+    def test_typed_scope_deadline_and_owner_loss_fail_without_reconnect(self):
+        for invalid in ("signature", "path", "deadline", "owner"):
+            monitor, emitted, gio, glib, _unix = self.monitor()
+            self.setup(monitor, glib)
+            if invalid == "owner":
+                RegionalEventMonitorTests().owner(monitor, glib, ":1.2", ":1.3")
+            else:
+                monitor.reconcile()
+                if invalid == "deadline":
+                    monitor.resolve_deadline = time.monotonic() - 1
+                signature, value = ("(s)", "bad") if invalid == "signature" else ("(o)", "/wrong_scope")
+                monitor.connection.call_finish.return_value = glib.Variant(signature, (value,))
+                monitor.unit_resolved(monitor.connection, object(),
+                    (monitor.resolution_epoch, monitor.resolve_round, monitor.units[0]))
+            self.assertTrue(monitor.stopped)
+            self.assertEqual(monitor.exit_code, 1)
+            gio.bus_get.assert_not_called()
+            self.assertEqual(emitted[0], "units-event\tready")
+
+    def test_property_bounds_and_synchronous_call_errors_fail_closed(self):
+        for signature, value in (("(s)", ("x",)),
+                ("(sa{sv}as)", (provider.SYSTEMD_NAME + ".Unit", {"ActiveState": None}, []))):
+            monitor, emitted, _gio, glib, _unix = self.monitor()
+            self.setup(monitor, glib)
+            if signature == "(sa{sv}as)":
+                value[1]["ActiveState"] = glib.Variant("b", True)
+            monitor.properties_changed(None, ":1.2", monitor.paths[monitor.units[0]],
+                provider.PROPERTIES_INTERFACE, "PropertiesChanged", glib.Variant(signature, value), None)
+            self.assertTrue(monitor.stopped)
+            self.assertEqual(emitted, ["units-event\tready"])
+        monitor, _emitted, _gio, glib, _unix = self.monitor()
+        self.setup(monitor, glib)
+        monitor.connection.call.side_effect = glib.Error("fixture call failure")
+        monitor.reconcile()
+        self.assertTrue(monitor.stopped)
+
+    def test_cli_grammar_and_real_private_bus_lifecycle(self):
+        with mock.patch.object(provider, "watch_service_events", return_value=0) as watch, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                contextlib.redirect_stderr(io.StringIO()):
+            for kind in ("printers", "security"):
+                self.assertEqual(provider.main(["watch-units", kind]), 0)
+            for args in ([], ["cups.service"], ["printers", "extra"], ["--system"]):
+                self.assertEqual(provider.main(["watch-units", *args]), 2)
+            self.assertEqual(watch.call_args_list, [mock.call("printers"), mock.call("security")])
+            backend.assert_not_called()
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-unit-events-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Private-bus unit events: PASS\n")
+
+
+class HardwareReadTests(unittest.TestCase):
+    def reader(self):
+        _regional, connection, gio, glib, variant = RegionalReadTests().reader()
+        return provider.HardwareRead(gio, glib), connection, gio, glib, variant
+
+    def reply(self, read, connection, variant, field, value="Fixture"):
+        connection.call_finish.return_value = variant.Variant("(v)", (variant.Variant("s", value),))
+        read.replied(connection, object(), field)
+
+    def test_fixed_gets_reply_orders_cleanup_and_single_use(self):
+        for order in (("HardwareVendor", "HardwareModel"), ("HardwareModel", "HardwareVendor")):
+            read, connection, gio, glib, variant = self.reader()
+            def run():
+                read.connected(None, object(), None)
+                for field in order:
+                    self.reply(read, connection, variant, field, field)
+            read.loop.run.side_effect = run
+            result = read.run()
+            self.assertEqual({key: state.value for key, state in result.items()},
+                {"hardware-vendor": "HardwareVendor", "hardware-model": "HardwareModel"})
+            self.assertTrue(all(state.status == "available" for state in result.values()))
+            calls = connection.call.call_args_list
+            self.assertEqual(len(calls), 2)
+            for call, field in zip(calls, ("HardwareVendor", "HardwareModel")):
+                self.assertEqual(call.args[:4], ("org.freedesktop.hostname1", "/org/freedesktop/hostname1",
+                    provider.PROPERTIES_INTERFACE, "Get"))
+                self.assertEqual(call.args[4].unpack(), ("org.freedesktop.hostname1", field))
+                self.assertEqual(call.args[5].dup_string(), "(v)")
+                self.assertEqual(call.args[6], gio.DBusCallFlags.NONE)
+                self.assertTrue(0 < call.args[7] <= 10000)
+                self.assertIs(call.args[8], read.cancellable)
+            glib.timeout_add.assert_called_once_with(10000, read.expire)
+            glib.source_remove.assert_called_once_with(17)
+            self.assertTrue(read.cancellable.cancel.called)
+            connection.close_sync.assert_not_called()
+            with self.assertRaises(RuntimeError):
+                read.run()
+
+    def test_property_errors_preserve_the_peer(self):
+        for field in provider.HARDWARE_INFORMATION_FIELDS:
+            peer = next(key for key in provider.HARDWARE_INFORMATION_FIELDS if key != field)
+            for remote, status, code in (("UnknownProperty", "unsupported", "unsupported"),
+                    ("AccessDenied", "restricted", "permission-denied"),
+                    ("NoReply", "unavailable", "timeout")):
+                read, connection, gio, _glib, variant = self.reader()
+                def run():
+                    read.connected(None, object(), None)
+                    gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error." + remote
+                    connection.call_finish.side_effect = variant.Error("private service detail")
+                    read.replied(connection, object(), field)
+                    connection.call_finish.side_effect = None
+                    self.reply(read, connection, variant, peer)
+                read.loop.run.side_effect = run
+                result = read.run()
+                failed = result[provider.HARDWARE_INFORMATION_FIELDS[field]]
+                self.assertEqual((failed.status, failed.value, failed.error_code), (status, "unknown", code))
+                self.assertEqual(result[provider.HARDWARE_INFORMATION_FIELDS[peer]].status, "available")
+                self.assertNotIn("private service detail", repr(result))
+
+    def test_malformed_envelope_type_text_and_byte_bound_are_scoped(self):
+        from gi.repository import GLib
+        cases = [(GLib.Variant("(s)", ("wrong",)), False),
+            (GLib.Variant("(v)", (GLib.Variant("b", True),)), False)]
+        for text, valid in (("", False), ("\n", False), ("x" * 512, True), ("x" * 513, False),
+                            ("\u00e9" * 256, True), ("\u00e9" * 257, False), ("x" * 4096, False)):
+            cases.append((GLib.Variant("(v)", (GLib.Variant("s", text),)), valid))
+        for reply, valid in cases:
+            read, connection, _gio, _glib, variant = self.reader()
+            def run():
+                read.connected(None, object(), None)
+                connection.call_finish.return_value = reply
+                read.replied(connection, object(), "HardwareVendor")
+                self.reply(read, connection, variant, "HardwareModel")
+            read.loop.run.side_effect = run
+            result = read.run()
+            self.assertEqual(result["hardware-vendor"].status, "available" if valid else "partial")
+            self.assertEqual(result["hardware-model"].value, "Fixture")
+
+    def test_oversized_reply_is_rejected_before_child_extraction(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        reply = mock.Mock()
+        reply.get_type_string.return_value = "(v)"
+        reply.get_size.return_value = 1000000
+        def run():
+            read.connected(None, object(), None)
+            connection.call_finish.return_value = reply
+            read.replied(connection, object(), "HardwareVendor")
+            self.reply(read, connection, variant, "HardwareModel")
+        read.loop.run.side_effect = run
+        self.assertEqual(read.run()["hardware-vendor"].error_code, "malformed")
+        reply.get_child_value.assert_not_called()
+
+    def test_aggregate_timeout_preserves_a_valid_peer_and_discards_late_replies(self):
+        for field in provider.HARDWARE_INFORMATION_FIELDS:
+            peer = next(key for key in provider.HARDWARE_INFORMATION_FIELDS if key != field)
+            read, connection, _gio, glib, variant = self.reader()
+            def run():
+                read.connected(None, object(), None)
+                self.reply(read, connection, variant, peer)
+                read.expire()
+            read.loop.run.side_effect = run
+            result = read.run()
+            self.assertEqual(result[provider.HARDWARE_INFORMATION_FIELDS[peer]].status, "available")
+            failed = result[provider.HARDWARE_INFORMATION_FIELDS[field]]
+            self.assertEqual((failed.status, failed.value, failed.error_code), ("unavailable", "unknown", "timeout"))
+            connection.call_finish.reset_mock()
+            read.replied(connection, object(), field)
+            read.replied(connection, object(), peer)
+            connection.call_finish.assert_not_called()
+            glib.source_remove.assert_not_called()
+
+    def test_deadline_crossed_during_decode_cannot_publish_late_success(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        original = provider.information_text
+        def decode(value, detail):
+            read.deadline = time.monotonic() - 1
+            return original(value, detail)
+        def run():
+            read.connected(None, object(), None)
+            self.reply(read, connection, variant, "HardwareModel")
+            with mock.patch.object(provider, "information_text", side_effect=decode):
+                self.reply(read, connection, variant, "HardwareVendor")
+        read.loop.run.side_effect = run
+        result = read.run()
+        self.assertEqual(result["hardware-model"].status, "available")
+        self.assertEqual(result["hardware-vendor"].error_code, "timeout")
+
+    def test_expired_connection_never_dispatches(self):
+        read, connection, gio, _glib, _variant = self.reader()
+        def run():
+            read.deadline = time.monotonic() - 1
+            read.connected(None, object(), None)
+        read.loop.run.side_effect = run
+        self.assertTrue(all(state.error_code == "timeout" for state in read.run().values()))
+        gio.bus_get_finish.assert_not_called()
+        connection.call.assert_not_called()
+
+    def test_duplicate_callback_cannot_replace_an_already_validated_property(self):
+        read, connection, _gio, _glib, variant = self.reader()
+        def run():
+            read.connected(None, object(), None)
+            self.reply(read, connection, variant, "HardwareVendor", "First")
+            self.reply(read, connection, variant, "HardwareVendor", "Duplicate")
+            self.reply(read, connection, variant, "HardwareModel")
+        read.loop.run.side_effect = run
+        self.assertEqual(read.run()["hardware-vendor"].value, "First")
+        self.assertEqual(connection.call_finish.call_count, 2)
+
+    def test_dispatch_failure_does_not_prevent_peer_dispatch(self):
+        read, connection, gio, _glib, variant = self.reader()
+        connection.call.side_effect = [variant.Error("denied"), None]
+        gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error.AccessDenied"
+        def run():
+            read.connected(None, object(), None)
+            self.reply(read, connection, variant, "HardwareModel")
+        read.loop.run.side_effect = run
+        result = read.run()
+        self.assertEqual(connection.call.call_count, 2)
+        self.assertEqual(result["hardware-vendor"].status, "restricted")
+        self.assertEqual(result["hardware-model"].status, "available")
+
+    def test_bus_failure_and_missing_bindings_are_scoped(self):
+        read, connection, gio, _glib, variant = self.reader()
+        gio.bus_get_finish.side_effect = variant.Error("private bus failure")
+        read.loop.run.side_effect = lambda: read.connected(None, object(), None)
+        result = read.run()
+        self.assertTrue(all(state.status == "unavailable" for state in result.values()))
+        self.assertNotIn("private bus failure", repr(result))
+        connection.call.assert_not_called()
+        failure = provider.SnapshotFailure("missing-provider", "Bindings unavailable", "unavailable")
+        with mock.patch.object(provider, "HardwareRead", side_effect=failure), \
+                mock.patch.object(provider, "open_journal_directory") as journal:
+            result = provider.read_hardware_information()
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(state.error_code == "missing-provider" for state in result.values()))
+        journal.assert_not_called()
+
+    def test_wrapper_keeps_cooperative_interruption(self):
+        with mock.patch.object(provider, "HardwareRead") as reader, \
+                mock.patch.object(provider, "run_interruptible_read", side_effect=InterruptedError) as run:
+            with self.assertRaises(InterruptedError):
+                provider.read_hardware_information()
+            run.assert_called_once_with(reader.return_value)
+
+    def test_real_private_bus_property_isolation_and_aggregate_deadlines(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-hardware-read-bus.py"), str(PROVIDER_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=70)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Private-bus hardware reads: PASS (fixed properties, isolation, four real deadlines, late replies, shared bus)\n")
+
+
+class NtpReadTests(unittest.TestCase):
+    def reader(self):
+        _regional, connection, gio, glib, variant = RegionalReadTests().reader()
+        return provider.NtpRead(gio, glib), connection, gio, glib, variant
+
+    def test_only_two_fixed_boolean_gets_under_one_deadline(self):
+        read, connection, gio, glib, variant = self.reader()
+        def run():
+            read.connected(None, object(), None)
+            for field, value in (("NTPSynchronized", False), ("CanNTP", True)):
+                connection.call_finish.return_value = variant.Variant("(v)", (variant.Variant("b", value),))
+                read.replied(connection, object(), field)
+        read.loop.run.side_effect = run
+        self.assertEqual(read.run(), provider.NtpSample(True, False))
+        calls = connection.call.call_args_list
+        self.assertEqual(len(calls), 2)
+        for call, field in zip(calls, ("CanNTP", "NTPSynchronized")):
+            self.assertEqual(call.args[:4], ("org.freedesktop.timedate1", "/org/freedesktop/timedate1",
+                provider.PROPERTIES_INTERFACE, "Get"))
+            self.assertEqual(call.args[4].unpack(), ("org.freedesktop.timedate1", field))
+            self.assertEqual(call.args[6], gio.DBusCallFlags.NONE)
+            self.assertTrue(0 < call.args[7] <= 10000)
+        glib.source_remove.assert_called_once_with(17)
+        connection.close_sync.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            read.run()
+
+    def test_partial_timeout_denial_and_bad_types_do_not_publish_a_sample(self):
+        for failure in ("timeout", "denial", "type", "oversized"):
+            read, connection, gio, _glib, variant = self.reader()
+            def run():
+                read.connected(None, object(), None)
+                connection.call_finish.return_value = variant.Variant("(v)", (variant.Variant("b", True),))
+                read.replied(connection, object(), "CanNTP")
+                self.assertFalse(read.done)
+                if failure == "timeout":
+                    read.deadline = time.monotonic() - 1
+                elif failure == "denial":
+                    gio.dbus_error_get_remote_error.return_value = "org.freedesktop.DBus.Error.AccessDenied"
+                    connection.call_finish.side_effect = variant.Error("denied")
+                else:
+                    connection.call_finish.return_value = variant.Variant("(v)",
+                        (variant.Variant("s", "x" * (100 if failure == "oversized" else 1)),))
+                read.replied(connection, object(), "NTPSynchronized")
+            read.loop.run.side_effect = run
+            with self.assertRaises(provider.SnapshotFailure) as caught:
+                read.run()
+            self.assertEqual(caught.exception.code, {"timeout": "timeout", "denial": "permission-denied"}.get(failure, "malformed"))
+            self.assertIsNone(read.value)
+            connection.call_finish.reset_mock(side_effect=True)
+            read.replied(connection, object(), "NTPSynchronized")
+            connection.call_finish.assert_not_called()
+
+
+class TimeStatusCommandTests(unittest.TestCase):
+    header = "time-status-protocol\t1\t0\n"
+    complete = "complete\ttime-status\n"
+
+    def test_exact_tuple_and_strict_validation(self):
+        for can_ntp in (False, True):
+            for enabled in (False, True):
+                for synchronized in (False, True):
+                    state = provider.RegionalTimeState("Etc/UTC", can_ntp, enabled, synchronized)
+                    with mock.patch.object(provider, "RegionalRead") as reader:
+                        reader.return_value.run.return_value = state
+                        output, code = provider.time_status_output()
+                    reader.assert_called_once_with("time-state")
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output, self.header + "time\tEtc/UTC\t"
+                        + "\t".join("yes" if value else "no" for value in (can_ntp, enabled, synchronized))
+                        + "\n" + self.complete)
+        for state in (None, ("UTC", True, True, True),
+                      provider.RegionalTimeState("UTC", 1, True, True),
+                      provider.RegionalTimeState("UTC", True, "yes", True),
+                      provider.RegionalTimeState("UTC", True, True, 0),
+                      provider.RegionalTimeState("UTC\nrecord", True, True, True)):
+            with mock.patch.object(provider, "RegionalRead") as reader:
+                reader.return_value.run.return_value = state
+                output, code = provider.time_status_output()
+            self.assertEqual(code, 1)
+            self.assertIn("\nerror\ttime-status\tmalformed\t", output)
+            self.assertNotIn("\ntime\t", output)
+
+    def test_scoped_error_bounds_and_fixed_cli(self):
+        for error_code in (*sorted(provider.NTP_SAMPLE_ERROR_CODES), "other"):
+            with mock.patch.object(provider, "RegionalRead", side_effect=provider.SnapshotFailure(
+                    error_code, "failure\n\t\x00\ud800" + "é" * 600)):
+                output, code = provider.time_status_output()
+            self.assertEqual(code, 1)
+            self.assertEqual(len(output.splitlines()), 3)
+            self.assertTrue(output.startswith(self.header + "error\ttime-status\t"
+                + ("internal" if error_code == "other" else error_code) + "\t"))
+            self.assertTrue(output.endswith(self.complete))
+            self.assertLessEqual(len(output.encode()), provider.TIME_STATUS_STREAM_BYTES)
+        with mock.patch.object(provider, "RegionalRead") as reader, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                mock.patch.object(provider, "open_journal_directory") as journal, \
+                mock.patch.object(provider, "native_command") as mutation, \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()):
+            reader.return_value.run.return_value = provider.RegionalTimeState("UTC", True, False, True)
+            self.assertEqual(provider.main(["time-status"]), 0)
+            self.assertEqual(output.getvalue(), self.header + "time\tUTC\tyes\tno\tyes\n" + self.complete)
+            for args in (["time"], ["--system"], ["Timezone"], ["extra", "argument"]):
+                self.assertEqual(provider.main(["time-status", *args]), 2)
+            reader.assert_called_once_with("time-state")
+            backend.assert_not_called()
+            journal.assert_not_called()
+            mutation.assert_not_called()
+
+    def test_output_failure_and_interruption_never_report_success(self):
+        for failure in (0, 1, BlockingIOError(), BrokenPipeError(), InterruptedError()):
+            writer = mock.Mock(side_effect=failure) if isinstance(failure, OSError) else mock.Mock(return_value=failure)
+            with mock.patch.object(provider, "control_output_writers", return_value=contextlib.nullcontext((writer, None))), \
+                    mock.patch.object(provider, "RegionalRead") as reader:
+                reader.return_value.run.return_value = provider.RegionalTimeState("UTC", True, False, True)
+                self.assertEqual(provider.main(["time-status"]), 1)
+            writer.assert_called_once_with((self.header + "time\tUTC\tyes\tno\tyes\n" + self.complete).encode())
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            previous = signal.getsignal(signum)
+            with mock.patch.object(provider, "RegionalRead") as reader, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                def stop():
+                    signal.raise_signal(signum)
+                    signal.raise_signal(signum)
+                    return provider.RegionalTimeState("UTC", True, False, True)
+                reader.return_value.run.side_effect = stop
+                self.assertEqual(provider.main(["time-status"]), 1)
+                self.assertEqual(output.getvalue(), "")
+                reader.return_value.GLib.idle_add.assert_called_once()
+                reader.return_value.GLib.source_remove.assert_called_once()
+            self.assertIs(signal.getsignal(signum), previous)
+
+    def test_actual_command_handles_missing_output_and_unused_diagnostics(self):
+        code = """
+import os, runpy, sys
+from unittest import mock
+provider = runpy.run_path(sys.argv[1], run_name="time_output_fixture")
+mode = sys.argv[2]
+descriptor = 2 if mode.startswith("stderr") else 1
+if mode.endswith("readonly"):
+    source = os.open("/dev/null", os.O_RDONLY)
+    os.dup2(source, descriptor)
+    if source != descriptor:
+        os.close(source)
+elif mode.endswith("stream-closed"):
+    sys.stdout.close()
+else:
+    os.close(descriptor)
+    if mode.endswith("none"):
+        if descriptor == 1:
+            sys.stdout = None
+        else:
+            sys.stderr = None
+output = "time-status-protocol\\t1\\t0\\ntime\\tUTC\\tyes\\tno\\tyes\\ncomplete\\ttime-status\\n"
+reader = (lambda: (output, 0)) if descriptor == 2 else mock.Mock(side_effect=AssertionError("Read without output"))
+with mock.patch.dict(provider["main"].__globals__, time_status_output=reader):
+    raise SystemExit(provider["main"](["time-status"]))
+"""
+        for mode in ("stdout-closed", "stdout-readonly", "stdout-none", "stdout-stream-closed",
+                     "stderr-closed", "stderr-readonly", "stderr-none"):
+            with self.subTest(mode=mode):
+                result = subprocess.run([sys.executable, "-c", code, str(PROVIDER_PATH), mode],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False)
+                available = mode.startswith("stderr")
+                self.assertEqual(result.returncode, 0 if available else 1)
+                self.assertEqual(result.stdout,
+                    (self.header + "time\tUTC\tyes\tno\tyes\n" + self.complete).encode() if available else b"")
+                self.assertEqual(result.stderr, b"")
+
+
+class NtpSampleCommandTests(unittest.TestCase):
+    header = "ntp-sample-protocol\t1\t0\n"
+    complete = "complete\tntp-sample\n"
+
+    def test_all_boolean_pairs_have_one_exact_bounded_stream(self):
+        for can_ntp in (False, True):
+            for synchronized in (False, True):
+                with mock.patch.object(provider, "NtpRead") as reader:
+                    reader.return_value.run.return_value = provider.NtpSample(can_ntp, synchronized)
+                    output, code = provider.ntp_sample_output()
+                self.assertEqual(code, 0)
+                self.assertEqual(output, self.header + "sample\t"
+                    + ("yes" if can_ntp else "no") + "\t" + ("yes" if synchronized else "no") + "\n" + self.complete)
+                self.assertLessEqual(len(output.encode()), provider.NTP_SAMPLE_STREAM_BYTES)
+                reader.assert_called_once_with()
+                reader.return_value.run.assert_called_once_with()
+
+    def test_invalid_values_never_coerce_to_a_successful_sample(self):
+        for value in (None, (True, True), provider.NtpSample(1, True),
+                      provider.NtpSample(True, "yes")):
+            with mock.patch.object(provider, "NtpRead") as reader:
+                reader.return_value.run.return_value = value
+                output, code = provider.ntp_sample_output()
+            self.assertEqual(code, 1)
+            self.assertIn("\nerror\tntp-sample\tmalformed\t", output)
+            self.assertNotIn("\nsample\t", output)
+
+    def test_typed_errors_are_bounded_and_cannot_inject_records(self):
+        for error_code in (*sorted(provider.NTP_SAMPLE_ERROR_CODES), "unrecognized"):
+            failure = provider.SnapshotFailure(error_code, "denied\t\n\r\x00\ud800" + "é" * 600)
+            with mock.patch.object(provider, "NtpRead", side_effect=failure):
+                output, code = provider.ntp_sample_output()
+            self.assertEqual(code, 1)
+            self.assertEqual(len(output.splitlines()), 3)
+            expected_code = "internal" if error_code == "unrecognized" else error_code
+            self.assertTrue(output.startswith(self.header + "error\tntp-sample\t" + expected_code + "\t"))
+            self.assertTrue(output.endswith(self.complete))
+            self.assertNotIn("\nsample\t", output)
+            self.assertLessEqual(len(output.encode()), provider.NTP_SAMPLE_STREAM_BYTES)
+            self.assertTrue(output.splitlines()[1].split("\t")[3].isprintable())
+
+    def test_fixed_cli_never_enters_packagekit_journal_or_mutation_paths(self):
+        with mock.patch.object(provider, "NtpRead") as reader, \
+                mock.patch.object(provider, "PackageKitBackend") as backend, \
+                mock.patch.object(provider, "open_journal_directory") as journal, \
+                mock.patch.object(provider, "native_command") as mutation, \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()):
+            reader.return_value.run.return_value = provider.NtpSample(True, False)
+            self.assertEqual(provider.main(["ntp-sample"]), 0)
+            self.assertEqual(output.getvalue(), self.header + "sample\tyes\tno\n" + self.complete)
+            for arguments in (["time"], ["--system"], ["CanNTP"], ["enabled"], ["extra", "argument"]):
+                self.assertEqual(provider.main(["ntp-sample", *arguments]), 2)
+            reader.assert_called_once_with()
+            backend.assert_not_called()
+            journal.assert_not_called()
+            mutation.assert_not_called()
+
+    def test_short_or_failed_write_cannot_report_completion(self):
+        for result in (0, 1, BlockingIOError(), BrokenPipeError(), InterruptedError()):
+            writer = mock.Mock(side_effect=result) if isinstance(result, OSError) else mock.Mock(return_value=result)
+            with mock.patch.object(provider, "control_output_writers", return_value=contextlib.nullcontext((writer, None))), \
+                    mock.patch.object(provider, "NtpRead") as reader:
+                reader.return_value.run.return_value = provider.NtpSample(True, False)
+                self.assertEqual(provider.ntp_sample_command(), 1)
+            writer.assert_called_once_with((self.header + "sample\tyes\tno\n" + self.complete).encode())
+
+    def test_real_pipe_output_preserves_parent_flags_and_fails_when_full(self):
+        for blocking in (False, True):
+            for full in (False, True):
+                read_fd, write_fd = os.pipe()
+                try:
+                    os.set_blocking(write_fd, False)
+                    if full:
+                        with self.assertRaises(BlockingIOError):
+                            while True:
+                                os.write(write_fd, b"x" * 4096)
+                    os.set_blocking(write_fd, blocking)
+                    original = provider.fcntl.fcntl(write_fd, provider.fcntl.F_GETFL)
+                    with mock.patch.object(provider.sys, "stdout", types.SimpleNamespace(fileno=lambda: write_fd)), \
+                            contextlib.redirect_stderr(io.StringIO()), \
+                            mock.patch.object(provider, "NtpRead") as reader:
+                        reader.return_value.run.return_value = provider.NtpSample(False, False)
+                        started = time.monotonic()
+                        self.assertEqual(provider.ntp_sample_command(), 1 if full else 0)
+                        self.assertLess(time.monotonic() - started, 1)
+                    self.assertEqual(provider.fcntl.fcntl(write_fd, provider.fcntl.F_GETFL), original)
+                    if not full:
+                        self.assertTrue(select.select([read_fd], [], [], 1)[0])
+                        self.assertEqual(os.read(read_fd, 4096), (self.header + "sample\tno\tno\n" + self.complete).encode())
+                finally:
+                    os.close(read_fd)
+                    os.close(write_fd)
+
+    def test_unused_stderr_does_not_prevent_stdout_sampling(self):
+        code = """
+import os, runpy, sys
+from unittest import mock
+provider = runpy.run_path(sys.argv[1], run_name="ntp_output_fixture")
+if sys.argv[2] == "readonly":
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    os.dup2(descriptor, 2)
+    if descriptor != 2:
+        os.close(descriptor)
+else:
+    os.close(2)
+    if sys.argv[2] == "none":
+        sys.stderr = None
+with mock.patch.dict(provider["ntp_sample_output"].__globals__,
+        read_ntp_sample=lambda: provider["NtpSample"](True, False)):
+    raise SystemExit(provider["main"](["ntp-sample"]))
+"""
+        for mode in ("closed", "readonly", "none"):
+            with self.subTest(mode=mode):
+                result = subprocess.run([sys.executable, "-c", code, str(PROVIDER_PATH), mode],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout,
+                    (self.header + "sample\tyes\tno\n" + self.complete).encode())
+                self.assertEqual(result.stderr, b"")
+
+    def test_unavailable_stdout_is_a_controlled_failure(self):
+        code = """
+import os, runpy, sys
+from unittest import mock
+provider = runpy.run_path(sys.argv[1], run_name="ntp_output_fixture")
+mode = sys.argv[2]
+if mode == "readonly":
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    os.dup2(descriptor, 1)
+    if descriptor != 1:
+        os.close(descriptor)
+elif mode == "stream-closed":
+    sys.stdout.close()
+else:
+    os.close(1)
+    if mode == "none":
+        sys.stdout = None
+with mock.patch.dict(provider["ntp_sample_output"].__globals__,
+        read_ntp_sample=mock.Mock(side_effect=AssertionError("Read without output"))):
+    raise SystemExit(provider["main"](["ntp-sample"]))
+"""
+        for mode in ("closed", "readonly", "none", "stream-closed"):
+            with self.subTest(mode=mode):
+                result = subprocess.run([sys.executable, "-c", code, str(PROVIDER_PATH), mode],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"")
+
+    def test_interruption_releases_output_context_and_restores_handlers(self):
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        for signum in handlers:
+            with contextlib.redirect_stdout(io.StringIO()) as output, \
+                    contextlib.redirect_stderr(io.StringIO()), mock.patch.object(provider, "NtpRead") as reader:
+                def signal_read():
+                    signal.raise_signal(signum)
+                    signal.raise_signal(signum)
+                    return provider.NtpSample(True, True)
+                reader.return_value.run.side_effect = signal_read
+                self.assertEqual(provider.ntp_sample_command(), 1)
+                self.assertEqual(output.getvalue(), "")
+                reader.return_value.fail.assert_not_called()
+                reader.return_value.GLib.idle_add.assert_called_once()
+                reader.return_value.GLib.source_remove.assert_called_once_with(
+                    reader.return_value.GLib.idle_add.return_value)
+            for selected, handler in handlers.items():
+                self.assertIs(signal.getsignal(selected), handler)
+
+    def test_signal_between_done_check_and_loop_start_cannot_lose_quit(self):
+        from gi.repository import GLib
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            gio = mock.Mock()
+            read = provider.NtpRead(gio, GLib)
+            loop = read.loop
+            expired = []
+
+            def guarded_stop():
+                expired.append(True)
+                loop.quit()
+                return GLib.SOURCE_REMOVE
+
+            def start():
+                # ServiceRead.run has already passed `if not self.done`.
+                signal.raise_signal(signum)
+                loop.run()
+
+            read.loop = types.SimpleNamespace(run=start, quit=loop.quit)
+            guard = GLib.timeout_add(200, guarded_stop)
+            try:
+                with mock.patch.object(provider, "NtpRead", return_value=read), \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                    self.assertEqual(provider.ntp_sample_command(), 1)
+                self.assertEqual(expired, [], "Cancellation quit before the main loop could observe it")
+                self.assertEqual(output.getvalue(), "")
+                # PyGObject's first loop may emit Python deprecation warnings.
+                self.assertNotIn("Traceback", diagnostic.getvalue())
+                self.assertTrue(read.done)
+                gio.bus_get_finish.assert_not_called()
+            finally:
+                if not expired:
+                    GLib.source_remove(guard)
+
+
+class OperationStreamTests(unittest.TestCase):
+    operation_id = "op-" + "1" * 32
+    started = "2026-09-05T01:00:00Z"
+    finished = "2026-09-05T00:00:00Z"  # A wall-clock rollback is valid.
+
+    def terminal(self, action="updates-refresh", state="succeeded", error=None):
+        kind = provider.JOURNAL_OPERATION_ACTION_KINDS[action]
+        return provider.JournalOperation(
+            self.operation_id, action, self.started, self.finished, kind, state,
+            error, "Durable result", "a" * 64 if kind == "update" else None,
+            "/18_adcbcaed" if kind in {"refresh", "update"} else None,
+            "none" if kind == "update" else None,
+            "none" if kind == "update" else None,
+            False if kind == "update" else None,
+            "01234567-89ab-cdef-0123-456789abcdef" if kind == "update" else None,
+            123 if kind in {"refresh", "update"} else None, 0,
+        )
+
+    def stream(self, output, action="updates-refresh"):
+        return provider.OperationStream(self.operation_id, action, self.started, "Starting", output.append)
+
+    def test_user_error_stays_separate_from_audit_detail(self):
+        output = []
+        stream = self.stream(output, "updates-install-all")
+        stream.transition("running", "Working")
+        stream.finish(self.terminal("updates-install-all", "failed", "network"), detail="Internal audit comparison")
+        records = "".join(output).splitlines()
+        self.assertEqual(rows(records, "error")[0][3], "Durable result")
+        self.assertEqual(rows(records, "audit")[0][7], "Internal audit comparison")
+
+    def test_item_progress_is_coalesced_bounded_and_separate_from_lifecycle(self):
+        output = []
+        stream = self.stream(output, "updates-install-all")
+        stream.transition("running", "Working")
+        stream.item_progress("example", "downloading", 42)
+        stream.item_progress("example", "downloading", 42)
+        self.assertEqual(len(rows("".join(output).splitlines(), "package-progress")), 1)
+        self.assertEqual(stream.progress_records, 0)
+        for index in range(4200):
+            stream.item_progress("example", "installing", index % 101)
+        items = rows("".join(output).splitlines(), "package-progress")
+        self.assertEqual(len(items), 4097)
+        self.assertEqual(items[-1][2:], ["", "working", "unknown"])
+        stream.finish(self.terminal("updates-install-all"))
+        self.assertIn("complete\toperation\n", "".join(output))
+        with self.assertRaises(provider.OperationProtocolError):
+            stream.item_progress("example", "installing", 50)
+
+    def test_progress_cap_reserves_every_lifecycle_and_terminal_record(self):
+        output = []
+        stream = self.stream(output)
+        stream.transition("authorizing", "Authorization")
+        stream.transition("running", "Running")
+        for index in range(400):
+            emitted = stream.transition("running", str(index), percent=index % 101, cancelable=True)
+            self.assertEqual(emitted, index < 252)
+        self.assertTrue(stream.transition("cancel-requested", "Cancellation requested", cancelable=False))
+        self.assertFalse(stream.transition("cancel-requested", "Still waiting", percent=100))
+        stream.finish(self.terminal())  # Success may race cancellation.
+        lines = "".join(output).splitlines()
+        operations = rows(lines, "operation")
+        self.assertEqual(len(operations), 257)
+        self.assertEqual([row[4] for row in operations[:3]], ["pending", "authorizing", "running"])
+        self.assertEqual([row[4] for row in operations[-2:]], ["cancel-requested", "succeeded"])
+        self.assertEqual(operations[-1][6], "no")
+        self.assertEqual(rows(lines, "audit")[0][1:7], [self.operation_id, "updates-refresh", "refresh", "succeeded", self.started, self.finished])
+        self.assertEqual(lines[-1], "complete\toperation")
+        self.assertLess(len("".join(output).encode()), 8 * 1024 * 1024)
+        self.assertEqual(stream.progress_records, 252)
+
+    def test_repeated_progress_is_coalesced_but_changed_cancelability_is_visible(self):
+        output = []
+        stream = self.stream(output)
+        stream.transition("running", "Working", percent=0)
+        self.assertFalse(stream.transition("running", "Working", percent=0))
+        self.assertTrue(stream.transition("running", "Working", percent=0, cancelable=True))
+        self.assertEqual(stream.progress_records, 1)
+
+    def test_pending_and_authorizing_progress_share_the_budget_without_consuming_lifecycle(self):
+        output = []
+        stream = self.stream(output)
+        stream.progress("Pending", cancelable=True)
+        stream.transition("authorizing", "Authorization")
+        for index in range(300):
+            stream.progress("Authorization", cancelable=index % 2 == 0)
+        self.assertEqual(stream.progress_records, 252)
+        stream.transition("running", "Running")
+        stream.transition("cancel-requested", "Cancel requested")
+        stream.finish(self.terminal())
+        operation_rows = rows("".join(output).splitlines(), "operation")
+        self.assertEqual(len(operation_rows), 257)
+        self.assertEqual([row[4] for row in operation_rows[-3:]], ["running", "cancel-requested", "succeeded"])
+
+    def test_replay_all_kinds_and_results_preserves_exact_terminal_and_error_owner(self):
+        for action in provider.JOURNAL_OPERATION_ACTION_KINDS:
+            for state in sorted(provider.JOURNAL_OPERATION_TERMINAL_STATES):
+                with self.subTest(action=action, state=state):
+                    error = "internal" if state == "failed" else None
+                    record = self.terminal(action, state, error)
+                    output = []
+                    provider.replay_terminal_operation(record, output.append)
+                    lines = "".join(output).splitlines()
+                    states = [row[4] for row in rows(lines, "operation")]
+                    implied = ["running"] if state == "succeeded" else ["authorizing"] if state == "permission-denied" else []
+                    self.assertEqual(states, ["pending", *implied, state])
+                    self.assertEqual(rows(lines, "operation")[-1][7], record.detail)
+                    self.assertEqual(rows(lines, "audit")[0][-1], record.detail)
+                    self.assertEqual(len(rows(lines, "audit")), 1)
+                    self.assertEqual(len(rows(lines, "complete")), 1)
+                    if error:
+                        owner = "updates" if record.kind in {"refresh", "update"} else "regional" if record.kind != "delegate" else "accounts" if action in {"accounts-open", "password-open"} else action.split("-")[0]
+                        self.assertEqual(rows(lines, "error"), [["error", owner, error, record.detail]])
+                        self.assertEqual(lines[-4].split("\t")[0], "error")
+                    else:
+                        self.assertEqual(rows(lines, "error"), [])
+                    if record.kind == "update":
+                        self.assertIn("comparison is unavailable", rows(lines, "operation")[0][-1])
+
+    def test_invalid_transitions_fields_and_terminal_identity_emit_nothing(self):
+        output = []
+        stream = self.stream(output)
+        before = tuple(output)
+        for state, options in (
+            ("pending", {}), ("cancel-requested", {}), ("succeeded", {}),
+            ("running", {"percent": 101}), ("running", {"percent": True}),
+            ("running", {"percent": "50"}), ("running", {"cancelable": 1}),
+        ):
+            with self.subTest(state=state, options=options), self.assertRaises(ValueError):
+                stream.transition(state, "Invalid", **options)
+            self.assertEqual(tuple(output), before)
+        for detail in ("bad\tvalue", "bad\nvalue", "bad\0value", "x" * 513, "\ud800"):
+            with self.subTest(detail=repr(detail)), self.assertRaises(ValueError):
+                stream.transition("running", detail)
+            self.assertEqual(tuple(output), before)
+        for record in (
+            self.terminal(),  # Success before running is invalid.
+            self.terminal(state="failed"),  # Failed requires an error.
+            replace(self.terminal(state="failed", error="internal"), operation_id="op-" + "2" * 32),
+            replace(self.terminal(state="failed", error="internal"), started_at=self.finished),
+        ):
+            with self.assertRaises(ValueError):
+                stream.finish(record)
+            self.assertEqual(tuple(output), before)
+
+    def test_terminal_error_and_completion_are_final_and_output_failure_is_not_retried(self):
+        output = []
+        stream = self.stream(output)
+        stream.finish(self.terminal(state="failed", error="conflict"))
+        before = tuple(output)
+        with self.assertRaises(ValueError):
+            stream.finish(self.terminal(state="failed", error="conflict"))
+        with self.assertRaises(ValueError):
+            stream.transition("running", "Late")
+        self.assertEqual(tuple(output), before)
+        output = []
+        stream = self.stream(output)
+        broken_pipe = BrokenPipeError("closed consumer")
+        writer = mock.Mock(side_effect=broken_pipe)
+        stream._write = writer
+        with self.assertRaises(BrokenPipeError) as caught:
+            stream.finish(self.terminal(state="interrupted", error="timeout"))
+        self.assertIs(caught.exception, broken_pipe)
+        self.assertTrue(stream.faulted)
+        with self.assertRaises(ValueError):
+            stream.finish(self.terminal(state="interrupted", error="timeout"))
+        writer.assert_called_once()
+
+    def test_live_terminal_summary_is_not_written_into_retained_record(self):
+        record = self.terminal()
+        output = []
+        stream = self.stream(output)
+        stream.transition("running", "Running")
+        stream.finish(record, detail="Live observed summary")
+        self.assertEqual(record.detail, "Durable result")
+        replay = []
+        provider.replay_terminal_operation(record, replay.append)
+        self.assertNotIn("Live observed summary", "".join(replay))
+
+    def test_invalid_construction_or_nonterminal_replay_has_no_output(self):
+        for operation_id, action, started in (
+            ("bad", "updates-refresh", self.started),
+            (self.operation_id, "updates-cancel", self.started),
+            (self.operation_id, "health-open", self.started),
+            (self.operation_id, "updates-refresh", "2026-02-30T00:00:00Z"),
+        ):
+            output = []
+            with self.assertRaises(ValueError):
+                provider.OperationStream(operation_id, action, started, "Starting", output.append)
+            self.assertEqual(output, [])
+        output = []
+        pending = replace(self.terminal(), state="pending", finished_at=None, terminal_monotonic=None)
+        with self.assertRaises(ValueError):
+            provider.replay_terminal_operation(pending, output.append)
+        self.assertEqual(output, [])
+
+
+class ObservedUpdateTests(unittest.TestCase):
+    def preview(self, action="update", package_id="pkg;2;x86_64;updates"):
+        return provider.PlanRow(package_id, action, "pkg", "2", "Preview")
+
+    def test_normalized_digest_matches_fixed_bytes_and_ignores_download_and_old_cleanup(self):
+        preview = [self.preview(), self.preview("install", "dep;1;x86_64;updates"),
+                   self.preview("obsolete", "old;1;noarch;installed")]
+        observed = provider.ObservedUpdateSummary(preview)
+        self.assertFalse(observed.observe(10, "pkg;2;x86_64;updates"))
+        self.assertFalse(observed.observe(14, "pkg;1;x86_64;installed"))
+        accepted = [(11, "update", "pkg;2;x86_64;updates"),
+                    (12, "install", "dep;1;x86_64;updates"),
+                    (14, "obsolete", "old;1;noarch;installed")]
+        expected = hashlib.sha256(b"dwm-titus-update-observed-v1")
+        for info, action, package_id in accepted:
+            self.assertTrue(observed.observe(info, package_id))
+            for field in (action, package_id):
+                encoded = field.encode()
+                expected.update(len(encoded).to_bytes(8, "big") + encoded)
+        self.assertEqual(observed._digest.hexdigest(), expected.hexdigest())
+        self.assertEqual(observed.counts, {"install": 1, "update": 1, "remove": 0, "obsolete": 1, "unknown": 0})
+        self.assertEqual(observed.comparison(), "unknown")
+        self.assertEqual(observed.comparison(final=True), "no")
+        self.assertEqual(observed.samples, [])
+
+    def test_cleanup_uses_architecture_and_exact_obsolete_identity(self):
+        observed = provider.ObservedUpdateSummary([self.preview()])
+        self.assertTrue(observed.observe(14, "pkg;1;i686;installed"))
+        self.assertEqual(observed.counts["unknown"], 1)
+        self.assertEqual(observed.comparison(final=True), "unknown")
+
+    def test_repeated_expected_signals_are_digested_without_unbounded_identity_storage(self):
+        observed = provider.ObservedUpdateSummary([self.preview()])
+        observed.observe(11, "pkg;2;x86_64;updates")
+        digest = observed._digest.hexdigest()
+        observed.observe(11, "pkg;2;x86_64;updates")
+        self.assertNotEqual(observed._digest.hexdigest(), digest)
+        self.assertEqual(observed.counts["update"], 2)
+        self.assertEqual(len(observed._matched), 1)
+        self.assertEqual(observed.comparison(final=True), "no")
+
+    def test_missing_extra_and_unknown_actions_never_report_equal(self):
+        observed = provider.ObservedUpdateSummary([self.preview()])
+        self.assertEqual(observed.comparison(final=True), "yes")
+        observed.observe(11, "pkg;2;x86_64;updates")
+        self.assertEqual(observed.comparison(final=True), "no")
+        observed.observe(13, "other;1;x86_64;installed")
+        self.assertEqual(observed.comparison(), "yes")
+        observed.observe(99, "unknown;1;x86_64;installed")
+        self.assertEqual(observed.comparison(final=True), "unknown")
+
+    def test_samples_and_summary_size_remain_bounded_and_duplicate_samples_coalesce(self):
+        observed = provider.ObservedUpdateSummary([])
+        for index in range(4096):
+            observed.observe(12, f"extra-{index};1;x86_64;updates")
+        observed.observe(12, "extra-0;1;x86_64;updates")
+        self.assertEqual(len(observed.samples), 128)
+        self.assertEqual(observed.counts["install"], 4097)
+        self.assertEqual(len(observed._matched), 0)
+        self.assertEqual(observed.comparison(final=True), "yes")
+        observed.counts = dict.fromkeys(observed.actions, provider.JOURNAL_SEQUENCE_MAX)
+        observed.observe(12, "extra-0;1;x86_64;updates")
+        self.assertEqual(observed.counts["install"], provider.JOURNAL_SEQUENCE_MAX)
+        self.assertEqual(observed.comparison(final=True), "unknown")
+        self.assertLessEqual(len(observed.detail(final=True).encode()), 512)
+
+    def test_invalid_input_cannot_change_counts_or_digest(self):
+        observed = provider.ObservedUpdateSummary([])
+        before = observed.detail(final=True)
+        for info, package_id in ((True, "pkg;1;x86_64;repo"), (-1, "pkg;1;x86_64;repo"),
+                                 (12, "malformed"), (12, "pkg;1;;repo"),
+                                 (12, "pkg;1;x86_64;bad\nrepo"), (12, "\ud800;1;x86_64;repo"),
+                                 (12, "x" * 513), (12, "pkg;1;x86_64;bad\0repo")):
+            with self.subTest(info=info, package_id=repr(package_id)), self.assertRaises(provider.SnapshotFailure):
+                observed.observe(info, package_id)
+            self.assertEqual(observed.detail(final=True), before)
+        for preview in ([self.preview(), self.preview()], [self.preview("reinstall")],
+                        [self.preview("downgrade")], [replace(self.preview(), package_id=[])],
+                        [None], [self.preview()] * 4097):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.ObservedUpdateSummary(preview)
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_complete_read_only_snapshot(self):
+        backend = FixtureBackend(
+            updates=(
+                package(26, "kernel;6.18.1;x86_64;updates", "Critical kernel"),
+                package(9, "held;2.0;x86_64;updates", "Blocked update"),
+                package(2, "bash;5.3;x86_64;updates", "Shell\tupdate\nsummary"),
+            ),
+            restart_types=(2, 5, 4),
+            plan=(
+                package(11, "kernel;6.18.1;x86_64;updates", "Critical kernel"),
+                package(11, "bash;5.3;x86_64;updates", "Shell update"),
+                package(12, "dependency;1.0;x86_64;updates", "New dependency"),
+                package(15, "old-dependency;0.9;x86_64;installed", "Old dependency"),
+            ),
+        )
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(output[0], "system-management-protocol\t1\t0")
+        self.assertEqual(output[-1], "complete\tsnapshot")
+        self.assertEqual(len(rows(output, "provider")), 2)
+        self.assertEqual(len(rows(output, "state")), 3)
+        self.assertEqual(len(rows(output, "action")), 3)
+        self.assertEqual(len(rows(output, "update")), 3)
+        self.assertEqual(len(rows(output, "package-change")), 4)
+        self.assertEqual(rows(output, "error"), [])
+        self.assertEqual(
+            backend.simulated_ids,
+            ("bash;5.3;x86_64;updates", "kernel;6.18.1;x86_64;updates"),
+        )
+        self.assertIn(
+            [
+                "state",
+                "update-summary",
+                "available",
+                "3",
+                "PackageKit update discovery completed",
+            ],
+            rows(output, "state"),
+        )
+        self.assertIn(
+            [
+                "state",
+                "update-restart",
+                "available",
+                "security-system",
+                "PackageKit restart guidance from update discovery",
+            ],
+            rows(output, "state"),
+        )
+        bash_row = next(
+            row for row in rows(output, "update") if row[1].startswith("bash;")
+        )
+        self.assertEqual(bash_row[2:4], ["unknown", "installable"])
+        self.assertEqual(bash_row[-1], "Shell update summary")
+        self.assertEqual(
+            output[1],
+            "snapshot-generation\t"
+            "0626a3347e1e76f4394deb0948b444a89b9ec8875696a1735c893b0db7258bac",
+        )
+
+    def test_empty_snapshot_has_stable_generation_and_skips_simulation(self):
+        backend = FixtureBackend()
+        output = provider.build_snapshot(backend)
+
+        expected = hashlib.sha256(b"dwm-titus-update-plan-v1").hexdigest()
+        self.assertEqual(output[1], f"snapshot-generation\t{expected}")
+        self.assertEqual(backend.simulated_ids, None)
+        self.assertIn(
+            [
+                "state",
+                "update-summary",
+                "available",
+                "0",
+                "PackageKit update discovery completed",
+            ],
+            rows(output, "state"),
+        )
+
+    def test_generation_changes_with_dependency_preview(self):
+        update = package(8, "openssl;4.0;x86_64;updates", "TLS library")
+        first = FixtureBackend(
+            updates=(update,), plan=(package(11, update.package_id, "TLS library"),)
+        )
+        second = FixtureBackend(
+            updates=(update,),
+            plan=(
+                package(11, update.package_id, "TLS library"),
+                package(12, "crypto-policy;2;x86_64;updates", "Policy data"),
+            ),
+        )
+
+        first_generation = provider.build_snapshot(first)[1]
+        second_generation = provider.build_snapshot(second)[1]
+
+        self.assertNotEqual(first_generation, second_generation)
+
+    def test_no_refresh_history_is_explicit_without_an_error(self):
+        output = provider.build_snapshot(FixtureBackend(refresh_age=provider.G_MAXUINT))
+
+        self.assertIn(
+            [
+                "state",
+                "update-last-refresh",
+                "partial",
+                "unknown",
+                "PackageKit has no successful refresh history",
+            ],
+            rows(output, "state"),
+        )
+        self.assertEqual(rows(output, "error"), [])
+
+    def test_source_failures_preserve_the_complete_protocol_shape(self):
+        backend = FixtureBackend(
+            refresh_failure=provider.SnapshotFailure(
+                "timeout", "PackageKit refresh history timed out", "unavailable"
+            ),
+            updates_failure=provider.SnapshotFailure(
+                "missing-provider", "PackageKit service is unavailable", "unavailable"
+            ),
+        )
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(output[-1], "complete\tsnapshot")
+        self.assertEqual(len(rows(output, "provider")), 2)
+        self.assertEqual(len(rows(output, "state")), 3)
+        self.assertEqual(len(rows(output, "action")), 3)
+        self.assertEqual(rows(output, "update"), [])
+        self.assertEqual(rows(output, "package-change"), [])
+        self.assertEqual(
+            [row[2] for row in rows(output, "error")],
+            ["timeout", "missing-provider"],
+        )
+        install_action = next(
+            row for row in rows(output, "action") if row[1] == "updates-install-all"
+        )
+        self.assertIn("dependency preview is unavailable", install_action[-1])
+
+    def test_invalid_update_classification_discards_the_inventory(self):
+        backend = FixtureBackend(
+            updates=(package(999, "bad;1;x86_64;updates", "Invalid"),)
+        )
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(rows(output, "update"), [])
+        self.assertIn(
+            [
+                "state",
+                "update-summary",
+                "partial",
+                "unknown",
+                "PackageKit returned an unsupported update classification",
+            ],
+            rows(output, "state"),
+        )
+        self.assertEqual(rows(output, "error")[0][2], "malformed")
+
+
+class JournalFrameTests(unittest.TestCase):
+    def frame_with_header(self, frame, *, offset, value):
+        changed = bytearray(frame)
+        changed[offset : offset + len(value)] = value
+        length = int.from_bytes(changed[12:16], "little")
+        payload = changed[provider.JOURNAL_PAYLOAD_OFFSET :][:length]
+        changed[32:64] = hashlib.sha256(changed[:32] + payload).digest()
+        return bytes(changed)
+
+    def test_golden_frame_layout_and_initial_image(self):
+        payload = "op-0123456789abcdef0123456789abcdef\tupdate"
+        frame = provider.encode_journal_frame(0x0102030405060708, payload)
+
+        self.assertEqual(len(frame), 8192)
+        self.assertEqual(frame[:8], b"DWMJNL1\0")
+        self.assertEqual(frame[8:10], b"\x01\x00")
+        self.assertEqual(frame[10:12], b"\x00\x00")
+        self.assertEqual(
+            int.from_bytes(frame[12:16], "little"), len(payload.encode("utf-8"))
+        )
+        self.assertEqual(frame[16:24], b"\x08\x07\x06\x05\x04\x03\x02\x01")
+        self.assertEqual(frame[24:32], bytes(8))
+        self.assertEqual(
+            frame[32:64],
+            hashlib.sha256(frame[:32] + payload.encode("utf-8")).digest(),
+        )
+        self.assertEqual(frame[64 : 64 + len(payload)], payload.encode("utf-8"))
+        self.assertEqual(frame[64 + len(payload) :], bytes(8128 - len(payload)))
+        self.assertEqual(
+            provider.decode_journal_frame(frame),
+            provider.JournalFrame(0x0102030405060708, payload),
+        )
+
+        initial = provider.initial_journal_image("00")
+        self.assertEqual(len(initial), 16384)
+        self.assertEqual(initial[8192:], bytes(8192))
+        self.assertEqual(
+            provider.select_journal_frame(initial),
+            (0, provider.JournalFrame(1, "00")),
+        )
+
+    def test_maximum_utf8_payload_round_trips(self):
+        payload = "x" * provider.JOURNAL_PAYLOAD_MAX
+        frame = provider.encode_journal_frame(2, payload)
+
+        self.assertEqual(provider.decode_journal_frame(frame).payload, payload)
+        with self.assertRaisesRegex(provider.JournalFrameError, "too large"):
+            provider.encode_journal_frame(2, payload + "x")
+
+    def test_payload_and_sequence_validation(self):
+        for payload in ("nul\0byte", "line\nbreak", "carriage\rreturn"):
+            with self.subTest(payload=payload):
+                with self.assertRaises(provider.JournalFrameError):
+                    provider.encode_journal_frame(1, payload)
+        with self.assertRaisesRegex(provider.JournalFrameError, "not UTF-8"):
+            provider.encode_journal_frame(1, "unpaired-\udcff")
+        for sequence in (0, -1, provider.JOURNAL_SEQUENCE_MAX + 1, True):
+            with self.subTest(sequence=sequence):
+                with self.assertRaises(provider.JournalFrameError):
+                    provider.encode_journal_frame(sequence, "")
+
+    def test_decoder_rejects_every_canonical_boundary_violation(self):
+        base = provider.encode_journal_frame(4, "payload")
+        cases = {
+            "size": base[:-1],
+            "magic": self.frame_with_header(base, offset=0, value=b"BADJNL1\0"),
+            "major": self.frame_with_header(base, offset=8, value=b"\x02\x00"),
+            "minor": self.frame_with_header(base, offset=10, value=b"\x01\x00"),
+            "length": self.frame_with_header(
+                base,
+                offset=12,
+                value=(provider.JOURNAL_PAYLOAD_MAX + 1).to_bytes(4, "little"),
+            ),
+            "sequence": self.frame_with_header(base, offset=16, value=bytes(8)),
+            "reserved": self.frame_with_header(base, offset=24, value=b"\x01"),
+            "digest": base[:32] + bytes(32) + base[64:],
+            "padding": base[:-1] + b"\x01",
+        }
+        for name, image in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalFrameError):
+                    provider.decode_journal_frame(image)
+
+        invalid_utf8 = bytearray(provider.encode_journal_frame(4, "x"))
+        invalid_utf8[64] = 0xFF
+        invalid_utf8[32:64] = hashlib.sha256(
+            invalid_utf8[:32] + invalid_utf8[64:65]
+        ).digest()
+        with self.assertRaisesRegex(provider.JournalFrameError, "not UTF-8"):
+            provider.decode_journal_frame(bytes(invalid_utf8))
+
+        forbidden = bytearray(provider.encode_journal_frame(4, "x"))
+        forbidden[64] = 0
+        forbidden[32:64] = hashlib.sha256(forbidden[:32] + forbidden[64:65]).digest()
+        with self.assertRaisesRegex(provider.JournalFrameError, "forbidden"):
+            provider.decode_journal_frame(bytes(forbidden))
+
+    def test_selector_uses_highest_valid_sequence_and_survives_torn_peer(self):
+        older = provider.encode_journal_frame(9, "older")
+        newer = provider.encode_journal_frame(10, "newer")
+
+        self.assertEqual(
+            provider.select_journal_frame(older + newer),
+            (1, provider.JournalFrame(10, "newer")),
+        )
+        torn = newer[:40] + bytes(provider.JOURNAL_FRAME_SIZE - 40)
+        self.assertEqual(
+            provider.select_journal_frame(older + torn),
+            (0, provider.JournalFrame(9, "older")),
+        )
+
+    def test_selector_rejects_ambiguous_or_exhausted_files(self):
+        first = provider.encode_journal_frame(7, "first")
+        second = provider.encode_journal_frame(7, "second")
+        exhausted = provider.encode_journal_frame(provider.JOURNAL_SEQUENCE_MAX, "")
+
+        with self.assertRaisesRegex(provider.JournalFrameError, "conflicting"):
+            provider.select_journal_frame(first + second)
+        with self.assertRaisesRegex(provider.JournalFrameError, "no valid"):
+            provider.select_journal_frame(bytes(provider.JOURNAL_FILE_SIZE))
+        with self.assertRaisesRegex(provider.JournalFrameError, "exhausted"):
+            provider.select_journal_frame(
+                exhausted + bytes(provider.JOURNAL_FRAME_SIZE)
+            )
+        self.assertEqual(
+            provider.select_journal_frame(first + first),
+            (0, provider.JournalFrame(7, "first")),
+        )
+
+
+class JournalControlRecordTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+    operation_id = "op-0123456789abcdef0123456789abcdef"
+
+    def test_cursor_round_trips_every_terminal_slot(self):
+        for slot in range(provider.JOURNAL_TERMINAL_COUNT):
+            with self.subTest(slot=slot):
+                payload = provider.encode_journal_cursor(slot)
+                self.assertEqual(payload, f"{slot:02d}")
+                self.assertEqual(provider.decode_journal_cursor(payload), slot)
+
+    def test_cursor_rejects_noncanonical_or_out_of_range_values(self):
+        for payload in ("", "0", "00 ", "01\t", "32", "-1", "aa"):
+            with self.subTest(payload=payload):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_cursor(payload)
+        for slot in (-1, 32, True, "00"):
+            with self.subTest(slot=slot):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_cursor(slot)
+
+    def test_handoff_round_trips_empty_and_exact_identity(self):
+        self.assertEqual(provider.encode_journal_handoff(None), "")
+        self.assertIsNone(provider.decode_journal_handoff(""))
+        record = provider.JournalHandoff(self.operation_id, 31)
+        payload = f"{self.operation_id}\t31"
+        self.assertEqual(provider.encode_journal_handoff(record), payload)
+        self.assertEqual(provider.decode_journal_handoff(payload), record)
+
+    def test_handoff_rejects_malformed_identity_or_extra_fields(self):
+        invalid = (
+            f"{self.operation_id}",
+            f"{self.operation_id}\t32",
+            f"{self.operation_id}\t00\textra",
+            f"op-{'A' * 32}\t00",
+            f"op-{'0' * 31}\t00",
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_handoff(payload)
+
+    def test_restart_round_trips_all_closed_values_and_uint64_boundary(self):
+        for system in provider.JOURNAL_RESTART_SYSTEM_VALUES:
+            for session in provider.JOURNAL_RESTART_SESSION_VALUES:
+                for application in (False, True):
+                    record = provider.JournalRestart(
+                        self.boot_id,
+                        self.operation_id,
+                        system,
+                        session,
+                        provider.JOURNAL_SEQUENCE_MAX,
+                        application,
+                        provider.JOURNAL_SEQUENCE_MAX,
+                    )
+                    with self.subTest(
+                        system=system, session=session, application=application
+                    ):
+                        payload = provider.encode_journal_restart(record)
+                        self.assertEqual(
+                            provider.decode_journal_restart(payload), record
+                        )
+
+        initial = provider.JournalRestart(
+            self.boot_id, None, "none", "none", 0, False, 0
+        )
+        self.assertEqual(
+            provider.decode_journal_restart(self.boot_id + "\t-\tnone\tnone\t0\tno\t0"),
+            initial,
+        )
+
+    def test_restart_rejects_noncanonical_or_kind_invalid_fields(self):
+        base = provider.encode_journal_restart(
+            provider.JournalRestart(self.boot_id, None, "none", "none", 0, False, 0)
+        ).split("\t")
+        cases = {
+            "field count": base[:-1],
+            "boot": ["not-a-boot-id", *base[1:]],
+            "operation": [base[0], "op-bad", *base[2:]],
+            "system": [*base[:2], "session", *base[3:]],
+            "session": [*base[:3], "system", *base[4:]],
+            "session cutoff": [*base[:4], "01", *base[5:]],
+            "application": [*base[:5], "true", base[6]],
+            "application cutoff": [*base[:6], str(1 << 64)],
+            "oversized cutoff": [*base[:6], "9" * 5000],
+        }
+        for name, fields in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_restart("\t".join(fields))
+
+    def test_restart_encoder_rejects_invalid_typed_values(self):
+        invalid = (
+            provider.JournalRestart(self.boot_id, None, "none", "none", True, False, 0),
+            provider.JournalRestart(self.boot_id, None, "none", "none", 0, "no", 0),
+            provider.JournalRestart(self.boot_id, None, "none", "none", 0, False, -1),
+            provider.JournalRestart(None, None, "none", "none", 0, False, 0),
+            provider.JournalRestart(self.boot_id, 1, "none", "none", 0, False, 0),
+            provider.JournalRestart(self.boot_id, None, [], "none", 0, False, 0),
+        )
+        for record in invalid:
+            with self.subTest(record=record):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_restart(record)
+
+    def update_operation(self, **changes):
+        record = provider.JournalOperation(
+            self.operation_id,
+            "updates-install-all",
+            "2026-02-28T01:02:03Z",
+            None,
+            "update",
+            "running",
+            None,
+            "Installing updates",
+            "a" * 64,
+            "/1_deadbeef",
+            "none",
+            "none",
+            False,
+            self.boot_id,
+            None,
+            31,
+        )
+        return replace(record, **changes)
+
+    def state_payloads(self):
+        return provider._initial_journal_payloads(self.boot_id)
+
+    def test_operation_round_trips_nonterminal_and_terminal_update(self):
+        active = self.update_operation()
+        active_payload = provider.encode_journal_operation(active)
+        self.assertEqual(provider.decode_journal_operation(active_payload), active)
+        self.assertIn("\tpending\tupdate\trunning\t-\t", active_payload)
+        self.assertTrue(active_payload.endswith(f"\t{self.boot_id}\tpending\t31"))
+
+        terminal = replace(
+            active,
+            finished_at="2026-02-28T01:03:04Z",
+            state="failed",
+            error_code="package",
+            system_restart="unknown",
+            session_restart="security-session",
+            application_restart=True,
+            terminal_monotonic=provider.JOURNAL_SEQUENCE_MAX,
+        )
+        payload = provider.encode_journal_operation(terminal)
+        self.assertEqual(provider.decode_journal_operation(payload), terminal)
+
+    def test_operation_round_trips_refresh_and_non_packagekit_kinds(self):
+        refresh = replace(
+            self.update_operation(),
+            action_id="updates-refresh",
+            kind="refresh",
+            generation=None,
+            system_restart=None,
+            session_restart=None,
+            application_restart=None,
+            boot_id=None,
+        )
+        timezone = replace(
+            refresh,
+            action_id="timezone-set",
+            kind="timezone",
+            transaction_path=None,
+        )
+        delegate = replace(
+            timezone,
+            action_id="printers-open",
+            kind="delegate",
+            finished_at="2026-02-28T01:02:04Z",
+            state="succeeded",
+        )
+        for record in (refresh, timezone, delegate):
+            with self.subTest(kind=record.kind):
+                payload = provider.encode_journal_operation(record)
+                self.assertEqual(provider.decode_journal_operation(payload), record)
+
+    def test_operation_rejects_identity_timestamp_and_field_shape_errors(self):
+        active = self.update_operation()
+        invalid_records = (
+            replace(active, operation_id="op-bad"),
+            replace(active, action_id="updates-refresh"),
+            replace(active, started_at="2026-02-30T01:02:03Z"),
+            replace(active, finished_at="2026-02-28T01:03:04Z"),
+            replace(active, state="unknown"),
+            replace(active, slot=32),
+        )
+        for record in invalid_records:
+            with self.subTest(record=record):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_operation(record)
+
+        payload = provider.encode_journal_operation(active)
+        for malformed in (payload + "\textra", "\t".join(payload.split("\t")[:-1])):
+            with self.subTest(payload=malformed):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_operation(malformed)
+
+    def test_operation_rejects_invalid_state_error_combinations(self):
+        active = self.update_operation()
+        invalid = (
+            replace(active, error_code="network"),
+            replace(
+                active,
+                finished_at="2026-02-28T01:03:04Z",
+                state="succeeded",
+                error_code="package",
+                terminal_monotonic=1,
+            ),
+            replace(
+                active,
+                finished_at="2026-02-28T01:03:04Z",
+                state="failed",
+                terminal_monotonic=1,
+            ),
+            replace(
+                active,
+                finished_at="2026-02-28T01:03:04Z",
+                state="failed",
+                error_code="not-normalized",
+                terminal_monotonic=1,
+            ),
+        )
+        for record in invalid:
+            with self.subTest(record=record):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_operation(record)
+
+    def test_operation_rejects_kind_incompatible_typed_fields(self):
+        active = self.update_operation()
+        invalid = (
+            replace(active, generation="A" * 64),
+            replace(active, transaction_path="/not/packagekit"),
+            replace(active, system_restart="session"),
+            replace(active, session_restart="system"),
+            replace(active, application_restart="no"),
+            replace(active, boot_id=None),
+            replace(active, terminal_monotonic=1),
+            replace(
+                active,
+                action_id="timezone-set",
+                kind="timezone",
+                transaction_path=None,
+                generation=None,
+                system_restart=None,
+                session_restart=None,
+                application_restart=None,
+                boot_id=None,
+                terminal_monotonic=1,
+            ),
+        )
+        for record in invalid:
+            with self.subTest(record=record):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_operation(record)
+
+    def test_operation_rejects_noncanonical_diagnostics_and_wire_fields(self):
+        active = self.update_operation()
+        for detail in ("line\nbreak", "tab\tbreak", "x" * 513, "bad\0byte"):
+            with self.subTest(detail=detail):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.encode_journal_operation(replace(active, detail=detail))
+
+        fields = provider.encode_journal_operation(active).split("\t")
+        malformed = {
+            "application": [*fields[:12], "maybe", *fields[13:]],
+            "monotonic": [*fields[:14], "0", fields[15]],
+            "finished": [*fields[:3], "-", *fields[4:]],
+        }
+        for name, changed in malformed.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_operation("\t".join(changed))
+
+    def test_state_round_trips_initial_and_nonterminal_active_payloads(self):
+        payloads = self.state_payloads()
+        state = provider.decode_journal_state(payloads)
+        self.assertEqual(state.cursor, 0)
+        self.assertIsNone(state.active)
+        self.assertIsNone(state.handoff)
+        self.assertEqual(state.restart.boot_id, self.boot_id)
+        self.assertEqual(state.terminals, (None,) * provider.JOURNAL_TERMINAL_COUNT)
+
+        active = self.update_operation(slot=7)
+        payloads["active"] = provider.encode_journal_operation(active)
+        self.assertEqual(provider.decode_journal_state(payloads).active, active)
+
+    def test_state_accepts_each_terminalization_checkpoint(self):
+        active = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        active_payload = provider.encode_journal_operation(active)
+        checkpoints = []
+
+        payloads = self.state_payloads()
+        payloads["active"] = active_payload
+        checkpoints.append(payloads.copy())
+        payloads["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(payloads["restart"]),
+                last_applied_operation_id=active.operation_id,
+            )
+        )
+        payloads["terminal-07"] = active_payload
+        checkpoints.append(payloads.copy())
+        payloads["cursor"] = "08"
+        checkpoints.append(payloads.copy())
+        payloads["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(active.operation_id, 7)
+        )
+        checkpoints.append(payloads.copy())
+        payloads["active"] = ""
+        checkpoints.append(payloads.copy())
+
+        for index, checkpoint in enumerate(checkpoints):
+            with self.subTest(checkpoint=index):
+                state = provider.decode_journal_state(checkpoint)
+                self.assertEqual(state.terminals[7], active if index >= 1 else None)
+
+    def test_state_accepts_old_selected_slot_before_terminal_overwrite(self):
+        payloads = self.state_payloads()
+        old = replace(
+            self.update_operation(
+                operation_id="op-ffffffffffffffffffffffffffffffff", slot=7
+            ),
+            finished_at="2026-02-27T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=100,
+        )
+        current = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        payloads["active"] = provider.encode_journal_operation(current)
+        payloads["terminal-07"] = provider.encode_journal_operation(old)
+        payloads["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(payloads["restart"]),
+                last_applied_operation_id=old.operation_id,
+            )
+        )
+        self.assertEqual(provider.decode_journal_state(payloads).active, current)
+
+    def test_state_accepts_pruned_lower_scope_restart_guidance(self):
+        terminal = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            session_restart="security-session",
+            application_restart=True,
+            terminal_monotonic=123,
+        )
+        payloads = self.state_payloads()
+        payloads["terminal-07"] = provider.encode_journal_operation(terminal)
+        payloads["cursor"] = "08"
+        payloads["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(payloads["restart"]),
+                last_applied_operation_id=terminal.operation_id,
+            )
+        )
+        state = provider.decode_journal_state(payloads)
+        self.assertEqual(state.restart.session, "none")
+        self.assertFalse(state.restart.application)
+
+        later = replace(
+            terminal,
+            operation_id="op-ffffffffffffffffffffffffffffffff",
+            session_restart="session",
+            application_restart=False,
+            terminal_monotonic=200,
+            slot=8,
+        )
+        payloads["terminal-08"] = provider.encode_journal_operation(later)
+        payloads["cursor"] = "09"
+        payloads["restart"] = provider.encode_journal_restart(
+            replace(
+                state.restart,
+                last_applied_operation_id=later.operation_id,
+                session="session",
+                session_cutoff=later.terminal_monotonic,
+            )
+        )
+        self.assertEqual(provider.decode_journal_state(payloads).restart.session, "session")
+
+    def test_state_rejects_missing_extra_or_wrong_typed_paths(self):
+        payloads = self.state_payloads()
+        invalid = []
+        missing = payloads.copy()
+        del missing["active"]
+        invalid.append(missing)
+        extra = payloads.copy()
+        extra["terminal-32"] = ""
+        invalid.append(extra)
+        wrong_type = payloads.copy()
+        wrong_type["active"] = None
+        invalid.append(wrong_type)
+        for state in invalid:
+            with self.subTest(paths=state.keys()):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_state(state)
+
+    def test_state_rejects_invalid_terminal_slot_records(self):
+        terminal = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        cases = {}
+        nonterminal = self.state_payloads()
+        nonterminal["terminal-07"] = provider.encode_journal_operation(
+            self.update_operation(slot=7)
+        )
+        cases["nonterminal slot"] = nonterminal
+        wrong_slot = self.state_payloads()
+        wrong_slot["terminal-06"] = provider.encode_journal_operation(terminal)
+        cases["wrong slot identity"] = wrong_slot
+        duplicate = self.state_payloads()
+        duplicate["terminal-07"] = provider.encode_journal_operation(terminal)
+        duplicate["terminal-08"] = provider.encode_journal_operation(
+            replace(terminal, slot=8)
+        )
+        cases["duplicate retained identity"] = duplicate
+        active_duplicate = self.state_payloads()
+        active_duplicate["active"] = provider.encode_journal_operation(
+            self.update_operation(slot=7)
+        )
+        active_duplicate["terminal-07"] = provider.encode_journal_operation(terminal)
+        cases["active identity duplicated in terminal"] = active_duplicate
+        for name, payloads in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_state(payloads)
+
+    def test_state_rejects_handoff_and_terminalization_conflicts(self):
+        terminal = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        other = replace(
+            terminal,
+            operation_id="op-ffffffffffffffffffffffffffffffff",
+        )
+        cases = {}
+        missing = self.state_payloads()
+        missing["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(terminal.operation_id, 7)
+        )
+        cases["handoff terminal missing"] = missing
+        mismatch = self.state_payloads()
+        mismatch["terminal-07"] = provider.encode_journal_operation(terminal)
+        mismatch["cursor"] = "08"
+        mismatch["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(other.operation_id, 7)
+        )
+        cases["handoff identity mismatch"] = mismatch
+        active_conflict = self.state_payloads()
+        active_conflict["active"] = provider.encode_journal_operation(other)
+        active_conflict["terminal-07"] = provider.encode_journal_operation(terminal)
+        active_conflict["cursor"] = "08"
+        active_conflict["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(terminal.operation_id, 7)
+        )
+        cases["active conflicts with handoff"] = active_conflict
+        for name, payloads in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_state(payloads)
+
+    def test_state_rejects_stale_cursor_restart_and_restart_id_reuse(self):
+        terminal = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        cases = {}
+        stale_cursor = self.state_payloads()
+        stale_cursor["terminal-07"] = provider.encode_journal_operation(terminal)
+        stale_cursor["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(terminal.operation_id, 7)
+        )
+        cases["handoff cursor is stale"] = stale_cursor
+        missing_restart = self.state_payloads()
+        missing_restart["active"] = provider.encode_journal_operation(terminal)
+        missing_restart["terminal-07"] = provider.encode_journal_operation(terminal)
+        cases["terminal update restart commit missing"] = missing_restart
+        missing_retained_restart = self.state_payloads()
+        missing_retained_restart["terminal-07"] = provider.encode_journal_operation(
+            terminal
+        )
+        missing_retained_restart["cursor"] = "08"
+        cases["retained update restart identity missing"] = missing_retained_restart
+        reused = self.state_payloads()
+        reused["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(reused["restart"]),
+                last_applied_operation_id=terminal.operation_id,
+            )
+        )
+        reused["active"] = provider.encode_journal_operation(
+            self.update_operation(slot=8)
+        )
+        cases["nonterminal active reuses restart identity"] = reused
+        non_update = replace(
+            terminal,
+            action_id="timezone-set",
+            kind="timezone",
+            generation=None,
+            transaction_path=None,
+            system_restart=None,
+            session_restart=None,
+            application_restart=None,
+            boot_id=None,
+            terminal_monotonic=None,
+        )
+        reused_terminal = self.state_payloads()
+        reused_terminal["restart"] = reused["restart"]
+        reused_terminal["terminal-07"] = provider.encode_journal_operation(non_update)
+        reused_terminal["cursor"] = "08"
+        cases["non-update terminal reuses restart identity"] = reused_terminal
+        previous_boot = self.state_payloads()
+        previous_boot["restart"] = reused["restart"]
+        previous_boot["terminal-07"] = provider.encode_journal_operation(
+            replace(terminal, boot_id="11234567-89ab-cdef-0123-456789abcdef")
+        )
+        previous_boot["cursor"] = "08"
+        cases["previous-boot update reuses restart identity"] = previous_boot
+        missing_contribution = self.state_payloads()
+        missing_contribution["restart"] = reused["restart"]
+        missing_contribution["terminal-07"] = provider.encode_journal_operation(
+            replace(terminal, system_restart="security-system")
+        )
+        missing_contribution["cursor"] = "08"
+        cases["system contribution missing"] = missing_contribution
+        older_contribution = self.state_payloads()
+        newer = replace(
+            terminal,
+            operation_id="op-ffffffffffffffffffffffffffffffff",
+            terminal_monotonic=200,
+            slot=8,
+        )
+        older_contribution["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(older_contribution["restart"]),
+                last_applied_operation_id=newer.operation_id,
+            )
+        )
+        older_contribution["terminal-07"] = provider.encode_journal_operation(
+            replace(terminal, system_restart="security-system")
+        )
+        older_contribution["terminal-08"] = provider.encode_journal_operation(newer)
+        cases["older system contribution missing"] = older_contribution
+        stale_identity = self.state_payloads()
+        stale_identity["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(stale_identity["restart"]),
+                last_applied_operation_id=terminal.operation_id,
+            )
+        )
+        stale_identity["terminal-07"] = provider.encode_journal_operation(terminal)
+        stale_identity["terminal-08"] = provider.encode_journal_operation(newer)
+        cases["last-applied identity is stale"] = stale_identity
+        for field, changes in (
+            (
+                "session",
+                {
+                    "session": "session",
+                    "session_cutoff": terminal.terminal_monotonic - 1,
+                },
+            ),
+            (
+                "application",
+                {
+                    "application": True,
+                    "application_cutoff": terminal.terminal_monotonic - 1,
+                },
+            ),
+        ):
+            stale_cutoff = self.state_payloads()
+            stale_cutoff["restart"] = provider.encode_journal_restart(
+                replace(
+                    provider.decode_journal_restart(stale_cutoff["restart"]),
+                    last_applied_operation_id=terminal.operation_id,
+                    **changes,
+                )
+            )
+            stale_cutoff["terminal-07"] = provider.encode_journal_operation(
+                replace(
+                    terminal,
+                    session_restart="session" if field == "session" else "none",
+                    application_restart=field == "application",
+                )
+            )
+            stale_cutoff["cursor"] = "08"
+            cases[f"{field} cutoff is stale"] = stale_cutoff
+        for field, changes in (
+            (
+                "session",
+                {
+                    "session": "session",
+                    "session_cutoff": terminal.terminal_monotonic + 1,
+                },
+            ),
+            (
+                "application",
+                {
+                    "application": True,
+                    "application_cutoff": terminal.terminal_monotonic + 1,
+                },
+            ),
+        ):
+            future_cutoff = self.state_payloads()
+            future_cutoff["restart"] = provider.encode_journal_restart(
+                replace(
+                    provider.decode_journal_restart(future_cutoff["restart"]),
+                    last_applied_operation_id=terminal.operation_id,
+                    **changes,
+                )
+            )
+            future_cutoff["terminal-07"] = provider.encode_journal_operation(
+                replace(
+                    terminal,
+                    session_restart="session" if field == "session" else "none",
+                    application_restart=field == "application",
+                )
+            )
+            future_cutoff["cursor"] = "08"
+            cases[f"{field} cutoff is newer than the last update"] = future_cutoff
+        for field, restart_changes in (
+            ("system", {"system": "security-system"}),
+            (
+                "session",
+                {"session": "security-session", "session_cutoff": 123},
+            ),
+            ("application", {"application": True, "application_cutoff": 123}),
+        ):
+            unsupported_bucket = self.state_payloads()
+            unsupported_bucket["restart"] = provider.encode_journal_restart(
+                replace(
+                    provider.decode_journal_restart(unsupported_bucket["restart"]),
+                    last_applied_operation_id=terminal.operation_id,
+                    **restart_changes,
+                )
+            )
+            unsupported_bucket["terminal-07"] = provider.encode_journal_operation(
+                terminal
+            )
+            unsupported_bucket["cursor"] = "08"
+            cases[f"{field} bucket is unsupported by retained history"] = (
+                unsupported_bucket
+            )
+        for field, contribution_changes, restart_changes in (
+            (
+                "session",
+                {"session_restart": "session"},
+                {"session": "session", "session_cutoff": 150},
+            ),
+            (
+                "application",
+                {"application_restart": True},
+                {"application": True, "application_cutoff": 150},
+            ),
+        ):
+            inexact_cutoff = self.state_payloads()
+            older = replace(terminal, terminal_monotonic=100, **contribution_changes)
+            latest = replace(
+                terminal,
+                operation_id="op-ffffffffffffffffffffffffffffffff",
+                terminal_monotonic=200,
+                slot=8,
+            )
+            inexact_cutoff["restart"] = provider.encode_journal_restart(
+                replace(
+                    provider.decode_journal_restart(inexact_cutoff["restart"]),
+                    last_applied_operation_id=latest.operation_id,
+                    **restart_changes,
+                )
+            )
+            inexact_cutoff["terminal-07"] = provider.encode_journal_operation(older)
+            inexact_cutoff["terminal-08"] = provider.encode_journal_operation(latest)
+            inexact_cutoff["cursor"] = "09"
+            cases[f"{field} cutoff is not a retained contribution"] = inexact_cutoff
+        unidentified_guidance = self.state_payloads()
+        unidentified_guidance["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(unidentified_guidance["restart"]),
+                system="unknown",
+            )
+        )
+        cases["restart guidance has no identity"] = unidentified_guidance
+        orphan_identity = self.state_payloads()
+        orphan_identity["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(orphan_identity["restart"]),
+                last_applied_operation_id="op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                system="unknown",
+            )
+        )
+        cases["restart identity is absent before ring wrap"] = orphan_identity
+        for field, changes in (
+            ("session", {"session_cutoff": 123}),
+            ("application", {"application_cutoff": 123}),
+        ):
+            cleared_cutoff = self.state_payloads()
+            cleared_cutoff["restart"] = provider.encode_journal_restart(
+                replace(
+                    provider.decode_journal_restart(cleared_cutoff["restart"]),
+                    last_applied_operation_id=terminal.operation_id,
+                    **changes,
+                )
+            )
+            cleared_cutoff["terminal-07"] = provider.encode_journal_operation(
+                terminal
+            )
+            cleared_cutoff["cursor"] = "08"
+            cases[f"cleared {field} bucket retains cutoff"] = cleared_cutoff
+        expected_errors = {
+            "system contribution missing": "restart contribution is incomplete",
+            "session cutoff is stale": "session restart cutoff is stale",
+            "application cutoff is stale": "application restart cutoff is stale",
+            "session cutoff is newer than the last update": (
+                "session restart cutoff is stale"
+            ),
+            "application cutoff is newer than the last update": (
+                "application restart cutoff is stale"
+            ),
+            "system bucket is unsupported by retained history": (
+                "system restart bucket is unsupported"
+            ),
+            "session bucket is unsupported by retained history": (
+                "session restart bucket is unsupported"
+            ),
+            "application bucket is unsupported by retained history": (
+                "application restart state is not derivable"
+            ),
+            "session cutoff is not a retained contribution": (
+                "session restart state is not derivable"
+            ),
+            "application cutoff is not a retained contribution": (
+                "application restart state is not derivable"
+            ),
+            "cleared session bucket retains cutoff": (
+                "cleared session restart has a cutoff"
+            ),
+            "cleared application bucket retains cutoff": (
+                "cleared application restart has a cutoff"
+            ),
+        }
+        for name, payloads in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    provider.JournalRecordError,
+                    expected_errors.get(name, "journal"),
+                ):
+                    provider.decode_journal_state(payloads)
+
+    def test_state_rejects_cross_record_recovery_conflicts(self):
+        terminal = replace(
+            self.update_operation(slot=7),
+            finished_at="2026-02-28T01:03:04Z",
+            state="succeeded",
+            terminal_monotonic=123,
+        )
+        cases = {}
+
+        newer = replace(
+            terminal,
+            operation_id="op-ffffffffffffffffffffffffffffffff",
+            terminal_monotonic=200,
+        )
+        stale_active = self.state_payloads()
+        stale_active["terminal-07"] = provider.encode_journal_operation(newer)
+        stale_active["cursor"] = "08"
+        stale_active["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(stale_active["restart"]),
+                last_applied_operation_id=newer.operation_id,
+            )
+        )
+        stale_active["active"] = provider.encode_journal_operation(
+            replace(terminal, slot=8, terminal_monotonic=100)
+        )
+        cases["active update predates retained history"] = stale_active
+
+        stale_refresh = self.state_payloads()
+        refresh = replace(
+            terminal,
+            action_id="updates-refresh",
+            kind="refresh",
+            generation=None,
+            system_restart=None,
+            session_restart=None,
+            application_restart=None,
+            boot_id=None,
+            terminal_monotonic=100,
+            slot=8,
+        )
+        stale_refresh["terminal-07"] = provider.encode_journal_operation(newer)
+        stale_refresh["cursor"] = "08"
+        stale_refresh["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(stale_refresh["restart"]),
+                last_applied_operation_id=newer.operation_id,
+            )
+        )
+        stale_refresh["active"] = provider.encode_journal_operation(refresh)
+        cases["active refresh predates retained update history"] = stale_refresh
+
+        old_boot_active = self.state_payloads()
+        old_boot_active["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(old_boot_active["restart"]),
+                last_applied_operation_id="op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                system="unknown",
+            )
+        )
+        old_boot_active["active"] = provider.encode_journal_operation(
+            replace(
+                self.update_operation(slot=7),
+                boot_id="11234567-89ab-cdef-0123-456789abcdef",
+            )
+        )
+        old_boot_active["cursor"] = "07"
+        regional_terminal = replace(
+            terminal,
+            action_id="timezone-set",
+            kind="timezone",
+            generation=None,
+            transaction_path=None,
+            system_restart=None,
+            session_restart=None,
+            application_restart=None,
+            boot_id=None,
+            terminal_monotonic=None,
+        )
+        for slot in range(provider.JOURNAL_TERMINAL_COUNT):
+            old_boot_active[f"terminal-{slot:02d}"] = (
+                provider.encode_journal_operation(
+                    replace(
+                        regional_terminal,
+                        operation_id=f"op-{slot + 1:032x}",
+                        slot=slot,
+                    )
+                )
+            )
+        cases["old-boot active update restart is not clear"] = old_boot_active
+
+        old_boot_handoff = self.state_payloads()
+        old_boot_terminal = replace(
+            terminal, boot_id="11234567-89ab-cdef-0123-456789abcdef"
+        )
+        old_boot_handoff["terminal-07"] = provider.encode_journal_operation(
+            old_boot_terminal
+        )
+        old_boot_handoff["cursor"] = "08"
+        old_boot_handoff["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(old_boot_terminal.operation_id, 7)
+        )
+        old_boot_handoff["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(old_boot_handoff["restart"]),
+                last_applied_operation_id="op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                system="unknown",
+            )
+        )
+        cases["old-boot handoff restart is not clear"] = old_boot_handoff
+
+        downgraded_session = self.state_payloads()
+        downgraded_session["terminal-07"] = provider.encode_journal_operation(
+            replace(terminal, session_restart="security-session")
+        )
+        downgraded_session["cursor"] = "08"
+        downgraded_session["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(downgraded_session["restart"]),
+                last_applied_operation_id=terminal.operation_id,
+                session="session",
+                session_cutoff=terminal.terminal_monotonic,
+            )
+        )
+        cases["security-session urgency is downgraded"] = downgraded_session
+
+        stale_handoff = self.state_payloads()
+        refresh = replace(
+            terminal,
+            action_id="updates-refresh",
+            kind="refresh",
+            generation=None,
+            system_restart=None,
+            session_restart=None,
+            application_restart=None,
+            boot_id=None,
+            terminal_monotonic=100,
+        )
+        later_update = replace(newer, slot=8)
+        stale_handoff["terminal-07"] = provider.encode_journal_operation(refresh)
+        stale_handoff["terminal-08"] = provider.encode_journal_operation(later_update)
+        stale_handoff["cursor"] = "08"
+        stale_handoff["handoff"] = provider.encode_journal_handoff(
+            provider.JournalHandoff(refresh.operation_id, 7)
+        )
+        stale_handoff["restart"] = provider.encode_journal_restart(
+            replace(
+                provider.decode_journal_restart(stale_handoff["restart"]),
+                last_applied_operation_id=later_update.operation_id,
+            )
+        )
+        cases["handoff is superseded by retained update"] = stale_handoff
+
+        stale_cursor = self.state_payloads()
+        stale_cursor["terminal-07"] = provider.encode_journal_operation(refresh)
+        cases["completed terminal cursor is stale"] = stale_cursor
+
+        for name, payloads in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(provider.JournalRecordError):
+                    provider.decode_journal_state(payloads)
+
+
+class JournalFileTests(unittest.TestCase):
+    def open_empty(self, directory, name="journal"):
+        path = pathlib.Path(directory) / name
+        lock_descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        return path, lock_descriptor, descriptor
+
+    def test_initialize_and_load_exact_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                initialized = provider.initialize_journal_file(
+                    lock_descriptor, descriptor, "initial"
+                )
+                selected = provider.read_journal_file(lock_descriptor, descriptor)
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+            self.assertEqual(initialized, provider.JournalFrame(1, "initial"))
+            self.assertEqual(selected, (0, initialized))
+            self.assertEqual(path.stat().st_size, provider.JOURNAL_FILE_SIZE)
+            self.assertEqual(path.stat().st_mode & 0o7777, 0o600)
+
+    def test_commits_alternate_frames_without_resizing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                provider.initialize_journal_file(lock_descriptor, descriptor)
+                self.assertEqual(
+                    provider.commit_journal_file(lock_descriptor, descriptor, "second"),
+                    (1, provider.JournalFrame(2, "second")),
+                )
+                self.assertEqual(
+                    provider.commit_journal_file(lock_descriptor, descriptor, "third"),
+                    (0, provider.JournalFrame(3, "third")),
+                )
+                self.assertEqual(
+                    provider.read_journal_file(lock_descriptor, descriptor),
+                    (0, provider.JournalFrame(3, "third")),
+                )
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+            self.assertEqual(path.stat().st_size, provider.JOURNAL_FILE_SIZE)
+
+    def test_reads_until_the_exact_image_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                provider.initialize_journal_file(lock_descriptor, descriptor, "chunked")
+                original_pread = os.pread
+
+                def chunked_pread(fd, length, offset):
+                    return original_pread(fd, min(length, 17), offset)
+
+                with mock.patch.object(provider.os, "pread", side_effect=chunked_pread):
+                    self.assertEqual(
+                        provider.read_journal_file(lock_descriptor, descriptor),
+                        (0, provider.JournalFrame(1, "chunked")),
+                    )
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+    def test_rejects_unsafe_metadata_and_descriptor_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, lock_descriptor, descriptor = self.open_empty(directory)
+            provider.initialize_journal_file(lock_descriptor, descriptor)
+            os.close(descriptor)
+
+            os.chmod(path, 0o644)
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                with self.assertRaisesRegex(provider.JournalFileError, "metadata"):
+                    provider.read_journal_file(lock_descriptor, descriptor)
+            finally:
+                os.close(descriptor)
+
+            os.chmod(path, 0o600)
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                with self.assertRaisesRegex(provider.JournalFileError, "access"):
+                    provider.commit_journal_file(lock_descriptor, descriptor, "new")
+            finally:
+                os.close(descriptor)
+
+            descriptor = os.open(path, os.O_RDWR | os.O_APPEND)
+            try:
+                with self.assertRaisesRegex(provider.JournalFileError, "access"):
+                    provider.commit_journal_file(lock_descriptor, descriptor, "new")
+                self.assertEqual(path.stat().st_size, provider.JOURNAL_FILE_SIZE)
+            finally:
+                os.close(descriptor)
+
+            os.link(path, pathlib.Path(directory) / "extra-link")
+            descriptor = os.open(path, os.O_RDWR)
+            try:
+                with self.assertRaisesRegex(provider.JournalFileError, "metadata"):
+                    provider.read_journal_file(lock_descriptor, descriptor)
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+    def test_torn_inactive_frame_preserves_previous_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                provider.initialize_journal_file(
+                    lock_descriptor, descriptor, "previous"
+                )
+                original_pwrite = os.pwrite
+
+                def short_pwrite(fd, data, offset):
+                    return original_pwrite(fd, data[:32], offset)
+
+                with mock.patch.object(provider.os, "pwrite", side_effect=short_pwrite):
+                    with self.assertRaisesRegex(
+                        provider.JournalCommitError, "indeterminate"
+                    ):
+                        provider.commit_journal_file(lock_descriptor, descriptor, "new")
+                self.assertEqual(
+                    provider.read_journal_file(lock_descriptor, descriptor),
+                    (0, provider.JournalFrame(1, "previous")),
+                )
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+    def test_concurrent_writers_are_serialized_by_directory_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, first_lock, first_file = self.open_empty(directory)
+            second_file = os.open(path, os.O_RDWR)
+            first_in_sync = threading.Event()
+            release_first = threading.Event()
+            second_done = threading.Event()
+            failures = []
+            original_fsync = os.fsync
+
+            def blocking_fsync(fd):
+                if fd == first_file and not first_in_sync.is_set():
+                    first_in_sync.set()
+                    if not release_first.wait(2):
+                        raise OSError("test did not release the first writer")
+                return original_fsync(fd)
+
+            def write(lock_descriptor, descriptor, payload, done=None):
+                try:
+                    provider.commit_journal_file(lock_descriptor, descriptor, payload)
+                except Exception as error:  # unittest thread boundary
+                    failures.append(error)
+                finally:
+                    if done is not None:
+                        done.set()
+
+            try:
+                provider.initialize_journal_file(first_lock, first_file, "initial")
+                with mock.patch.object(
+                    provider.os, "fsync", side_effect=blocking_fsync
+                ):
+                    first = threading.Thread(
+                        target=write,
+                        args=(first_lock, first_file, "first"),
+                    )
+                    second = threading.Thread(
+                        target=write,
+                        args=(first_lock, second_file, "second", second_done),
+                    )
+                    first.start()
+                    self.assertTrue(first_in_sync.wait(1))
+                    second.start()
+                    self.assertFalse(second_done.wait(0.05))
+                    release_first.set()
+                    first.join(2)
+                    second.join(2)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(
+                    provider.read_journal_file(first_lock, first_file),
+                    (0, provider.JournalFrame(3, "second")),
+                )
+            finally:
+                release_first.set()
+                os.close(second_file)
+                os.close(first_file)
+                os.close(first_lock)
+
+    def test_sync_failure_can_leave_new_frame_authoritative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                provider.initialize_journal_file(
+                    lock_descriptor, descriptor, "previous"
+                )
+                with mock.patch.object(
+                    provider.os, "fsync", side_effect=OSError("injected sync failure")
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalCommitError, "indeterminate"
+                    ):
+                        provider.commit_journal_file(lock_descriptor, descriptor, "new")
+                self.assertEqual(
+                    provider.read_journal_file(lock_descriptor, descriptor),
+                    (1, provider.JournalFrame(2, "new")),
+                )
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+    def test_readback_mismatch_is_indeterminate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _path, lock_descriptor, descriptor = self.open_empty(directory)
+            try:
+                provider.initialize_journal_file(
+                    lock_descriptor, descriptor, "previous"
+                )
+                original_read = provider._read_journal_image
+                read_count = 0
+
+                def mismatched_readback(fd):
+                    nonlocal read_count
+                    read_count += 1
+                    image = original_read(fd)
+                    if read_count == 2:
+                        changed = bytearray(image)
+                        changed[provider.JOURNAL_FRAME_SIZE + 32] ^= 1
+                        return bytes(changed)
+                    return image
+
+                with mock.patch.object(
+                    provider, "_read_journal_image", side_effect=mismatched_readback
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalCommitError, "indeterminate"
+                    ):
+                        provider.commit_journal_file(lock_descriptor, descriptor, "new")
+                self.assertEqual(
+                    provider.read_journal_file(lock_descriptor, descriptor),
+                    (1, provider.JournalFrame(2, "new")),
+                )
+            finally:
+                os.close(descriptor)
+                os.close(lock_descriptor)
+
+
+class JournalLayoutTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+    def open_directory(self, directory):
+        return os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+
+    def read_path(self, directory_descriptor, name):
+        descriptor = os.open(
+            name,
+            os.O_NOFOLLOW | os.O_CLOEXEC | os.O_RDWR,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            return provider.read_journal_file(directory_descriptor, descriptor)
+        finally:
+            os.close(descriptor)
+
+    def write_path(self, directory, name, image):
+        path = pathlib.Path(directory) / name
+        path.write_bytes(image)
+        os.chmod(path, 0o600)
+        return path
+
+    def test_fresh_layout_has_exact_initial_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                self.assertEqual(
+                    set(os.listdir(directory)), set(provider.JOURNAL_NAMES)
+                )
+                payloads = provider._initial_journal_payloads(self.boot_id)
+                for name in provider.JOURNAL_NAMES:
+                    with self.subTest(name=name):
+                        path = pathlib.Path(directory) / name
+                        metadata = path.stat()
+                        self.assertEqual(metadata.st_mode & 0o7777, 0o600)
+                        self.assertEqual(metadata.st_nlink, 1)
+                        self.assertEqual(metadata.st_size, provider.JOURNAL_FILE_SIZE)
+                        self.assertEqual(
+                            self.read_path(directory_descriptor, name),
+                            (0, provider.JournalFrame(1, payloads[name])),
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_invalid_boot_identity_creates_nothing(self):
+        invalid = (
+            "",
+            "01234567-89AB-cdef-0123-456789abcdef",
+            "0123456789ab-cdef-0123-456789abcdef",
+            "01234567-89ab-cdef-0123-456789abcdeg",
+        )
+        for boot_id in invalid:
+            with self.subTest(boot_id=boot_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    directory_descriptor = self.open_directory(directory)
+                    try:
+                        with self.assertRaisesRegex(
+                            provider.JournalLayoutError, "boot identity"
+                        ):
+                            provider.initialize_journal_layout(
+                                directory_descriptor, boot_id
+                            )
+                        self.assertEqual(os.listdir(directory), [])
+                    finally:
+                        os.close(directory_descriptor)
+
+    def test_fixed_symlink_collision_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            victim = pathlib.Path(directory) / "victim"
+            victim.write_bytes(b"do not modify")
+            os.symlink("victim", pathlib.Path(directory) / "active")
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active partial metadata is unsafe"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(victim.read_bytes(), b"do not modify")
+                self.assertFalse(
+                    (pathlib.Path(directory) / provider.JOURNAL_CURSOR_NAME).exists()
+                )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_directory_sync_failure_leaves_cursor_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            original_fsync = os.fsync
+
+            def fail_directory_sync(descriptor):
+                if descriptor == directory_descriptor:
+                    raise OSError("injected directory sync failure")
+                return original_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    provider.os, "fsync", side_effect=fail_directory_sync
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "directory sync"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+                self.assertEqual(
+                    set(os.listdir(directory)), set(provider.JOURNAL_DATA_NAMES)
+                )
+                self.assertFalse(
+                    (pathlib.Path(directory) / provider.JOURNAL_CURSOR_NAME).exists()
+                )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_final_directory_sync_failure_is_not_accepted_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            original_fsync = os.fsync
+            directory_syncs = 0
+
+            def fail_final_directory_sync(descriptor):
+                nonlocal directory_syncs
+                if descriptor == directory_descriptor:
+                    directory_syncs += 1
+                    if directory_syncs == 2:
+                        raise OSError("injected final directory sync failure")
+                return original_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    provider.os, "fsync", side_effect=fail_final_directory_sync
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "directory sync"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+                self.assertEqual(
+                    set(os.listdir(directory)), set(provider.JOURNAL_NAMES)
+                )
+                self.assertEqual(
+                    self.read_path(directory_descriptor, provider.JOURNAL_CURSOR_NAME),
+                    (0, provider.JournalFrame(1, "00")),
+                )
+                observed_directory_sync = False
+
+                def observe_retry_sync(descriptor):
+                    nonlocal observed_directory_sync
+                    if descriptor == directory_descriptor:
+                        observed_directory_sync = True
+                    return original_fsync(descriptor)
+
+                with mock.patch.object(
+                    provider.os, "fsync", side_effect=observe_retry_sync
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertTrue(observed_directory_sync)
+            finally:
+                os.close(directory_descriptor)
+
+    def test_descriptor_close_failure_does_not_mask_layout_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+            original_close_descriptors = provider._close_descriptors
+            cleanup_calls = 0
+
+            def close_descriptors_then_fail(descriptors):
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                self.assertIsNone(original_close_descriptors(descriptors))
+                return OSError(errno.EIO, "injected close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        provider,
+                        "_validate_initialized_journal_path_unlocked",
+                        side_effect=provider.JournalLayoutError(
+                            "injected primary layout error"
+                        ),
+                    ),
+                    mock.patch.object(
+                        provider,
+                        "_close_descriptors",
+                        side_effect=close_descriptors_then_fail,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "injected primary layout error"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+            self.assertEqual(cleanup_calls, 2)
+
+    def test_successful_layout_close_failure_inside_exception_handler_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+            original_close_descriptors = provider._close_descriptors
+            cleanup_calls = 0
+
+            def close_descriptors_then_fail(descriptors):
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                self.assertIsNone(original_close_descriptors(descriptors))
+                return OSError(errno.EIO, "injected close failure")
+
+            try:
+                try:
+                    raise RuntimeError("outer handled error")
+                except RuntimeError:
+                    with mock.patch.object(
+                        provider,
+                        "_close_descriptors",
+                        side_effect=close_descriptors_then_fail,
+                    ):
+                        with self.assertRaisesRegex(
+                            provider.JournalLayoutError,
+                            "journal partial descriptor close failed",
+                        ):
+                            provider.initialize_journal_layout(
+                                directory_descriptor, self.boot_id
+                            )
+            finally:
+                os.close(directory_descriptor)
+
+            self.assertEqual(cleanup_calls, 2)
+
+    def test_legacy_plaintext_is_rejected_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = pathlib.Path(directory) / "active"
+            active.write_bytes(b"legacy record")
+            os.chmod(active, 0o600)
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active is not recoverable"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(active.read_bytes(), b"legacy record")
+                self.assertFalse(
+                    (pathlib.Path(directory) / provider.JOURNAL_CURSOR_NAME).exists()
+                )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_missing_and_short_initial_fragments_are_recovered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payloads = provider._initial_journal_payloads(self.boot_id)
+            active_image = provider.initial_journal_image(payloads["active"])
+            cursor_image = provider.initial_journal_image(
+                payloads[provider.JOURNAL_CURSOR_NAME]
+            )
+            active = self.write_path(directory, "active", active_image[:113])
+            cursor = self.write_path(
+                directory, provider.JOURNAL_CURSOR_NAME, cursor_image[:31]
+            )
+            active_identity = (active.stat().st_dev, active.stat().st_ino)
+            cursor_identity = (cursor.stat().st_dev, cursor.stat().st_ino)
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                self.assertEqual(
+                    set(os.listdir(directory)), set(provider.JOURNAL_NAMES)
+                )
+                self.assertEqual(
+                    (active.stat().st_dev, active.stat().st_ino), active_identity
+                )
+                self.assertEqual(
+                    (cursor.stat().st_dev, cursor.stat().st_ino), cursor_identity
+                )
+                for name in provider.JOURNAL_NAMES:
+                    with self.subTest(name=name):
+                        self.assertEqual(
+                            self.read_path(directory_descriptor, name),
+                            (0, provider.JournalFrame(1, payloads[name])),
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_previous_boot_restart_fragments_are_recovered(self):
+        previous_boot = "11234567-89ab-cdef-0123-456789abcdef"
+        previous_payload = provider._initial_journal_payloads(previous_boot)["restart"]
+        previous_image = provider.initial_journal_image(previous_payload)
+        for image in (
+            previous_image,
+            previous_image[:48],
+            previous_image[:100],
+            previous_image[:100] + bytes(len(previous_image) - 100),
+        ):
+            with (
+                self.subTest(size=len(image)),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                restart = self.write_path(directory, "restart", image)
+                identity = (restart.stat().st_dev, restart.stat().st_ino)
+                directory_descriptor = self.open_directory(directory)
+                try:
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                    self.assertEqual(
+                        (restart.stat().st_dev, restart.stat().st_ino), identity
+                    )
+                    current_payload = provider._initial_journal_payloads(self.boot_id)[
+                        "restart"
+                    ]
+                    self.assertEqual(
+                        self.read_path(directory_descriptor, "restart"),
+                        (0, provider.JournalFrame(1, current_payload)),
+                    )
+                finally:
+                    os.close(directory_descriptor)
+
+    def test_noninitial_restart_records_still_block_recovery(self):
+        previous_boot = "11234567-89ab-cdef-0123-456789abcdef"
+        previous_payload = provider._initial_journal_payloads(previous_boot)["restart"]
+        cases = (
+            provider.encode_journal_frame(1, "not-an-all-clear-record")
+            + bytes(provider.JOURNAL_FRAME_SIZE),
+            provider.encode_journal_frame(1, previous_payload)
+            + provider.encode_journal_frame(2, previous_payload),
+        )
+        for image in cases:
+            with (
+                self.subTest(image=image[:72]),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                restart = self.write_path(directory, "restart", image)
+                before = restart.read_bytes()
+                directory_descriptor = self.open_directory(directory)
+                try:
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "restart is not recoverable"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+                    self.assertEqual(restart.read_bytes(), before)
+                    self.assertEqual(os.listdir(directory), ["restart"])
+                finally:
+                    os.close(directory_descriptor)
+
+    def test_interrupted_previous_boot_rewrite_remains_retryable(self):
+        previous_boot = "11234567-89ab-cdef-0123-456789abcdef"
+        previous_payload = provider._initial_journal_payloads(previous_boot)["restart"]
+        with tempfile.TemporaryDirectory() as directory:
+            restart = self.write_path(
+                directory, "restart", provider.initial_journal_image(previous_payload)
+            )
+            restart_identity = (restart.stat().st_dev, restart.stat().st_ino)
+            directory_descriptor = self.open_directory(directory)
+            original_pwrite = os.pwrite
+            injected = False
+
+            def interrupt_restart_rewrite(descriptor, image, offset):
+                nonlocal injected
+                metadata = os.fstat(descriptor)
+                if (
+                    not injected
+                    and (metadata.st_dev, metadata.st_ino) == restart_identity
+                    and offset == 0
+                    and len(image) == provider.JOURNAL_FILE_SIZE
+                ):
+                    injected = True
+                    self.assertEqual(
+                        original_pwrite(descriptor, image[:40], offset), 40
+                    )
+                    return 40
+                return original_pwrite(descriptor, image, offset)
+
+            try:
+                with mock.patch.object(
+                    provider.os, "pwrite", side_effect=interrupt_restart_rewrite
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "restart recovery failed"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                current_payload = provider._initial_journal_payloads(self.boot_id)[
+                    "restart"
+                ]
+                self.assertEqual(
+                    self.read_path(directory_descriptor, "restart"),
+                    (0, provider.JournalFrame(1, current_payload)),
+                )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_safe_fragments_cover_short_and_torn_initial_writes(self):
+        expected = provider.initial_journal_image("payload")
+        for length in (0, 1, 7, 8, 31, 64, 8191, 8192, 10000, 16383):
+            with self.subTest(length=length):
+                self.assertTrue(
+                    provider._is_safe_initial_fragment(expected[:length], expected)
+                )
+        first_difference = next(
+            index for index, byte in enumerate(expected) if byte != 0
+        )
+        torn = expected[: first_difference + 1] + bytes(
+            len(expected) - first_difference - 1
+        )
+        self.assertTrue(provider._is_safe_initial_fragment(torn, expected))
+        self.assertFalse(provider._is_safe_initial_fragment(b"legacy record", expected))
+        self.assertFalse(
+            provider._is_safe_initial_fragment(expected + b"extra", expected)
+        )
+
+    def test_invalid_precursor_file_blocks_all_recovery_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = provider.initial_journal_image("")
+            active = self.write_path(directory, "active", expected[:47])
+            restart = self.write_path(directory, "restart", b"legacy record")
+            active_before = active.read_bytes()
+            restart_before = restart.read_bytes()
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "restart is not recoverable"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(active.read_bytes(), active_before)
+                self.assertEqual(restart.read_bytes(), restart_before)
+                self.assertEqual(set(os.listdir(directory)), {"active", "restart"})
+            finally:
+                os.close(directory_descriptor)
+
+    def test_advanced_precursor_file_blocks_reinitialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            advanced = provider.encode_journal_frame(
+                1, ""
+            ) + provider.encode_journal_frame(2, "changed")
+            active = self.write_path(directory, "active", advanced)
+            before = active.read_bytes()
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active is not recoverable"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(active.read_bytes(), before)
+                self.assertEqual(os.listdir(directory), ["active"])
+            finally:
+                os.close(directory_descriptor)
+
+    def test_missing_file_after_cursor_is_not_recreated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                active = pathlib.Path(directory) / "active"
+                active.unlink()
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active is missing after cursor"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertFalse(active.exists())
+            finally:
+                os.close(directory_descriptor)
+
+    def test_damaged_file_after_cursor_is_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                active = pathlib.Path(directory) / "active"
+                active.write_bytes(b"damage")
+                damaged = active.read_bytes()
+                with self.assertRaises(provider.JournalLayoutError):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(active.read_bytes(), damaged)
+            finally:
+                os.close(directory_descriptor)
+
+    def test_empty_mode_zero_file_after_cursor_is_not_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                active = pathlib.Path(directory) / "active"
+                active.write_bytes(b"")
+                os.chmod(active, 0)
+                with self.assertRaises(provider.JournalLayoutError):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(stat.S_IMODE(active.stat().st_mode), 0)
+                self.assertEqual(active.stat().st_size, 0)
+            finally:
+                os.chmod(pathlib.Path(directory) / "active", 0o600)
+                os.close(directory_descriptor)
+
+    def test_valid_advanced_file_after_cursor_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            try:
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                active_descriptor = os.open(
+                    "active",
+                    os.O_NOFOLLOW | os.O_CLOEXEC | os.O_RDWR,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    provider.commit_journal_file(
+                        directory_descriptor, active_descriptor, "changed"
+                    )
+                finally:
+                    os.close(active_descriptor)
+                active = pathlib.Path(directory) / "active"
+                before = active.read_bytes()
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                self.assertEqual(active.read_bytes(), before)
+                self.assertEqual(
+                    self.read_path(directory_descriptor, "active"),
+                    (1, provider.JournalFrame(2, "changed")),
+                )
+            finally:
+                os.close(directory_descriptor)
+
+    def test_interrupted_creation_is_private_and_retryable_under_strict_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_descriptor = self.open_directory(directory)
+            previous_umask = os.umask(0o777)
+            try:
+                with mock.patch.object(
+                    provider,
+                    "_initialize_journal_file_unlocked",
+                    side_effect=provider.JournalFrameError(
+                        "injected initialization interruption"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "active initialization"
+                    ):
+                        provider.initialize_journal_layout(
+                            directory_descriptor, self.boot_id
+                        )
+                active = pathlib.Path(directory) / "active"
+                self.assertEqual(stat.S_IMODE(active.stat().st_mode), 0o600)
+                self.assertEqual(active.stat().st_size, 0)
+                provider.initialize_journal_layout(directory_descriptor, self.boot_id)
+                self.assertEqual(
+                    set(os.listdir(directory)), set(provider.JOURNAL_NAMES)
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(directory_descriptor)
+
+    def test_empty_owner_mode_precursors_are_repaired_through_held_descriptors(self):
+        for mode in (0, 0o200, 0o400):
+            with (
+                self.subTest(mode=oct(mode)),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                active = self.write_path(directory, "active", b"")
+                os.chmod(active, mode)
+                directory_descriptor = self.open_directory(directory)
+                try:
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                    self.assertEqual(stat.S_IMODE(active.stat().st_mode), 0o600)
+                    self.assertEqual(
+                        self.read_path(directory_descriptor, "active"),
+                        (0, provider.JournalFrame(1, "")),
+                    )
+                finally:
+                    os.close(directory_descriptor)
+
+    def test_mode_repair_waits_until_every_path_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.write_path(directory, "active", b"")
+            os.chmod(active, 0)
+            restart = self.write_path(directory, "restart", b"legacy record")
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "restart is not recoverable"
+                ):
+                    provider.initialize_journal_layout(
+                        directory_descriptor, self.boot_id
+                    )
+                self.assertEqual(stat.S_IMODE(active.stat().st_mode), 0)
+                self.assertEqual(active.stat().st_size, 0)
+                self.assertEqual(restart.read_bytes(), b"legacy record")
+            finally:
+                os.close(directory_descriptor)
+
+    def test_invalid_initial_frame_uses_layout_error_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = pathlib.Path(directory) / "active"
+            active.write_bytes(b"\0" * provider.JOURNAL_FILE_SIZE)
+            os.chmod(active, 0o600)
+            directory_descriptor = self.open_directory(directory)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active is not initial"
+                ):
+                    provider._validate_initial_journal_path_unlocked(
+                        directory_descriptor, "active", "0"
+                    )
+            finally:
+                os.close(directory_descriptor)
+
+
+class JournalStateLoadTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+    def open_initialized_chain(self, directory):
+        state = pathlib.Path(directory) / "state"
+        journal = state / "dwm-titus" / "system-management"
+        chain = provider.open_journal_directory_chain(str(journal))
+        provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+        return state, journal, chain
+
+    def test_loads_exact_fixed_paths_read_only_without_enumeration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, _journal, chain = self.open_initialized_chain(directory)
+            opened = {}
+            first_read_saw_all_descriptors = False
+            original_open = os.open
+            original_read = provider._read_journal_file_unlocked
+
+            def track_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened[path] = (descriptor, flags)
+                return descriptor
+
+            def observe_first_read(descriptor):
+                nonlocal first_read_saw_all_descriptors
+                if not first_read_saw_all_descriptors:
+                    self.assertEqual(tuple(opened), provider.JOURNAL_NAMES)
+                    first_read_saw_all_descriptors = True
+                return original_read(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(provider.os, "open", side_effect=track_open),
+                    mock.patch.object(
+                        provider.os,
+                        "listdir",
+                        side_effect=AssertionError("directory enumeration is forbidden"),
+                    ),
+                    mock.patch.object(
+                        provider.os,
+                        "scandir",
+                        side_effect=AssertionError("directory enumeration is forbidden"),
+                    ),
+                    mock.patch.object(
+                        provider,
+                        "_read_journal_file_unlocked",
+                        side_effect=observe_first_read,
+                    ),
+                ):
+                    state = provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+            self.assertTrue(first_read_saw_all_descriptors)
+            self.assertEqual(
+                state,
+                provider.decode_journal_state(
+                    provider._initial_journal_payloads(self.boot_id)
+                ),
+            )
+            self.assertEqual(tuple(opened), provider.JOURNAL_NAMES)
+            for descriptor, flags in opened.values():
+                self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+                self.assertTrue(flags & os.O_NONBLOCK)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+                self.assertTrue(flags & os.O_CLOEXEC)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_record_error_closes_every_retained_file_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, _journal, chain = self.open_initialized_chain(directory)
+            active_descriptor = os.open(
+                "active",
+                os.O_NOFOLLOW | os.O_CLOEXEC | os.O_RDWR,
+                dir_fd=chain.directory_descriptor,
+            )
+            try:
+                provider.commit_journal_file(
+                    chain.directory_descriptor, active_descriptor, "malformed"
+                )
+            finally:
+                os.close(active_descriptor)
+
+            opened = []
+            original_open = os.open
+
+            def track_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened.append(descriptor)
+                return descriptor
+
+            try:
+                with mock.patch.object(provider.os, "open", side_effect=track_open):
+                    with self.assertRaisesRegex(
+                        provider.JournalRecordError, "operation field count"
+                    ):
+                        provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+            self.assertEqual(len(opened), len(provider.JOURNAL_NAMES))
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_close_failure_does_not_mask_primary_record_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, _journal, chain = self.open_initialized_chain(directory)
+            opened = []
+            original_open = os.open
+            original_close = os.close
+            failed_close = False
+
+            def track_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened.append(descriptor)
+                return descriptor
+
+            def close_then_fail_once(descriptor):
+                nonlocal failed_close
+                original_close(descriptor)
+                if descriptor in opened and not failed_close:
+                    failed_close = True
+                    raise OSError(errno.EIO, "injected close failure")
+
+            try:
+                with (
+                    mock.patch.object(provider.os, "open", side_effect=track_open),
+                    mock.patch.object(
+                        provider,
+                        "decode_journal_state",
+                        side_effect=provider.JournalRecordError(
+                            "injected primary record error"
+                        ),
+                    ),
+                    mock.patch.object(
+                        provider.os, "close", side_effect=close_then_fail_once
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalRecordError, "injected primary record error"
+                    ):
+                        provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+            self.assertTrue(failed_close)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_successful_load_close_failure_inside_exception_handler_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, _journal, chain = self.open_initialized_chain(directory)
+            opened = []
+            original_open = os.open
+            original_close = os.close
+            failed_close = False
+
+            def track_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened.append(descriptor)
+                return descriptor
+
+            def close_then_fail_once(descriptor):
+                nonlocal failed_close
+                original_close(descriptor)
+                if descriptor in opened and not failed_close:
+                    failed_close = True
+                    raise OSError(errno.EIO, "injected close failure")
+
+            try:
+                try:
+                    raise RuntimeError("outer handled error")
+                except RuntimeError:
+                    with (
+                        mock.patch.object(
+                            provider.os, "open", side_effect=track_open
+                        ),
+                        mock.patch.object(
+                            provider.os, "close", side_effect=close_then_fail_once
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            provider.JournalLayoutError,
+                            "journal state descriptor close failed",
+                        ):
+                            provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+            self.assertTrue(failed_close)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_open_failure_closes_every_previously_opened_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, _journal, chain = self.open_initialized_chain(directory)
+            opened = []
+            original_open = os.open
+
+            def fail_later_open(path, flags, *args, **kwargs):
+                if (
+                    path == "terminal-05"
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    raise OSError(errno.EIO, "injected open failure")
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened.append(descriptor)
+                return descriptor
+
+            try:
+                with mock.patch.object(provider.os, "open", side_effect=fail_later_open):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "terminal-05 open failed"
+                    ):
+                        provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+            self.assertGreater(len(opened), 1)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_fixed_symlink_is_rejected_without_following_the_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, journal, chain = self.open_initialized_chain(directory)
+            path = journal / "terminal-31"
+            target = journal / "terminal-31-retained"
+            path.rename(target)
+            path.symlink_to(target.name)
+            before = target.read_bytes()
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "terminal-31 open failed"
+                ):
+                    provider.load_journal_state(chain)
+                self.assertEqual(target.read_bytes(), before)
+            finally:
+                chain.close()
+
+    def test_unsafe_metadata_reports_the_exact_fixed_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, journal, chain = self.open_initialized_chain(directory)
+            active = journal / "active"
+            os.chmod(active, 0o644)
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active identity is unsafe"
+                ):
+                    provider.load_journal_state(chain)
+            finally:
+                os.chmod(active, 0o600)
+                chain.close()
+
+    def test_fifo_path_fails_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, journal, chain = self.open_initialized_chain(directory)
+            path = journal / "terminal-31"
+            path.unlink()
+            os.mkfifo(path, 0o600)
+            os.chmod(path, 0o600)
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "terminal-31 identity is unsafe"
+                ):
+                    provider.load_journal_state(chain)
+                self.assertLess(time.monotonic() - started, 1)
+            finally:
+                chain.close()
+
+    def test_replaced_path_is_rejected_after_descriptor_bound_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state, journal, chain = self.open_initialized_chain(directory)
+            active = journal / "active"
+            detached = journal / "active-detached"
+            image = active.read_bytes()
+            original_read = provider._read_journal_file_unlocked
+            replaced = False
+
+            def replace_active(descriptor):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    active.rename(detached)
+                    active.write_bytes(image)
+                    os.chmod(active, 0o600)
+                return original_read(descriptor)
+
+            try:
+                with mock.patch.object(
+                    provider,
+                    "_read_journal_file_unlocked",
+                    side_effect=replace_active,
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "active identity is unsafe"
+                    ):
+                        provider.load_journal_state(chain)
+                self.assertTrue(replaced)
+                self.assertEqual(detached.read_bytes(), image)
+                self.assertEqual(active.read_bytes(), image)
+            finally:
+                chain.close()
+
+    def test_replaced_ancestor_is_rejected_after_complete_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path, _journal, chain = self.open_initialized_chain(directory)
+            moved = pathlib.Path(directory) / "state-moved"
+            original_decode = provider.decode_journal_state
+
+            def replace_state(payloads):
+                result = original_decode(payloads)
+                state_path.rename(moved)
+                state_path.mkdir()
+                return result
+
+            try:
+                with mock.patch.object(
+                    provider, "decode_journal_state", side_effect=replace_state
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "state is unsafe"
+                    ):
+                        provider.load_journal_state(chain)
+            finally:
+                chain.close()
+
+
+class JournalWritableOpenTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+    def open_initialized_chain(self, directory):
+        journal = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+        chain = provider.open_journal_directory_chain(str(journal))
+        provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+        return journal, chain
+
+    def test_retains_exact_fixed_writable_paths_under_exclusive_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            opened = {}
+            lock_events = []
+            original_open = os.open
+            original_lock = provider._journal_lock
+
+            def track_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened[path] = (descriptor, flags)
+                return descriptor
+
+            @contextlib.contextmanager
+            def observe_lock(descriptor, *, exclusive):
+                lock_events.append(("enter", descriptor, exclusive))
+                with original_lock(descriptor, exclusive=exclusive):
+                    yield
+                lock_events.append(("exit", descriptor, exclusive))
+
+            try:
+                with (
+                    mock.patch.object(provider.os, "open", side_effect=track_open),
+                    mock.patch.object(provider, "_journal_lock", side_effect=observe_lock),
+                    mock.patch.object(
+                        provider.os,
+                        "listdir",
+                        side_effect=AssertionError("directory enumeration is forbidden"),
+                    ),
+                    mock.patch.object(
+                        provider.os,
+                        "scandir",
+                        side_effect=AssertionError("directory enumeration is forbidden"),
+                    ),
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        self.assertEqual(
+                            lock_events,
+                            [("enter", chain.directory_descriptor, True)],
+                        )
+                        self.assertEqual(tuple(opened), provider.JOURNAL_NAMES)
+                        journal.validate()
+                        for name, (descriptor, flags) in opened.items():
+                            self.assertEqual(journal.descriptor(name), descriptor)
+                            self.assertEqual(flags & os.O_ACCMODE, os.O_RDWR)
+                            self.assertTrue(flags & os.O_NONBLOCK)
+                            self.assertTrue(flags & os.O_NOFOLLOW)
+                            self.assertTrue(flags & os.O_CLOEXEC)
+
+                self.assertEqual(
+                    lock_events,
+                    [
+                        ("enter", chain.directory_descriptor, True),
+                        ("exit", chain.directory_descriptor, True),
+                    ],
+                )
+                self.assertTrue(journal.closed)
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "descriptor set is closed"
+                ):
+                    journal.descriptor("active")
+                for descriptor, _flags in opened.values():
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+            finally:
+                chain.close()
+
+    def test_open_failure_closes_every_previously_retained_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            opened = []
+            original_open = os.open
+
+            def fail_later_open(path, flags, *args, **kwargs):
+                if (
+                    path == "terminal-05"
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    raise OSError(errno.EIO, "injected open failure")
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path in provider.JOURNAL_NAMES
+                    and kwargs.get("dir_fd") == chain.directory_descriptor
+                ):
+                    opened.append(descriptor)
+                return descriptor
+
+            try:
+                with mock.patch.object(provider.os, "open", side_effect=fail_later_open):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError,
+                        "terminal-05 writable open failed",
+                    ):
+                        with provider.open_writable_journal(chain):
+                            self.fail("journal opened after a fixed-path failure")
+                self.assertGreater(len(opened), 1)
+                for descriptor in opened:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+            finally:
+                chain.close()
+
+    def test_fifo_path_is_rejected_without_waiting_for_a_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            path = journal_path / "terminal-31"
+            path.unlink()
+            os.mkfifo(path, 0o600)
+            os.chmod(path, 0o600)
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "terminal-31 identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain):
+                        self.fail("FIFO was accepted as a journal file")
+                self.assertLess(time.monotonic() - started, 1)
+            finally:
+                chain.close()
+
+    def test_replaced_path_is_rejected_before_releasing_the_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            active = journal_path / "active"
+            detached = journal_path / "active-detached"
+            image = active.read_bytes()
+            held_descriptors = ()
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        held_descriptors = tuple(
+                            journal.descriptor(name) for name in provider.JOURNAL_NAMES
+                        )
+                        active.rename(detached)
+                        active.write_bytes(image)
+                        os.chmod(active, 0o600)
+                self.assertEqual(detached.read_bytes(), image)
+                self.assertEqual(active.read_bytes(), image)
+                for descriptor in held_descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+            finally:
+                chain.close()
+
+    def test_close_failure_does_not_mask_body_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            original_close_descriptors = provider._close_descriptors
+            cleanup_calls = 0
+
+            def close_descriptors_then_fail(descriptors):
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                self.assertIsNone(original_close_descriptors(descriptors))
+                return OSError(errno.EIO, "injected close failure")
+
+            try:
+                with mock.patch.object(
+                    provider,
+                    "_close_descriptors",
+                    side_effect=close_descriptors_then_fail,
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalRecordError, "injected body error"
+                    ):
+                        with provider.open_writable_journal(chain):
+                            raise provider.JournalRecordError("injected body error")
+                self.assertEqual(cleanup_calls, 1)
+            finally:
+                chain.close()
+
+    def test_successful_close_failure_inside_exception_handler_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            original_close_descriptors = provider._close_descriptors
+            cleanup_calls = 0
+
+            def close_descriptors_then_fail(descriptors):
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                self.assertIsNone(original_close_descriptors(descriptors))
+                return OSError(errno.EIO, "injected close failure")
+
+            try:
+                try:
+                    raise RuntimeError("outer handled error")
+                except RuntimeError:
+                    with mock.patch.object(
+                        provider,
+                        "_close_descriptors",
+                        side_effect=close_descriptors_then_fail,
+                    ):
+                        with self.assertRaisesRegex(
+                            provider.JournalLayoutError,
+                            "writable journal descriptor close failed",
+                        ):
+                            with provider.open_writable_journal(chain):
+                                pass
+                self.assertEqual(cleanup_calls, 1)
+            finally:
+                chain.close()
+
+
+class JournalWritableCommitTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+    def open_initialized_chain(self, directory):
+        journal = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+        chain = provider.open_journal_directory_chain(str(journal))
+        provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+        return journal, chain
+
+    def test_commits_retained_path_between_complete_validations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    index, frame = provider.commit_writable_journal_path(
+                        journal, "active", ""
+                    )
+
+                    self.assertEqual(index, 1)
+                    self.assertEqual(frame, provider.JournalFrame(2, ""))
+                    self.assertEqual(
+                        provider._read_journal_file_unlocked(
+                            journal.descriptor("active")
+                        ),
+                        (index, frame),
+                    )
+            finally:
+                chain.close()
+
+    def test_replaced_target_is_rejected_before_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            active = journal_path / "active"
+            detached = journal_path / "active-detached"
+            image = active.read_bytes()
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        active.rename(detached)
+                        active.write_bytes(image)
+                        os.chmod(active, 0o600)
+                        provider.commit_writable_journal_path(journal, "active", "")
+
+                self.assertEqual(
+                    provider.select_journal_frame(detached.read_bytes())[1].sequence,
+                    1,
+                )
+                self.assertEqual(
+                    provider.select_journal_frame(active.read_bytes())[1].sequence,
+                    1,
+                )
+            finally:
+                chain.close()
+
+    def test_replaced_target_is_rejected_after_descriptor_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            active = journal_path / "active"
+            detached = journal_path / "active-detached"
+            image = active.read_bytes()
+            original_commit = provider._commit_journal_file_unlocked
+
+            def replace_after_commit(descriptor, payload):
+                result = original_commit(descriptor, payload)
+                active.rename(detached)
+                active.write_bytes(image)
+                os.chmod(active, 0o600)
+                return result
+
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        with mock.patch.object(
+                            provider,
+                            "_commit_journal_file_unlocked",
+                            side_effect=replace_after_commit,
+                        ):
+                            provider.commit_writable_journal_path(
+                                journal, "active", ""
+                            )
+
+                self.assertEqual(
+                    provider.select_journal_frame(detached.read_bytes())[1].sequence,
+                    2,
+                )
+                self.assertEqual(
+                    provider.select_journal_frame(active.read_bytes())[1].sequence,
+                    1,
+                )
+            finally:
+                chain.close()
+
+    def test_unrelated_replaced_path_is_rejected_after_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            terminal = journal_path / "terminal-12"
+            detached = journal_path / "terminal-12-detached"
+            terminal_image = terminal.read_bytes()
+            original_commit = provider._commit_journal_file_unlocked
+
+            def replace_after_commit(descriptor, payload):
+                result = original_commit(descriptor, payload)
+                terminal.rename(detached)
+                terminal.write_bytes(terminal_image)
+                os.chmod(terminal, 0o600)
+                return result
+
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "terminal-12 identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        with mock.patch.object(
+                            provider,
+                            "_commit_journal_file_unlocked",
+                            side_effect=replace_after_commit,
+                        ):
+                            provider.commit_writable_journal_path(
+                                journal, "active", ""
+                            )
+
+                self.assertEqual(
+                    provider.select_journal_frame(
+                        (journal_path / "active").read_bytes()
+                    )[1].sequence,
+                    2,
+                )
+            finally:
+                chain.close()
+
+    def test_indeterminate_commit_revalidates_and_preserves_primary_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            active = journal_path / "active"
+            detached = journal_path / "active-detached"
+            image = active.read_bytes()
+            commit_error = provider.JournalCommitError(
+                "injected indeterminate commit"
+            )
+
+            def fail_after_replacement(_descriptor, _payload):
+                active.rename(detached)
+                active.write_bytes(image)
+                os.chmod(active, 0o600)
+                raise commit_error
+
+            try:
+                with self.assertRaises(provider.JournalCommitError) as caught:
+                    with provider.open_writable_journal(chain) as journal:
+                        with mock.patch.object(
+                            provider,
+                            "_commit_journal_file_unlocked",
+                            side_effect=fail_after_replacement,
+                        ):
+                            provider.commit_writable_journal_path(journal, "active", "")
+
+                self.assertIs(caught.exception, commit_error)
+                self.assertIsInstance(
+                    caught.exception.__cause__, provider.JournalLayoutError
+                )
+                self.assertIn(
+                    "active identity is unsafe", str(caught.exception.__cause__)
+                )
+            finally:
+                chain.close()
+
+
+class JournalRetainedSessionTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+
+    @contextlib.contextmanager
+    def session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+            with provider.open_journal_directory_chain(str(path)) as chain:
+                provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+                with provider.retain_writable_journal(chain) as journal:
+                    yield path, chain, journal
+
+    def begin(self, journal):
+        return provider.begin_journal_operation(
+            journal, "updates-refresh", "2026-09-04T18:00:00Z", "Starting refresh",
+            transaction_path="/1_test", boot_id=self.boot_id,
+        )
+
+    def test_service_interval_releases_lock_but_retains_all_file_identities(self):
+        with self.session() as (_path, chain, journal):
+            identities = {
+                name: (journal.descriptor(name), os.fstat(journal.descriptor(name)).st_ino)
+                for name in provider.JOURNAL_NAMES
+            }
+            with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                pass
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+                with mock.patch.object(provider, "JOURNAL_LOCK_DEADLINE_SECONDS", 0.01):
+                    with self.assertRaises(provider.JournalLockError):
+                        with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                            self.fail("checkpoint lock did not exclude another writer")
+            with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                pass
+            with provider.lock_writable_journal(journal):
+                self.assertEqual(provider.load_writable_journal_state(journal).active, operation)
+                for name, (descriptor, inode) in identities.items():
+                    self.assertEqual(journal.descriptor(name), descriptor)
+                    self.assertEqual(os.fstat(descriptor).st_ino, inode)
+        self.assertTrue(journal.closed)
+        for descriptor, _inode in identities.values():
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_unlocked_state_reads_and_commits_are_rejected(self):
+        with self.session() as (path, _chain, journal):
+            before = (path / "active").read_bytes()
+            with self.assertRaisesRegex(provider.JournalLockError, "exclusive interval"):
+                provider.load_writable_journal_state(journal)
+            with self.assertRaisesRegex(provider.JournalLockError, "exclusive interval"):
+                provider.commit_writable_journal_path(journal, "active", "active\tempty")
+            with self.assertRaisesRegex(provider.JournalLockError, "exclusive interval"):
+                self.begin(journal)
+            self.assertEqual((path / "active").read_bytes(), before)
+
+    def test_reacquisition_observes_concurrent_checkpoint_and_rejects_stale_owner(self):
+        with self.session() as (_path, chain, journal):
+            with provider.lock_writable_journal(journal):
+                pending = self.begin(journal)
+            running = replace(pending, state="running")
+            with provider.open_writable_journal(chain) as observer:
+                provider.advance_journal_operation(observer, pending, running)
+            with provider.lock_writable_journal(journal):
+                self.assertEqual(provider.load_writable_journal_state(journal).active, running)
+                with self.assertRaises(provider.JournalAdmissionError):
+                    provider.advance_journal_operation(journal, pending, running)
+
+    def test_replaced_file_during_service_wait_is_rejected_before_checkpoint(self):
+        descriptors = ()
+        with self.assertRaisesRegex(provider.JournalLayoutError, "active identity"):
+            with self.session() as (path, _chain, journal):
+                descriptors = tuple(journal.descriptor(name) for name in provider.JOURNAL_NAMES)
+                active = path / "active"
+                before = active.read_bytes()
+                active.rename(path / "detached-active")
+                active.write_bytes(before)
+                active.chmod(0o600)
+                with provider.lock_writable_journal(journal):
+                    self.fail("replacement was accepted")
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_replaced_directory_during_service_wait_is_rejected(self):
+        with self.assertRaises(provider.JournalLayoutError):
+            with self.session() as (path, _chain, journal):
+                path.rename(path.with_name("detached-journal"))
+                path.mkdir(mode=0o700)
+                with provider.lock_writable_journal(journal):
+                    self.fail("directory replacement was accepted")
+
+    def test_nested_interval_and_body_error_release_lock(self):
+        with self.session() as (_path, chain, journal):
+            with self.assertRaisesRegex(RuntimeError, "service error"):
+                with provider.lock_writable_journal(journal):
+                    with self.assertRaisesRegex(provider.JournalLockError, "already active"):
+                        with provider.lock_writable_journal(journal):
+                            self.fail("nested interval was accepted")
+                    raise RuntimeError("service error")
+            self.assertFalse(journal._exclusive)
+            with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                pass
+            with provider.lock_writable_journal(journal):
+                self.assertIsNone(provider.load_writable_journal_state(journal).active)
+
+    def test_service_error_reports_replacement_and_closes_every_descriptor(self):
+        service_error = RuntimeError("service call failed after send")
+        with self.assertRaises(RuntimeError) as caught:
+            with self.session() as (path, _chain, journal):
+                descriptors = tuple(journal.descriptor(name) for name in provider.JOURNAL_NAMES)
+                active = path / "active"
+                image = active.read_bytes()
+                active.rename(path / "detached-active")
+                active.write_bytes(image)
+                active.chmod(0o600)
+                raise service_error
+        self.assertIs(caught.exception, service_error)
+        self.assertIsInstance(caught.exception.__cause__, provider.JournalLayoutError)
+        self.assertIn("active identity", str(caught.exception.__cause__))
+        self.assertTrue(journal.closed)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_interval_error_revalidates_before_unlock_even_when_caught_by_owner(self):
+        with self.session() as (_path, _chain, journal):
+            checkpoint_error = RuntimeError("checkpoint failed")
+            identity_error = provider.JournalLayoutError("injected identity loss")
+            with self.assertRaises(RuntimeError) as caught:
+                with provider.lock_writable_journal(journal):
+                    original_validate = journal.validate
+                    # Keep validation fault active during context unwinding, but
+                    # restore it before the retained-session context is closed.
+                    journal.validate = mock.Mock(side_effect=identity_error)
+                    raise checkpoint_error
+            validation = journal.validate
+            journal.validate = original_validate
+            self.assertIs(caught.exception, checkpoint_error)
+            self.assertIs(caught.exception.__cause__, identity_error)
+            validation.assert_called_once_with()
+            self.assertFalse(journal._exclusive)
+            with provider.lock_writable_journal(journal):
+                self.assertIsNone(provider.load_writable_journal_state(journal).active)
+
+    def test_contended_reacquisition_remains_bounded_and_can_be_retried(self):
+        with self.session() as (_path, chain, journal):
+            with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                started = time.monotonic()
+                with mock.patch.object(provider, "JOURNAL_LOCK_DEADLINE_SECONDS", 0.01):
+                    with self.assertRaises(provider.JournalLockError):
+                        with provider.lock_writable_journal(journal):
+                            self.fail("contended interval was entered")
+                self.assertLess(time.monotonic() - started, 1)
+            self.assertFalse(journal._exclusive)
+            with provider.lock_writable_journal(journal):
+                self.assertIsNone(provider.load_writable_journal_state(journal).active)
+
+
+class JournalLifecycleTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+    started = "2026-09-04T18:00:00Z"
+    finished = "2026-09-04T18:01:00Z"
+
+    def test_fedora_transaction_paths_are_root_level_bounded_ids(self):
+        for path in ("/18_adcbcaed", "/45_dafeca"):
+            self.assertIsNotNone(provider.JOURNAL_PACKAGEKIT_PATH_PATTERN.fullmatch(path))
+        for path in (
+            "/org/freedesktop/PackageKit/transactions/18_adcbcaed",
+            "/org/freedesktop/PackageKit", "/", "/18_adcbcaed/child",
+            "/18_", "/18_" + "a" * 65, "/" + "1" * 21 + "_abcd",
+            "/18_abcd\n", "/18_ab-cd",
+        ):
+            self.assertIsNone(provider.JOURNAL_PACKAGEKIT_PATH_PATTERN.fullmatch(path))
+
+    @contextlib.contextmanager
+    def journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+            with provider.open_journal_directory_chain(str(path)) as chain:
+                provider.initialize_journal_layout(
+                    chain.directory_descriptor, self.boot_id
+                )
+                with provider.open_writable_journal(chain) as journal:
+                    yield journal
+
+    def begin(self, journal, action="updates-refresh"):
+        args = {}
+        if action in ("updates-refresh", "updates-install-all"):
+            args["transaction_path"] = "/1_test"
+            args["boot_id"] = self.boot_id
+        if action == "updates-install-all":
+            args.update(generation="a" * 64, boot_id=self.boot_id)
+        return provider.begin_journal_operation(
+            journal, action, self.started, "Starting operation", **args
+        )
+
+    def finish(self, journal, operation, **contributions):
+        running = replace(operation, state="running", **contributions)
+        provider.advance_journal_operation(journal, operation, running)
+        terminal = replace(
+            running,
+            state="succeeded",
+            finished_at=self.finished,
+            terminal_monotonic=100 if running.kind in ("refresh", "update") else None,
+        )
+        provider.advance_journal_operation(journal, running, terminal)
+        return terminal
+
+    def image(self, journal, name):
+        return os.pread(journal.descriptor(name), provider.JOURNAL_FILE_SIZE, 0)
+
+    def test_pending_is_durable_and_blocks_overlap(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            self.assertEqual(
+                provider.load_writable_journal_state(journal).active, operation
+            )
+            self.assertEqual(operation.state, "pending")
+            before = self.image(journal, "active")
+            with self.assertRaises(provider.JournalAdmissionError):
+                self.begin(journal)
+            self.assertEqual(self.image(journal, "active"), before)
+
+    def test_invalid_admission_arguments_never_commit(self):
+        with self.journal() as journal:
+            with mock.patch.object(provider, "commit_writable_journal_path") as commit:
+                for action, args in (
+                    ("unknown", {}),
+                    ("updates-refresh", {"transaction_path": "/arbitrary"}),
+                    ("timezone-set", {"generation": "a" * 64}),
+                    (
+                        "updates-install-all",
+                        {
+                            "generation": "a" * 64,
+                            "transaction_path": "/1_test",
+                            "boot_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        },
+                    ),
+                ):
+                    with self.subTest(action=action):
+                        with self.assertRaises(
+                            (
+                                provider.JournalRecordError,
+                                provider.JournalAdmissionError,
+                            )
+                        ):
+                            provider.begin_journal_operation(
+                                journal, action, self.started, "Starting", **args
+                            )
+                commit.assert_not_called()
+
+    def test_rejects_stale_identity_illegal_transition_and_progress_writes(self):
+        with self.journal() as journal:
+            pending = self.begin(journal)
+            running = replace(pending, state="running")
+            provider.advance_journal_operation(journal, pending, running)
+            for expected, following in (
+                (pending, running),
+                (
+                    running,
+                    replace(
+                        running,
+                        transaction_path="/2_other",
+                    ),
+                ),
+                (running, replace(running, state="authorizing")),
+                (running, replace(running, detail="Progress only")),
+            ):
+                with self.subTest(following=following):
+                    before = self.image(journal, "active")
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        provider.advance_journal_operation(journal, expected, following)
+                    self.assertEqual(self.image(journal, "active"), before)
+
+    def test_restart_contributions_only_strengthen(self):
+        with self.journal() as journal:
+            pending = self.begin(journal, "updates-install-all")
+            stronger = replace(
+                pending, session_restart="security-session", application_restart=True
+            )
+            provider.advance_journal_operation(journal, pending, stronger)
+            with self.assertRaises(provider.JournalAdmissionError):
+                provider.advance_journal_operation(journal, stronger, pending)
+
+    def test_every_kind_retains_exact_terminal_until_acknowledged(self):
+        for action in provider.JOURNAL_OPERATION_ACTION_KINDS:
+            with self.subTest(action=action), self.journal() as journal:
+                terminal = self.finish(journal, self.begin(journal, action))
+                restart_before = self.image(journal, "restart")
+                provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                state = provider.load_writable_journal_state(journal)
+                self.assertIsNone(state.active)
+                self.assertEqual(
+                    state.handoff, provider.JournalHandoff(terminal.operation_id, 0)
+                )
+                self.assertEqual(state.cursor, 1)
+                self.assertEqual(
+                    provider.retained_journal_operation(journal, terminal.operation_id),
+                    terminal,
+                )
+                with self.assertRaises(provider.JournalAdmissionError):
+                    self.begin(journal)
+                with self.assertRaises(provider.JournalAdmissionError):
+                    provider.acknowledge_journal_handoff(journal, "op-" + "f" * 32)
+                provider.acknowledge_journal_handoff(journal, terminal.operation_id)
+                self.assertIsNone(provider.load_writable_journal_state(journal).handoff)
+                self.assertEqual(
+                    provider.retained_journal_operation(journal, terminal.operation_id),
+                    terminal,
+                )
+                if terminal.kind != "update":
+                    self.assertEqual(self.image(journal, "restart"), restart_before)
+
+    def test_terminalization_recovers_before_and_after_every_commit(self):
+        for action in (
+            "updates-refresh",
+            "updates-install-all",
+            "timezone-set",
+            "accounts-open",
+        ):
+            names = ["terminal-00", "cursor", "handoff", "active"]
+            if action == "updates-install-all":
+                names.insert(0, "restart")
+            for target in names:
+                for after in (False, True):
+                    with (
+                        self.subTest(action=action, target=target, after=after),
+                        self.journal() as journal,
+                    ):
+                        contributions = {}
+                        if action == "updates-install-all":
+                            contributions = dict(
+                                system_restart="system",
+                                session_restart="security-session",
+                                application_restart=True,
+                            )
+                        terminal = self.finish(
+                            journal, self.begin(journal, action), **contributions
+                        )
+                        real_commit = provider.commit_writable_journal_path
+
+                        def crash(journal, name, payload):
+                            if name == target and not after:
+                                raise provider.JournalCommitError(
+                                    "injected before commit"
+                                )
+                            result = real_commit(journal, name, payload)
+                            if name == target:
+                                raise provider.JournalCommitError(
+                                    "injected after commit"
+                                )
+                            return result
+
+                        with mock.patch.object(
+                            provider, "commit_writable_journal_path", side_effect=crash
+                        ):
+                            with self.assertRaises(provider.JournalCommitError):
+                                provider.complete_journal_terminal(
+                                    journal, boot_id=self.boot_id
+                                )
+                        provider.load_writable_journal_state(journal)
+                        provider.complete_journal_terminal(
+                            journal, boot_id=self.boot_id
+                        )
+                        state = provider.load_writable_journal_state(journal)
+                        self.assertIsNone(state.active)
+                        self.assertEqual(state.terminals[0], terminal)
+                        self.assertEqual(state.cursor, 1)
+                        self.assertEqual(
+                            state.handoff.operation_id, terminal.operation_id
+                        )
+                        if action == "updates-install-all":
+                            self.assertEqual(state.restart.system, "system")
+                            self.assertEqual(state.restart.session, "security-session")
+                            self.assertEqual(state.restart.application_cutoff, 100)
+
+    def test_boot_and_login_boundaries_never_reapply_satisfied_contributions(self):
+        for new_boot, login in (
+            (self.boot_id, 101),
+            ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", None),
+        ):
+            with self.subTest(boot=new_boot), self.journal() as journal:
+                terminal = self.finish(
+                    journal,
+                    self.begin(journal, "updates-install-all"),
+                    system_restart="system",
+                    session_restart="security-session",
+                    application_restart=True,
+                )
+                provider.complete_journal_terminal(
+                    journal, boot_id=new_boot, session_started=login
+                )
+                state = provider.load_writable_journal_state(journal)
+                self.assertEqual(state.restart.session, "none")
+                self.assertFalse(state.restart.application)
+                self.assertEqual(
+                    state.restart.system,
+                    "system" if new_boot == self.boot_id else "none",
+                )
+                self.assertEqual(state.terminals[0], terminal)
+
+    def test_ring_wrap_replays_older_exact_identity_not_newest_slot(self):
+        with self.journal() as journal:
+            terminals = []
+            for _ in range(34):
+                terminal = self.finish(journal, self.begin(journal))
+                provider.complete_journal_terminal(journal)
+                provider.acknowledge_journal_handoff(journal, terminal.operation_id)
+                terminals.append(terminal)
+            self.assertEqual(
+                provider.retained_journal_operation(journal, terminals[2].operation_id),
+                terminals[2],
+            )
+            with self.assertRaises(provider.JournalAdmissionError):
+                provider.retained_journal_operation(journal, terminals[0].operation_id)
+            self.assertEqual(provider.load_writable_journal_state(journal).cursor, 2)
+
+    def test_pending_and_ack_commit_errors_preserve_durable_authority(self):
+        for target in ("active", "handoff"):
+            for after in (False, True):
+                with self.subTest(target=target, after=after), self.journal() as journal:
+                    operation = None
+                    if target == "handoff":
+                        operation = self.finish(journal, self.begin(journal))
+                        provider.complete_journal_terminal(journal)
+                    real_commit = provider.commit_writable_journal_path
+
+                    def fail(journal, name, payload):
+                        self.assertEqual(name, target)
+                        if after:
+                            real_commit(journal, name, payload)
+                        raise provider.JournalCommitError("indeterminate commit")
+
+                    with mock.patch.object(provider, "commit_writable_journal_path", side_effect=fail):
+                        with self.assertRaises(provider.JournalCommitError):
+                            if target == "active":
+                                self.begin(journal)
+                            else:
+                                provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                    state = provider.load_writable_journal_state(journal)
+                    if target == "active":
+                        self.assertEqual(state.active is not None, after)
+                    else:
+                        self.assertEqual(state.handoff is None, after)
+                        self.assertEqual(state.terminals[0], operation)
+
+    def test_stale_terminal_timestamp_is_rejected_before_checkpoint(self):
+        with self.journal() as journal:
+            terminal = self.finish(journal, self.begin(journal, "updates-install-all"))
+            provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+            provider.acknowledge_journal_handoff(journal, terminal.operation_id)
+            pending = self.begin(journal)
+            interrupted = replace(
+                pending, state="interrupted", finished_at=self.finished,
+                terminal_monotonic=99,
+            )
+            before = self.image(journal, "active")
+            with self.assertRaises(provider.JournalRecordError):
+                provider.advance_journal_operation(journal, pending, interrupted)
+            self.assertEqual(self.image(journal, "active"), before)
+
+    def test_refresh_requires_boot_reconciliation_without_storing_a_boot_field(self):
+        with self.journal() as journal:
+            terminal = self.finish(journal, self.begin(journal, "updates-install-all"))
+            provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+            provider.acknowledge_journal_handoff(journal, terminal.operation_id)
+            new_boot = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            with self.assertRaises(provider.JournalAdmissionError):
+                provider.begin_journal_operation(
+                    journal, "updates-refresh", self.started, "Starting",
+                    transaction_path="/18_adcbcaed", boot_id=new_boot,
+                )
+            provider.prune_journal_restart(journal, new_boot, None)
+            pending = provider.begin_journal_operation(
+                journal, "updates-refresh", self.started, "Starting",
+                transaction_path="/18_adcbcaed", boot_id=new_boot,
+            )
+            self.assertIsNone(pending.boot_id)
+            interrupted = replace(
+                pending, state="interrupted", finished_at=self.finished,
+                terminal_monotonic=1,
+            )
+            provider.advance_journal_operation(journal, pending, interrupted)
+            before = self.image(journal, "restart")
+            provider.complete_journal_terminal(journal)
+            self.assertEqual(self.image(journal, "restart"), before)
+
+    def test_terminal_pruning_shares_the_three_commit_restart_budget(self):
+        for prune_before_terminal in (False, True):
+            with self.subTest(prune_before_terminal=prune_before_terminal), self.journal() as journal:
+                for cutoff, contributions in (
+                    (100, {"session_restart": "session"}),
+                    (200, {"application_restart": True}),
+                ):
+                    pending = self.begin(journal, "updates-install-all")
+                    running = replace(pending, state="running", **contributions)
+                    provider.advance_journal_operation(journal, pending, running)
+                    terminal = replace(running, state="succeeded", finished_at=self.finished, terminal_monotonic=cutoff)
+                    provider.advance_journal_operation(journal, running, terminal)
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                    provider.acknowledge_journal_handoff(journal, terminal.operation_id)
+                pending = self.begin(journal, "updates-install-all")
+                real_commit = provider.commit_writable_journal_path
+                with mock.patch.object(provider, "commit_writable_journal_path", wraps=real_commit) as commits:
+                    provider.prune_journal_restart(journal, self.boot_id, 150)
+                    if prune_before_terminal:
+                        provider.prune_journal_restart(journal, self.boot_id, 250)
+                    running = replace(pending, state="running")
+                    provider.advance_journal_operation(journal, pending, running)
+                    terminal = replace(running, state="succeeded", finished_at=self.finished, terminal_monotonic=300)
+                    provider.advance_journal_operation(journal, running, terminal)
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id, session_started=250)
+                self.assertEqual(sum(call.args[1] == "restart" for call in commits.call_args_list), 3)
+
+
+class JournalAdmissionTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+    operation_id = "op-0123456789abcdef0123456789abcdef"
+
+    def open_initialized_chain(self, directory):
+        journal = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+        chain = provider.open_journal_directory_chain(str(journal))
+        provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+        return journal, chain
+
+    def operation(self, *, operation_id=None, state="running", slot=0):
+        terminal = state in provider.JOURNAL_OPERATION_TERMINAL_STATES
+        return provider.JournalOperation(
+            operation_id or self.operation_id,
+            "updates-refresh",
+            "2026-09-04T18:00:00Z",
+            "2026-09-04T18:01:00Z" if terminal else None,
+            "refresh",
+            state,
+            None,
+            "Refreshing update metadata",
+            None,
+            "/1_deadbeef",
+            None,
+            None,
+            None,
+            None,
+            1 if terminal else None,
+            slot,
+        )
+
+    def set_sequence(self, journal, name, sequence, payload):
+        image = provider.encode_journal_frame(sequence, payload)
+        descriptor = journal.descriptor(name)
+        os.pwrite(descriptor, image + bytes(provider.JOURNAL_FRAME_SIZE), 0)
+        os.fsync(descriptor)
+
+    def test_loads_complete_state_and_selects_the_cursor_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("cursor"), "31"
+                    )
+                    with mock.patch.object(
+                        provider.os, "urandom", return_value=b"\xab" * 16
+                    ) as urandom:
+                        admission = provider.prepare_journal_admission(journal)
+
+                    self.assertEqual(admission.slot, 31)
+                    self.assertEqual(admission.operation_id, f"op-{'ab' * 16}")
+                    urandom.assert_called_once_with(16)
+                    self.assertEqual(admission.state.cursor, 31)
+                    self.assertIsNone(admission.state.active)
+                    self.assertIsNone(admission.state.handoff)
+                    self.assertEqual(len(admission.state.terminals), 32)
+                    self.assertEqual(
+                        journal.descriptor("terminal-31"),
+                        journal.descriptor(f"terminal-{admission.slot:02d}"),
+                    )
+            finally:
+                chain.close()
+
+    def test_retries_a_retained_terminal_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            terminal = self.operation(
+                operation_id=f"op-{'11' * 16}", state="succeeded", slot=0
+            )
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("terminal-00"),
+                        provider.encode_journal_operation(terminal),
+                    )
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("cursor"), "01"
+                    )
+                    with mock.patch.object(
+                        provider.os,
+                        "urandom",
+                        side_effect=(b"\x11" * 16, b"\x22" * 16),
+                    ) as urandom:
+                        admission = provider.prepare_journal_admission(journal)
+
+                    self.assertEqual(admission.slot, 1)
+                    self.assertEqual(admission.operation_id, f"op-{'22' * 16}")
+                    self.assertEqual(urandom.call_count, 2)
+            finally:
+                chain.close()
+
+    def test_rejects_restart_only_collision_after_four_attempts(self):
+        restart_operation_id = f"op-{'ff' * 16}"
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    for slot in range(provider.JOURNAL_TERMINAL_COUNT):
+                        terminal = self.operation(
+                            operation_id=f"op-{slot + 1:032x}",
+                            state="succeeded",
+                            slot=slot,
+                        )
+                        provider._commit_journal_file_unlocked(
+                            journal.descriptor(f"terminal-{slot:02d}"),
+                            provider.encode_journal_operation(terminal),
+                        )
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("restart"),
+                        provider.encode_journal_restart(
+                            provider.JournalRestart(
+                                self.boot_id,
+                                restart_operation_id,
+                                "none",
+                                "none",
+                                0,
+                                False,
+                                0,
+                            )
+                        ),
+                    )
+                    with mock.patch.object(
+                        provider.os, "urandom", return_value=b"\xff" * 16
+                    ) as urandom:
+                        with self.assertRaisesRegex(
+                            provider.JournalAdmissionError,
+                            "collision limit reached",
+                        ):
+                            provider.prepare_journal_admission(journal)
+
+                    self.assertEqual(
+                        urandom.call_count, provider.JOURNAL_OPERATION_ID_ATTEMPTS
+                    )
+            finally:
+                chain.close()
+
+    def test_rng_failure_blocks_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    with mock.patch.object(
+                        provider.os, "urandom", side_effect=OSError("unavailable")
+                    ) as urandom:
+                        with self.assertRaisesRegex(
+                            provider.JournalAdmissionError,
+                            "generation failed",
+                        ):
+                            provider.prepare_journal_admission(journal)
+
+                    urandom.assert_called_once_with(16)
+            finally:
+                chain.close()
+
+    def test_rejects_malformed_nested_state_before_randomness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    admission = provider.prepare_journal_admission(journal)
+                    terminal = self.operation(state="succeeded", slot=0)
+                    cases = {
+                        "restart record": replace(admission.state, restart=None),
+                        "restart ID": replace(
+                            admission.state,
+                            restart=replace(
+                                admission.state.restart,
+                                last_applied_operation_id=17,
+                            ),
+                        ),
+                        "active ID": replace(
+                            admission.state,
+                            active=replace(self.operation(), operation_id=[]),
+                        ),
+                        "terminal ID": replace(
+                            admission.state,
+                            terminals=(
+                                replace(terminal, operation_id="op-bad"),
+                                *admission.state.terminals[1:],
+                            ),
+                        ),
+                    }
+                    for name, malformed in cases.items():
+                        with self.subTest(name=name), mock.patch.object(
+                            provider.os, "urandom"
+                        ) as urandom:
+                            with self.assertRaisesRegex(
+                                provider.JournalAdmissionError,
+                                "state is invalid",
+                            ):
+                                provider.generate_journal_operation_id(malformed)
+
+                            urandom.assert_not_called()
+            finally:
+                chain.close()
+
+    def test_scans_from_cursor_for_the_first_slot_with_commit_headroom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("cursor"), "31"
+                    )
+                    self.set_sequence(
+                        journal,
+                        "terminal-31",
+                        provider.JOURNAL_SEQUENCE_MAX - 1,
+                        "",
+                    )
+                    self.set_sequence(
+                        journal,
+                        "terminal-00",
+                        provider.JOURNAL_SEQUENCE_MAX - 1,
+                        "",
+                    )
+
+                    admission = provider.prepare_journal_admission(journal)
+
+                    self.assertEqual(admission.state.cursor, 31)
+                    self.assertEqual(admission.slot, 1)
+            finally:
+                chain.close()
+
+    def test_rejects_admission_when_every_terminal_slot_lacks_headroom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    for slot in range(provider.JOURNAL_TERMINAL_COUNT):
+                        self.set_sequence(
+                            journal,
+                            f"terminal-{slot:02d}",
+                            provider.JOURNAL_SEQUENCE_MAX - 1,
+                            "",
+                        )
+
+                    with self.assertRaisesRegex(
+                        provider.JournalAdmissionError,
+                        "no reusable terminal slot",
+                    ):
+                        provider.prepare_journal_admission(journal)
+            finally:
+                chain.close()
+
+    def test_rejects_each_control_path_without_commit_headroom(self):
+        payloads = provider._initial_journal_payloads(self.boot_id)
+        for name, required_commits in (
+            provider.JOURNAL_CONTROL_ADMISSION_COMMITS.items()
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                _journal_path, chain = self.open_initialized_chain(directory)
+                try:
+                    with provider.open_writable_journal(chain) as journal:
+                        self.set_sequence(
+                            journal,
+                            name,
+                            provider.JOURNAL_SEQUENCE_MAX - required_commits,
+                            payloads[name],
+                        )
+
+                        with self.assertRaisesRegex(
+                            provider.JournalAdmissionError,
+                            "control path has no commit headroom",
+                        ):
+                            provider.prepare_journal_admission(journal)
+                finally:
+                    chain.close()
+
+    def test_accepts_control_paths_with_the_exact_required_headroom(self):
+        payloads = provider._initial_journal_payloads(self.boot_id)
+        for name, required_commits in (
+            provider.JOURNAL_CONTROL_ADMISSION_COMMITS.items()
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                _journal_path, chain = self.open_initialized_chain(directory)
+                try:
+                    with provider.open_writable_journal(chain) as journal:
+                        self.set_sequence(
+                            journal,
+                            name,
+                            provider.JOURNAL_SEQUENCE_MAX - required_commits - 1,
+                            payloads[name],
+                        )
+
+                        admission = provider.prepare_journal_admission(journal)
+
+                        self.assertEqual(admission.slot, 0)
+                finally:
+                    chain.close()
+
+    def test_nonterminal_active_operation_blocks_admission_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("active"),
+                        provider.encode_journal_operation(self.operation()),
+                    )
+                    active_before = os.pread(
+                        journal.descriptor("active"), provider.JOURNAL_FILE_SIZE, 0
+                    )
+                    with self.assertRaisesRegex(
+                        provider.JournalAdmissionError, "admission is blocked"
+                    ):
+                        provider.prepare_journal_admission(journal)
+                    self.assertEqual(
+                        os.pread(
+                            journal.descriptor("active"),
+                            provider.JOURNAL_FILE_SIZE,
+                            0,
+                        ),
+                        active_before,
+                    )
+            finally:
+                chain.close()
+
+    def test_valid_terminal_handoff_blocks_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            terminal = self.operation(state="succeeded", slot=7)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("terminal-07"),
+                        provider.encode_journal_operation(terminal),
+                    )
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("cursor"), "08"
+                    )
+                    provider._commit_journal_file_unlocked(
+                        journal.descriptor("handoff"),
+                        provider.encode_journal_handoff(
+                            provider.JournalHandoff(self.operation_id, 7)
+                        ),
+                    )
+
+                    with self.assertRaisesRegex(
+                        provider.JournalAdmissionError, "admission is blocked"
+                    ):
+                        provider.prepare_journal_admission(journal)
+            finally:
+                chain.close()
+
+    def test_malformed_fixed_path_names_the_path_and_blocks_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _journal_path, chain = self.open_initialized_chain(directory)
+            try:
+                with provider.open_writable_journal(chain) as journal:
+                    descriptor = journal.descriptor("terminal-12")
+                    os.pwrite(descriptor, bytes(provider.JOURNAL_FILE_SIZE), 0)
+                    os.fsync(descriptor)
+
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "terminal-12 is malformed"
+                    ):
+                        provider.prepare_journal_admission(journal)
+            finally:
+                chain.close()
+
+    def test_replaced_path_is_rejected_after_complete_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path, chain = self.open_initialized_chain(directory)
+            active = journal_path / "active"
+            detached = journal_path / "active-detached"
+            image = active.read_bytes()
+            original_decode = provider.decode_journal_state
+
+            def replace_active(payloads):
+                state = original_decode(payloads)
+                active.rename(detached)
+                active.write_bytes(image)
+                os.chmod(active, 0o600)
+                return state
+
+            try:
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "active identity is unsafe"
+                ):
+                    with provider.open_writable_journal(chain) as journal:
+                        with mock.patch.object(
+                            provider,
+                            "decode_journal_state",
+                            side_effect=replace_active,
+                        ):
+                            provider.prepare_journal_admission(journal)
+            finally:
+                chain.close()
+
+
+class JournalDirectoryChainTests(unittest.TestCase):
+    def test_xdg_state_path_and_home_fallback_are_canonical(self):
+        self.assertEqual(
+            provider.journal_directory_path(
+                {"XDG_STATE_HOME": "/var/tmp/state", "HOME": "/ignored"}
+            ),
+            "/var/tmp/state/dwm-titus/system-management",
+        )
+        self.assertEqual(
+            provider.journal_directory_path({"HOME": "/var/tmp/home"}),
+            "/var/tmp/home/.local/state/dwm-titus/system-management",
+        )
+        self.assertEqual(
+            provider.journal_directory_path(
+                {"XDG_STATE_HOME": "relative", "HOME": "/var/tmp/home/"}
+            ),
+            "/var/tmp/home/.local/state/dwm-titus/system-management",
+        )
+        self.assertEqual(
+            provider.journal_directory_path({"XDG_STATE_HOME": "/var/tmp/state/"}),
+            "/var/tmp/state/dwm-titus/system-management",
+        )
+
+    def test_invalid_state_inputs_fail_before_filesystem_access(self):
+        cases = (
+            {},
+            {"HOME": "relative"},
+            {"XDG_STATE_HOME": "/tmp/../state"},
+            {"XDG_STATE_HOME": "/tmp//state"},
+            {"XDG_STATE_HOME": "/tmp/state\0suffix"},
+            {"XDG_STATE_HOME": f"/tmp/{'x' * 256}"},
+        )
+        for environment in cases:
+            with self.subTest(environment=environment):
+                with self.assertRaises(provider.JournalLayoutError):
+                    provider.journal_directory_path(environment)
+
+    def test_fresh_chain_creates_private_journal_and_retains_each_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_home = pathlib.Path(directory) / "new" / "state"
+            chain = provider.open_journal_directory(
+                {"XDG_STATE_HOME": str(state_home), "HOME": "/ignored"}
+            )
+            descriptors = chain.descriptors
+            try:
+                self.assertEqual(
+                    chain.path,
+                    str(state_home / "dwm-titus" / "system-management"),
+                )
+                self.assertEqual(len(descriptors), len(chain.names) + 1)
+                self.assertEqual(
+                    stat.S_IMODE(os.fstat(chain.directory_descriptor).st_mode), 0o700
+                )
+                chain.validate()
+            finally:
+                chain.close()
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_root_path_is_rejected_before_opening_a_descriptor(self):
+        with mock.patch.object(provider.os, "open") as open_mock:
+            with self.assertRaisesRegex(
+                provider.JournalLayoutError, "must not be root"
+            ):
+                provider.open_journal_directory_chain("/")
+        open_mock.assert_not_called()
+
+    def test_execute_only_existing_ancestor_can_be_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ancestor = pathlib.Path(directory) / "traverse-only"
+            journal = ancestor / "state" / "dwm-titus" / "system-management"
+            journal.mkdir(parents=True, mode=0o700)
+            os.chmod(journal, 0o700)
+            os.chmod(ancestor, 0o311)
+            try:
+                with provider.open_journal_directory_chain(str(journal)) as chain:
+                    chain.validate()
+            finally:
+                os.chmod(ancestor, 0o700)
+
+    def test_execute_only_parent_is_rejected_before_child_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ancestor = pathlib.Path(directory) / "traverse-only"
+            ancestor.mkdir()
+            os.chmod(ancestor, 0o311)
+            ancestor_identity = (ancestor.stat().st_dev, ancestor.stat().st_ino)
+            original_open = os.open
+
+            def reject_readable_ancestor(path, flags, *args, **kwargs):
+                descriptor = kwargs.get("dir_fd")
+                if path == "." and descriptor is not None:
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) == ancestor_identity:
+                        raise PermissionError(errno.EACCES, "injected access denial")
+                return original_open(path, flags, *args, **kwargs)
+
+            try:
+                journal = ancestor / "state" / "dwm-titus" / "system-management"
+                with mock.patch.object(
+                    provider.os, "open", side_effect=reject_readable_ancestor
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "sync handle"
+                    ):
+                        provider.open_journal_directory_chain(str(journal))
+                self.assertFalse((ancestor / "state").exists())
+            finally:
+                os.chmod(ancestor, 0o700)
+
+    def test_restrictive_umask_cannot_remove_created_owner_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = (
+                pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+            )
+            previous_umask = os.umask(0o777)
+            try:
+                with provider.open_journal_directory_chain(str(journal)) as chain:
+                    self.assertEqual(
+                        stat.S_IMODE(os.fstat(chain.directory_descriptor).st_mode),
+                        0o700,
+                    )
+            finally:
+                os.umask(previous_umask)
+
+    def test_interrupted_mode_repair_leaves_a_retryable_private_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory) / "state" / "dwm-titus"
+            parent.mkdir(parents=True)
+            journal = parent / "system-management"
+            previous_umask = os.umask(0o777)
+            try:
+                with mock.patch.object(
+                    provider,
+                    "_chmod_directory_descriptor",
+                    side_effect=provider.JournalLayoutError(
+                        "injected mode update interruption"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        provider.JournalLayoutError, "mode update interruption"
+                    ):
+                        provider.open_journal_directory_chain(str(journal))
+                self.assertEqual(stat.S_IMODE(journal.stat().st_mode), 0o700)
+                with provider.open_journal_directory_chain(str(journal)) as chain:
+                    chain.validate()
+            finally:
+                os.umask(previous_umask)
+
+    def test_retry_resyncs_an_indeterminate_created_parent_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory) / "state" / "dwm-titus"
+            parent.mkdir(parents=True)
+            journal = parent / "system-management"
+            parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
+            original_fsync = os.fsync
+            failed_parent_sync = False
+
+            def fail_created_entry_sync(descriptor):
+                nonlocal failed_parent_sync
+                metadata = os.fstat(descriptor)
+                if (
+                    not failed_parent_sync
+                    and journal.exists()
+                    and (metadata.st_dev, metadata.st_ino) == parent_identity
+                ):
+                    failed_parent_sync = True
+                    raise OSError("injected parent sync failure")
+                return original_fsync(descriptor)
+
+            with mock.patch.object(
+                provider.os, "fsync", side_effect=fail_created_entry_sync
+            ):
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "directory sync failed"
+                ):
+                    provider.open_journal_directory_chain(str(journal))
+            self.assertTrue(journal.is_dir())
+
+            observed_parent_sync = False
+
+            def observe_parent_sync(descriptor):
+                nonlocal observed_parent_sync
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                    observed_parent_sync = True
+                return original_fsync(descriptor)
+
+            with mock.patch.object(
+                provider.os, "fsync", side_effect=observe_parent_sync
+            ):
+                with provider.open_journal_directory_chain(str(journal)) as chain:
+                    chain.validate()
+            self.assertTrue(observed_parent_sync)
+
+    def test_retry_resyncs_an_indeterminate_created_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory) / "state" / "dwm-titus"
+            parent.mkdir(parents=True)
+            journal = parent / "system-management"
+            original_fsync = os.fsync
+
+            def fail_final_sync(descriptor):
+                metadata = os.fstat(descriptor)
+                if journal.exists():
+                    current = journal.stat()
+                    if (metadata.st_dev, metadata.st_ino) == (
+                        current.st_dev,
+                        current.st_ino,
+                    ):
+                        raise OSError("injected directory sync failure")
+                return original_fsync(descriptor)
+
+            with mock.patch.object(provider.os, "fsync", side_effect=fail_final_sync):
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "directory sync failed"
+                ):
+                    provider.open_journal_directory_chain(str(journal))
+            journal_identity = (journal.stat().st_dev, journal.stat().st_ino)
+
+            observed_directory_sync = False
+
+            def observe_directory_sync(descriptor):
+                nonlocal observed_directory_sync
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == journal_identity:
+                    observed_directory_sync = True
+                return original_fsync(descriptor)
+
+            with mock.patch.object(
+                provider.os, "fsync", side_effect=observe_directory_sync
+            ):
+                with provider.open_journal_directory_chain(str(journal)) as chain:
+                    chain.validate()
+            self.assertTrue(observed_directory_sync)
+
+    def test_created_directory_mode_update_follows_the_held_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = pathlib.Path(directory) / "original"
+            replacement = pathlib.Path(directory) / "replacement"
+            original.mkdir(mode=0o755)
+            replacement.mkdir(mode=0o755)
+            os.chmod(original, 0o755)
+            os.chmod(replacement, 0o755)
+            descriptor = os.open(original, os.O_PATH | os.O_DIRECTORY)
+            try:
+                moved = pathlib.Path(directory) / "moved"
+                original.rename(moved)
+                replacement.rename(original)
+                provider._chmod_directory_descriptor(descriptor, 0o700)
+                self.assertEqual(stat.S_IMODE(moved.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(original.stat().st_mode), 0o755)
+            finally:
+                os.close(descriptor)
+
+    def test_existing_nonprivate_ancestor_is_not_modified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ancestor = pathlib.Path(directory) / "shared"
+            ancestor.mkdir(mode=0o755)
+            os.chmod(ancestor, 0o755)
+            with provider.open_journal_directory_chain(
+                str(ancestor / "state" / "dwm-titus" / "system-management")
+            ) as chain:
+                chain.validate()
+                self.assertEqual(stat.S_IMODE(ancestor.stat().st_mode), 0o755)
+
+    def test_nonprivate_existing_journal_is_rejected_without_chmod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = pathlib.Path(directory) / "dwm-titus" / "system-management"
+            journal.mkdir(parents=True, mode=0o755)
+            os.chmod(journal, 0o755)
+            with self.assertRaisesRegex(
+                provider.JournalLayoutError, "system-management is not private"
+            ):
+                provider.open_journal_directory_chain(str(journal))
+            self.assertEqual(stat.S_IMODE(journal.stat().st_mode), 0o755)
+
+    def test_symlink_and_nondirectory_components_fail_closed(self):
+        for collision in ("symlink", "file"):
+            with (
+                self.subTest(collision=collision),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                state = pathlib.Path(directory) / "state"
+                if collision == "symlink":
+                    target = pathlib.Path(directory) / "target"
+                    target.mkdir()
+                    state.symlink_to(target, target_is_directory=True)
+                else:
+                    state.write_text("not a directory", encoding="utf-8")
+                with self.assertRaises(provider.JournalLayoutError):
+                    provider.open_journal_directory_chain(
+                        str(state / "dwm-titus" / "system-management")
+                    )
+
+    def test_renamed_ancestor_fails_identity_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            journal = state / "dwm-titus" / "system-management"
+            chain = provider.open_journal_directory_chain(str(journal))
+            try:
+                moved = pathlib.Path(directory) / "state-moved"
+                state.rename(moved)
+                state.mkdir()
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "state is unsafe"
+                ):
+                    chain.validate()
+            finally:
+                chain.close()
+
+    def test_renamed_journal_fails_identity_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory) / "state"
+            journal = state / "dwm-titus" / "system-management"
+            chain = provider.open_journal_directory_chain(str(journal))
+            try:
+                moved = journal.with_name("system-management-moved")
+                journal.rename(moved)
+                journal.mkdir(mode=0o700)
+                with self.assertRaisesRegex(
+                    provider.JournalLayoutError, "system-management is unsafe"
+                ):
+                    chain.validate()
+            finally:
+                chain.close()
+
+
+class SnapshotValidationTests(unittest.TestCase):
+    def test_dnf5_requested_installs_remain_visible_in_complete_plan(self):
+        updates = tuple(package(8, f"pkg-{index};2;x86_64;updates", "Update")
+                        for index in range(23))
+        plan = tuple(package(12 if index < 5 else 11, update.package_id, "Change")
+                     for index, update in enumerate(updates)) + tuple(
+            package(13, f"old-{index};1;x86_64;installed", "Removal")
+            for index in range(6))
+        backend = FixtureBackend(updates=updates, plan=plan)
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(len(rows(output, "update")), 23)
+        changes = rows(output, "package-change")
+        self.assertEqual(len(changes), 29)
+        self.assertEqual([row[2] for row in changes].count("install"), 5)
+        self.assertEqual([row[2] for row in changes].count("update"), 18)
+        self.assertEqual([row[2] for row in changes].count("remove"), 6)
+        self.assertEqual(rows(output, "error"), [])
+        generation = rows(output, "snapshot-generation")[0][1]
+        requested, preview = provider.confirmed_update_plan(backend, generation)
+        self.assertEqual(set(requested), {update.package_id for update in updates})
+        self.assertEqual({row.package_id for row in preview if row.action == "install"},
+                         {update.package_id for update in updates[:5]})
+
+    def test_requested_install_action_change_invalidates_confirmation(self):
+        update = package(8, "example;2;x86_64;updates", "Update")
+        backend = FixtureBackend(updates=(update,),
+                                 plan=(package(12, update.package_id, "Install"),))
+        generation = rows(provider.build_snapshot(backend), "snapshot-generation")[0][1]
+        backend.plan_records = (package(11, update.package_id, "Update"),)
+
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            provider.confirmed_update_plan(backend, generation)
+        self.assertEqual(raised.exception.code, "conflict")
+
+    def test_requested_outbound_or_unsupported_plan_action_is_malformed(self):
+        package_id = "example;2;x86_64;updates"
+        for info in (13, 15, 19, 20):
+            with self.subTest(info=info), self.assertRaisesRegex(
+                    provider.SnapshotFailure, "incomplete update plan"):
+                provider.normalize_plan((package(info, package_id, "Change"),),
+                                        (package_id,))
+
+    def test_requested_install_does_not_relax_missing_duplicate_or_extra_update_checks(self):
+        package_id = "example;2;x86_64;updates"
+        install = package(12, package_id, "Install")
+        extra_id = "dependency;1;x86_64;updates"
+        for plan in ((), (install, install), (package(12, extra_id, "Dependency"),),
+                     (install, package(11, extra_id, "Unexpected update"))):
+            with self.subTest(plan=plan), self.assertRaises(provider.SnapshotFailure):
+                provider.normalize_plan(plan, (package_id,))
+        valid = provider.normalize_plan(
+            (install, package(12, extra_id, "Dependency")), (package_id,))
+        self.assertEqual({row.package_id for row in valid}, {package_id, extra_id})
+        self.assertEqual({row.action for row in valid}, {"install"})
+
+    def test_duplicate_plan_preserves_readable_updates(self):
+        update = package(8, "openssl;4.0;x86_64;updates", "TLS library")
+        backend = FixtureBackend(
+            updates=(update,),
+            plan=(
+                package(11, update.package_id, "TLS library"),
+                package(11, update.package_id, "Duplicate"),
+            ),
+        )
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(len(rows(output, "update")), 1)
+        self.assertEqual(rows(output, "package-change"), [])
+        self.assertEqual(rows(output, "error")[0][2], "malformed")
+        install_action = next(
+            row for row in rows(output, "action") if row[1] == "updates-install-all"
+        )
+        self.assertIn("duplicate plan identity", install_action[-1])
+
+    def test_plan_rejects_packagekit_intent_enums(self):
+        package_id = "example;2;x86_64;updates"
+        for info in (27, 28, 29, 30):
+            with self.subTest(info=info):
+                with self.assertRaisesRegex(
+                    provider.SnapshotFailure, "unsupported plan classification"
+                ):
+                    provider.normalize_plan(
+                        (package(info, package_id, "Intent enum"),), (package_id,)
+                    )
+
+    def test_reinstall_and_downgrade_plan_remains_visible_but_unsupported(self):
+        update = package(8, "openssl;4.0;x86_64;updates", "TLS library")
+        for extra_info, extra_id in (
+            (19, "openssl;4.0;x86_64;installed"),
+            (20, "compat-lib;1.0;x86_64;updates"),
+        ):
+            with self.subTest(extra_info=extra_info):
+                backend = FixtureBackend(
+                    updates=(update,),
+                    plan=(
+                        package(11, update.package_id, "TLS library"),
+                        package(extra_info, extra_id, "Unsupported change"),
+                    ),
+                )
+
+                output = provider.build_snapshot(backend)
+
+                self.assertEqual(
+                    {row[1] for row in rows(output, "package-change")},
+                    {update.package_id, extra_id},
+                )
+                self.assertIn("unsupported", [row[2] for row in rows(output, "error")])
+                install_action = next(
+                    row
+                    for row in rows(output, "action")
+                    if row[1] == "updates-install-all"
+                )
+                self.assertIn("unsupported reinstall or downgrade", install_action[-1])
+
+    def test_unlisted_packagekit_errors_fall_back_to_internal(self):
+        backend = object.__new__(provider.PackageKitBackend)
+
+        self.assertEqual(backend._transaction_failure(10, "download").code, "package")
+        self.assertEqual(backend._transaction_failure(4, "internal").code, "internal")
+
+    def test_blocked_updates_are_not_simulated(self):
+        backend = FixtureBackend(
+            updates=(package(9, "held;2.0;x86_64;updates", "Blocked"),)
+        )
+
+        output = provider.build_snapshot(backend)
+
+        self.assertEqual(backend.simulated_ids, None)
+        self.assertEqual(rows(output, "update")[0][3], "blocked")
+
+    def test_unsafe_or_duplicate_identities_fail_closed(self):
+        cases = (
+            (package(8, "bad\tid;1;x86_64;updates", "Unsafe"),),
+            (
+                package(8, "same;1;x86_64;updates", "First"),
+                package(8, "same;1;x86_64;updates", "Second"),
+            ),
+        )
+        for records in cases:
+            with self.subTest(records=records):
+                output = provider.build_snapshot(FixtureBackend(updates=records))
+                self.assertEqual(rows(output, "update"), [])
+                self.assertEqual(rows(output, "error")[0][2], "malformed")
+
+    def test_restart_aggregation_rejects_unknown_values(self):
+        update = package(9, "held;2.0;x86_64;updates", "Blocked")
+        output = provider.build_snapshot(
+            FixtureBackend(updates=(update,), restart_types=(99,))
+        )
+
+        self.assertEqual(len(rows(output, "update")), 1)
+        summary = next(
+            row for row in rows(output, "state") if row[1] == "update-summary"
+        )
+        self.assertEqual(summary[2:4], ["available", "1"])
+        restart = next(
+            row for row in rows(output, "state") if row[1] == "update-restart"
+        )
+        self.assertEqual(restart[2:4], ["partial", "unknown"])
+        self.assertEqual(rows(output, "error")[0][2], "malformed")
+
+    def test_record_count_limit_discards_the_whole_inventory(self):
+        packages = tuple(
+            package(2, f"pkg-{number};1;x86_64;updates", "Update")
+            for number in range(provider.MAX_LIST_RECORDS + 1)
+        )
+
+        output = provider.build_snapshot(FixtureBackend(updates=packages))
+
+        self.assertEqual(rows(output, "update"), [])
+        self.assertEqual(rows(output, "error")[0][2], "malformed")
+
+
+class PackageKitSafetyTests(unittest.TestCase):
+    def test_backport_gate_is_required_before_mutation_is_enabled(self):
+        for micro in (4, 6):
+            with self.subTest(micro=micro):
+                backend = provider.PackageKitBackend.__new__(provider.PackageKitBackend)
+                backend.GLib = types.SimpleNamespace(Variant=lambda signature, values: values)
+                backend._call = mock.Mock(return_value=types.SimpleNamespace(unpack=lambda: (
+                    {"VersionMajor": 1, "VersionMinor": 3, "VersionMicro": micro},)))
+                backend._require_running_backport_identity = mock.Mock(
+                    side_effect=provider.SnapshotFailure("unsupported", "Old running executable", "unsupported"))
+                rpm = types.SimpleNamespace(error=RuntimeError, labelCompare=lambda left, right: 0,
+                    TransactionSet=lambda: types.SimpleNamespace(dbMatch=lambda *args: [
+                        {"epoch": None, "version": f"1.3.{micro}", "release": "3.fc44"}]))
+                with mock.patch.dict(sys.modules, {"rpm": rpm}), mock.patch.object(
+                    provider, "read_fedora_identity", return_value={"ID": "fedora", "VERSION_ID": "44"}):
+                    if micro == 4:
+                        with self.assertRaises(provider.SnapshotFailure):
+                            backend.require_mutation_safe()
+                        backend._require_running_backport_identity.assert_called_once_with()
+                    else:
+                        backend.require_mutation_safe()
+                        backend._require_running_backport_identity.assert_not_called()
+
+    def test_backport_requires_running_executable_identity_and_stable_bus_owner(self):
+        regular = stat.S_IFREG | 0o755
+        installed = types.SimpleNamespace(st_mode=regular, st_uid=0, st_dev=1, st_ino=2)
+        for running, final_owner, accepted in (
+            (installed, ":1.8", True),
+            (types.SimpleNamespace(st_mode=regular, st_uid=0, st_dev=1, st_ino=1), ":1.8", False),
+            (types.SimpleNamespace(st_mode=regular, st_uid=1000, st_dev=1, st_ino=2), ":1.8", False),
+            (types.SimpleNamespace(st_mode=stat.S_IFREG | 0o775, st_uid=0, st_dev=1, st_ino=2), ":1.8", False),
+            (types.SimpleNamespace(st_mode=stat.S_IFREG | 0o757, st_uid=0, st_dev=1, st_ino=2), ":1.8", False),
+            (PermissionError("procfs denied"), ":1.8", False),
+            (installed, ":1.9", False),
+        ):
+            with self.subTest(running=running, final_owner=final_owner):
+                backend = provider.PackageKitBackend.__new__(provider.PackageKitBackend)
+                backend.GLib = types.SimpleNamespace(Variant=lambda signature, values: values, Error=RuntimeError)
+                backend.Gio = types.SimpleNamespace(DBusCallFlags=types.SimpleNamespace(NONE=0))
+                replies = [types.SimpleNamespace(unpack=lambda: (":1.8",)),
+                           types.SimpleNamespace(unpack=lambda: (123,)),
+                           types.SimpleNamespace(unpack=lambda: (final_owner,))]
+                backend.connection = mock.Mock()
+                backend.connection.call_sync.side_effect = replies
+                with mock.patch.object(provider.os, "stat", side_effect=[installed, running]) as read:
+                    if accepted:
+                        backend._require_running_backport_identity()
+                    else:
+                        with self.assertRaises(provider.SnapshotFailure) as raised:
+                            backend._require_running_backport_identity()
+                        self.assertEqual(raised.exception.status, "unsupported")
+                self.assertEqual(read.call_args_list, [mock.call("/usr/libexec/packagekitd", follow_symlinks=False),
+                                                      mock.call("/proc/123/exe")])
+                self.assertEqual(backend.connection.call_sync.call_args_list[1].args[4], (":1.8",))
+
+    def test_unknown_action_reports_unsupported_without_touching_backend(self):
+        backend = mock.Mock()
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            provider.run_packagekit_mutation(None, backend, "arbitrary", lambda value: None,
+                                            boot_id="01234567-89ab-cdef-0123-456789abcdef")
+        self.assertEqual((raised.exception.code, raised.exception.status), ("unsupported", "unsupported"))
+        self.assertEqual(backend.mock_calls, [])
+
+    def test_security_floor_uses_rpm_order_and_checks_running_daemon(self):
+        compare = mock.Mock(return_value=0)
+        self.assertTrue(provider.packagekit_security_floor("1.3.5", "1.fc44", "44", (1, 3, 5), compare))
+        compare.assert_called_once_with(("0", "1.3.5", "1.fc44"), ("0", "1.3.5", "0"))
+        compare = mock.Mock(side_effect=[-1, 0])
+        self.assertTrue(provider.packagekit_security_floor("1.3.4", "3.fc44", "44", (1, 3, 4), compare))
+        self.assertEqual(compare.call_args.args[1], ("0", "1.3.4", "3.fc44"))
+        for version, release, fedora, daemon in (
+            ("1.3.4", "2.fc44", "44", (1, 3, 4)),
+            ("1.3.4", "3.fc44", "43", (1, 3, 4)),
+            ("1.3.4", "3.fc43", "44", (1, 3, 4)),
+            ("1.3.4", "3.fc44.custom", "44", (1, 3, 4)),
+            ("1.3.6", "1.fc44", "44", (1, 3, 4)),
+            ("1.3.6", "1.fc44", "44", (True, 3, 6)),
+            ("1.3.6", "1.fc44", "44", None),
+            ("1.3.6;bad", "1.fc44", "44", (1, 3, 6)),
+        ):
+            with self.subTest(version=version, release=release, fedora=fedora, daemon=daemon):
+                self.assertFalse(provider.packagekit_security_floor(version, release, fedora, daemon,
+                                                                    mock.Mock(return_value=-1)))
+
+    def test_platform_identity_is_fixed_bounded_and_never_evaluated(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data=b'ID=fedora\nVERSION_ID="44"\nNAME="ignored"\n')) as source:
+            self.assertEqual(provider.read_fedora_identity(), {"ID": "fedora", "VERSION_ID": "44"})
+            source.assert_called_once_with("/etc/os-release", "rb")
+            source().read.assert_called_once_with(65537)
+        for data in (b"ID=ubuntu\nID_LIKE=fedora", b"ID=fedora\nID=fedora", b"ID=$(false)",
+                     b"ID=fedora#variant", b'ID="fedora"#variant', b"ID=fedora #inline",
+                     b"ID='fedora", b"\xff", b"x" * 65537):
+            with self.subTest(data=data[:20]), mock.patch("builtins.open", mock.mock_open(read_data=data)):
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.read_fedora_identity()
+
+
+class PackageKitExecutionTests(unittest.TestCase):
+    boot_id = "01234567-89ab-cdef-0123-456789abcdef"
+    package_id = "example;2;x86_64;updates"
+
+    @contextlib.contextmanager
+    def journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "state" / "dwm-titus" / "system-management"
+            with provider.open_journal_directory_chain(str(path)) as chain:
+                provider.initialize_journal_layout(chain.directory_descriptor, self.boot_id)
+                with provider.retain_writable_journal(chain) as journal:
+                    yield journal
+
+    def backend(self, journal, events):
+        """Drive the real adapter with a deterministic, host-independent bus."""
+        test = self
+
+        class Variant:
+            def __init__(self, signature, values):
+                self.signature, self.values = signature, values
+
+            def unpack(self):
+                return self.values
+
+        class BusError(Exception):
+            pass
+
+        class Loop:
+            stopped = False
+
+            def quit(self):
+                self.stopped = True
+
+            def run(self):
+                for event in events:
+                    if self.stopped:
+                        break
+                    test.assertFalse(journal._exclusive)
+                    event(connection)
+                test.assertTrue(self.stopped, "adapter did not reach a terminal observation")
+
+        class Connection:
+            def __init__(self):
+                self.subscriptions = {}
+                self.calls = []
+                self.cancel_allowed = True
+                self.closed_callback = None
+
+            def connect(self, signal, callback):
+                test.assertEqual(signal, "closed")
+                self.closed_callback = callback
+                return 19
+
+            def disconnect(self, handle):
+                test.assertEqual(handle, 19)
+                self.closed_callback = None
+
+            def signal_subscribe(self, *args):
+                key = len(self.subscriptions) + 1
+                self.subscriptions[key] = args
+                return key
+
+            def signal_unsubscribe(self, key):
+                del self.subscriptions[key]
+
+            def call(self, *args):
+                test.assertFalse(journal._exclusive)
+                with provider.lock_writable_journal(journal):
+                    active = provider.load_writable_journal_state(journal).active
+                test.assertEqual(active.state, "authorizing")
+                test.assertEqual(active.transaction_path, args[1])
+                test.assertEqual(len(self.subscriptions), 3)
+                self.calls.append(args)
+                self.reply_callback = args[-2]
+
+            def call_finish(self, result):
+                if isinstance(result, Exception):
+                    raise result
+                return Variant("()", ())
+
+            def call_sync(self, *args):
+                test.assertFalse(journal._exclusive)
+                self.calls.append(args)
+                test.assertEqual(args[1], "/1_test")
+                if args[3] == "Get":
+                    return Variant("(v)", (self.cancel_allowed,))
+                test.assertEqual(args[3], "Cancel")
+                return Variant("()", ())
+
+            def emit(self, signal, values, *, properties=False):
+                interface = provider.PROPERTIES_INTERFACE if properties else provider.TRANSACTION_INTERFACE
+                for args in tuple(self.subscriptions.values()):
+                    if args[1] == interface:
+                        test.assertEqual(args[0], provider.PACKAGEKIT_NAME)
+                        test.assertEqual(args[3], "/1_test")
+                        args[-2](self, provider.PACKAGEKIT_NAME, "/1_test", interface,
+                                 signal, Variant("", values), None)
+
+            def progress(self, **properties):
+                self.emit("PropertiesChanged", (provider.TRANSACTION_INTERFACE, properties, []), properties=True)
+
+            def reply_error(self, message):
+                self.reply_callback(self, BusError(message), None)
+
+        connection = Connection()
+        backend = provider.PackageKitBackend.__new__(provider.PackageKitBackend)
+        backend.connection = connection
+        backend.flags_only_trusted = 2
+        backend.GLib = types.SimpleNamespace(Variant=Variant, MainLoop=Loop, Error=BusError,
+                                            VariantType=types.SimpleNamespace(new=lambda value: value))
+        backend.Gio = types.SimpleNamespace(
+            Cancellable=lambda: types.SimpleNamespace(cancel=lambda: None),
+            dbus_error_get_remote_error=lambda error: "org.freedesktop.DBus.Error." + str(error),
+            DBusSignalFlags=types.SimpleNamespace(NONE=0),
+            DBusCallFlags=types.SimpleNamespace(NONE=0, ALLOW_INTERACTIVE_AUTHORIZATION=1))
+        backend.require_mutation_safe = mock.Mock()
+        backend.create_mutation = mock.Mock(return_value="/1_test")
+        backend.updates = mock.Mock(return_value=provider.TransactionResult((provider.Package(5, self.package_id, "Example"),)))
+        backend.simulate = mock.Mock(return_value=provider.TransactionResult((provider.Package(11, self.package_id, "Example"),)))
+        return backend
+
+    def run_operation(self, journal, backend, chunks, update=False, write=None):
+        args = {}
+        if update:
+            args = dict(generation=provider.snapshot_generation([self.package_id],
+                        [provider.PlanRow(self.package_id, "update", "example", "2", "Example")]))
+        return provider.run_packagekit_mutation(
+            journal, backend, "updates-install-all" if update else "updates-refresh",
+            write or chunks.append, boot_id=self.boot_id, **args)
+
+    def test_refresh_dispatch_and_durable_handoff_precede_terminal_output(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3, Percentage=42, AllowCancel=True),
+                                            lambda bus: bus.emit("Finished", (1, 10))])
+
+            def write(chunk):
+                if "complete\toperation" in chunk:
+                    with provider.lock_writable_journal(journal):
+                        state = provider.load_writable_journal_state(journal)
+                    self.assertIsNone(state.active)
+                    self.assertIsNotNone(state.handoff)
+                    self.assertEqual(state.terminals[0].state, "succeeded")
+                chunks.append(chunk)
+
+            terminal = self.run_operation(journal, backend, chunks, write=write)
+            self.assertEqual(terminal.state, "succeeded")
+            self.assertEqual(backend.connection.calls[0][3], "RefreshCache")
+            self.assertEqual(backend.connection.calls[0][4].unpack(), (True,))
+            self.assertEqual(backend.connection.subscriptions, {})
+            self.assertIsNone(backend.connection.closed_callback)
+            self.assertIn("\t42\tyes\t", "".join(chunks))
+
+    def test_package_item_progress_does_not_replace_overall_percentage_or_audit(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=8, Percentage=20),
+                lambda bus: bus.emit("Package", (10, self.package_id, "Example")),
+                lambda bus: bus.emit("ItemProgress", (self.package_id, 8, 67)),
+                lambda bus: bus.emit("ItemProgress", (self.package_id, 9, 101)),
+                lambda bus: bus.emit("ItemProgress", ("unsafe\tidentity", 9, 5)),
+                lambda bus: bus.emit("Finished", (1, 10))])
+            terminal = self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual(terminal.state, "succeeded")
+            items = rows("".join(chunks).splitlines(), "package-progress")
+            name = provider.package_display_fields(self.package_id)[0]
+            self.assertEqual([item[2:] for item in items], [[name, "downloading", "unknown"],
+                [name, "downloading", "67"], [name, "installing", "unknown"], ["", "working", "unknown"]])
+            self.assertIn("\t20\t", "".join(chunks))
+            self.assertNotIn("unsafe", "".join(chunks))
+
+    def test_update_uses_exact_ids_and_accumulates_restart_contributions(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.emit("Package", (11, self.package_id, "Example")),
+                lambda bus: bus.emit("RequireRestart", (3, self.package_id)),
+                lambda bus: bus.emit("RequireRestart", (6, self.package_id)),
+                lambda bus: bus.emit("RequireRestart", (2, self.package_id)),
+                lambda bus: bus.emit("Finished", (1, 10))])
+            terminal = self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual(backend.connection.calls[0][3], "UpdatePackages")
+            self.assertEqual(backend.connection.calls[0][4].unpack(), (2, [self.package_id]))
+            self.assertEqual((terminal.system_restart, terminal.session_restart, terminal.application_restart),
+                             ("security-system", "session", True))
+            self.assertIn("different=no", "".join(chunks))
+
+    def test_lost_method_reply_keeps_observing_until_finished(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.reply_error("TimedOut"),
+                lambda bus: bus.progress(Status=3), lambda bus: bus.emit("Finished", (1, 1))])
+            self.assertEqual(self.run_operation(journal, backend, chunks, update=True).state, "succeeded")
+
+    def test_denial_before_running_does_not_add_restart_uncertainty(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.reply_error("AccessDenied")])
+            terminal = self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual((terminal.state, terminal.system_restart), ("permission-denied", "none"))
+            self.assertIn("error\tupdates\tpermission-denied", "".join(chunks))
+
+    def test_definitive_method_rejection_does_not_wait_for_terminal_signals(self):
+        for error in ("UnknownMethod", "InvalidArgs", "UnknownInterface", "UnknownObject"):
+            with self.subTest(error=error), self.journal() as journal:
+                backend = self.backend(journal, [lambda bus: bus.reply_error(error)])
+                chunks = []
+                terminal = self.run_operation(journal, backend, chunks, update=True)
+                self.assertEqual((terminal.state, terminal.system_restart), ("failed", "none"))
+                self.assertIn("complete\toperation", "".join(chunks))
+
+    def test_definitive_rejection_does_not_clear_observed_execution_uncertainty(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3),
+                                            lambda bus: bus.reply_error("InvalidArgs")])
+            terminal = self.run_operation(journal, backend, [], update=True)
+            self.assertEqual((terminal.state, terminal.system_restart), ("failed", "unknown"))
+
+    def test_invalidated_or_malformed_status_cannot_prove_prerunning_cancellation(self):
+        for invalidate in (True, False):
+            with self.subTest(invalidate=invalidate), self.journal() as journal:
+                def invalidate_status(bus):
+                    if invalidate:
+                        bus.emit("PropertiesChanged", (provider.TRANSACTION_INTERFACE, {}, ["Status"]), properties=True)
+                    else:
+                        bus.progress(Status="bad")
+                backend = self.backend(journal, [lambda bus: bus.progress(Status=31), invalidate_status,
+                                                lambda bus: bus.emit("Finished", (3, 0))])
+                terminal = self.run_operation(journal, backend, [], update=True)
+                self.assertEqual((terminal.state, terminal.system_restart), ("canceled", "unknown"))
+
+    def test_lost_object_or_bus_after_send_is_interrupted_unknown(self):
+        for event in (lambda bus: bus.emit("Destroy", ()), lambda bus: bus.closed_callback()):
+            with self.subTest(event=event), self.journal() as journal:
+                backend = self.backend(journal, [event])
+                terminal = self.run_operation(journal, backend, [], update=True)
+                self.assertEqual((terminal.state, terminal.system_restart), ("interrupted", "unknown"))
+
+    def test_error_cancels_only_with_fresh_allow_cancel_and_never_after_finished(self):
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed), self.journal() as journal:
+                chunks = []
+                backend = self.backend(journal, [lambda bus: bus.progress(Status=3, AllowCancel=True),
+                    lambda bus: bus.emit("ErrorCode", (13, "Untrusted raw text")),
+                    lambda bus: bus.emit("Finished", (2, 10))])
+                backend.connection.cancel_allowed = allowed
+                terminal = self.run_operation(journal, backend, chunks, update=True)
+                self.assertEqual(terminal.state, "failed")
+                methods = [call[3] for call in backend.connection.calls]
+                self.assertEqual(methods.count("Cancel"), int(allowed))
+                self.assertEqual(methods.count("Get"), 1)
+                self.assertNotIn("Untrusted raw text", "".join(chunks))
+
+    def test_canceled_while_running_has_legal_transition_and_uncertainty(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3),
+                                            lambda bus: bus.emit("Finished", (3, 0))])
+            terminal = self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual((terminal.state, terminal.system_restart), ("canceled", "unknown"))
+            self.assertIn("\tcancel-requested\t", "".join(chunks))
+
+    def test_malformed_percentage_is_unknown_and_invalidated_cancel_is_not_reused(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3, Percentage=True, AllowCancel=True),
+                lambda bus: bus.emit("PropertiesChanged", (provider.TRANSACTION_INTERFACE, {}, ["AllowCancel"]), properties=True),
+                lambda bus: bus.emit("ErrorCode", (13, "")), lambda bus: bus.emit("Finished", (2, 1))])
+            self.run_operation(journal, backend, chunks)
+            self.assertIn("percentage is malformed", "".join(chunks))
+            self.assertEqual([call[3] for call in backend.connection.calls], ["RefreshCache"])
+
+    def test_persistence_failure_keeps_observer_but_suppresses_terminal(self):
+        with self.journal() as journal:
+            chunks = []
+            observed = []
+
+            def damage(bus):
+                os.fchmod(journal.descriptor("terminal-31"), 0o644)
+                bus.progress(Status=3, AllowCancel=True)
+
+            def finish(bus):
+                observed.append(True)
+                bus.emit("Finished", (1, 0))
+
+            backend = self.backend(journal, [damage, finish])
+            with self.assertRaises(provider.JournalFileError):
+                self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual(observed, [True])
+            self.assertNotIn("complete\toperation", "".join(chunks))
+            self.assertIn("Cancel", [call[3] for call in backend.connection.calls])
+            os.fchmod(journal.descriptor("terminal-31"), 0o600)
+
+    def test_early_item_progress_does_not_change_denial_or_restart_evidence(self):
+        with self.journal() as journal:
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.emit("ItemProgress", (self.package_id, 8, 42)),
+                lambda bus: bus.reply_error("AccessDenied")])
+            terminal = self.run_operation(journal, backend, chunks, update=True)
+            self.assertEqual((terminal.state, terminal.system_restart, terminal.session_restart),
+                             ("permission-denied", "none", "none"))
+            records = "".join(chunks).splitlines()
+            self.assertEqual(rows(records, "package-progress"), [])
+            self.assertNotIn("running", [record[4] for record in rows(records, "operation")])
+
+    def test_output_failure_after_send_does_not_abandon_durable_result(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3),
+                                            lambda bus: bus.emit("Finished", (1, 0))])
+            def write(chunk):
+                if "\trunning\t" in chunk:
+                    raise BrokenPipeError("closed consumer")
+            with self.assertRaises(BrokenPipeError):
+                self.run_operation(journal, backend, [], write=write)
+            with provider.lock_writable_journal(journal):
+                state = provider.load_writable_journal_state(journal)
+            self.assertIsNone(state.active)
+            self.assertEqual(state.terminals[0].state, "succeeded")
+
+    def test_overlap_and_invalid_inputs_never_dispatch(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [lambda bus: bus.emit("Finished", (1, 0))])
+            self.run_operation(journal, backend, [])
+            before = len(backend.connection.calls)
+            with self.assertRaises(provider.JournalAdmissionError):
+                self.run_operation(journal, backend, [])
+            self.assertEqual(len(backend.connection.calls), before)
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.run_packagekit_mutation(journal, backend, "updates-install-all", lambda value: None,
+                                                boot_id=self.boot_id, generation="invalid")
+            self.assertEqual(len(backend.connection.calls), before)
+
+    def test_security_rejection_never_creates_or_journals_a_transaction(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            backend.require_mutation_safe.side_effect = provider.SnapshotFailure("unsupported", "Unsafe build")
+            with self.assertRaises(provider.SnapshotFailure):
+                self.run_operation(journal, backend, [])
+            backend.create_mutation.assert_not_called()
+            with provider.lock_writable_journal(journal):
+                self.assertIsNone(provider.load_writable_journal_state(journal).active)
+
+    def test_changed_plan_rejects_before_mutable_transaction_or_journal_write(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            backend.simulate.return_value = provider.TransactionResult((provider.Package(11, self.package_id, "Changed preview"),))
+            with self.assertRaises(provider.SnapshotFailure) as raised:
+                self.run_operation(journal, backend, [], update=True)
+            self.assertEqual(raised.exception.code, "conflict")
+            backend.create_mutation.assert_not_called()
+            with provider.lock_writable_journal(journal):
+                state = provider.load_writable_journal_state(journal)
+                self.assertIsNone(state.active)
+                self.assertIsNone(state.handoff)
+
+    def test_preflight_waits_are_unlocked_and_competing_admission_is_rechecked(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            def competing_owner(package_ids):
+                with provider.lock_writable_journal(journal):
+                    provider.begin_journal_operation(journal, "updates-refresh", "2026-09-05T00:00:00Z",
+                                                     "Competing owner", transaction_path="/2_other", boot_id=self.boot_id)
+                return provider.TransactionResult((provider.Package(11, self.package_id, "Example"),))
+            backend.simulate.side_effect = competing_owner
+            with self.assertRaises(provider.JournalAdmissionError):
+                self.run_operation(journal, backend, [], update=True)
+            self.assertEqual(backend.connection.calls, [])
+
+    def test_fresh_complete_plan_matches_snapshot_generation(self):
+        backend = FixtureBackend(updates=(provider.Package(5, self.package_id, "Example"),
+                                         provider.Package(9, "blocked;1;x86_64;updates", "Blocked")),
+                                 plan=(provider.Package(12, "dependency;1;x86_64;updates", "Dependency"),
+                                       provider.Package(11, self.package_id, "Example")))
+        generation = rows(provider.build_snapshot(backend), "snapshot-generation")[0][1]
+        package_ids, preview = provider.confirmed_update_plan(backend, generation)
+        self.assertEqual(package_ids, (self.package_id,))
+        self.assertEqual({row.action for row in preview}, {"install", "update"})
+
+    def test_invalid_generation_never_reads_backend(self):
+        for generation in (None, "", "A" * 64, "a" * 65, "a" * 63):
+            with self.subTest(generation=generation):
+                backend = mock.Mock()
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    provider.confirmed_update_plan(backend, generation)
+                self.assertEqual(raised.exception.code, "malformed")
+                self.assertEqual(backend.mock_calls, [])
+
+    def test_empty_set_never_simulates_even_when_generation_matches(self):
+        backend = mock.Mock()
+        backend.updates.return_value = provider.TransactionResult(())
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            provider.confirmed_update_plan(backend, provider.snapshot_generation((), ()))
+        self.assertEqual(raised.exception.code, "conflict")
+        backend.simulate.assert_not_called()
+
+    def test_failed_or_unsupported_plan_never_becomes_confirmed(self):
+        for result, code in (
+            (provider.SnapshotFailure("permission-denied", "Denied"), "permission-denied"),
+            (provider.TransactionResult(()), "malformed"),
+            (provider.TransactionResult((provider.Package(11, self.package_id, "Example"),) * 2), "malformed"),
+            (provider.TransactionResult((provider.Package(11, self.package_id, "Example"),
+                                          provider.Package(20, "dependency;1;x86_64;updates", "Downgrade"))), "unsupported"),
+        ):
+            with self.subTest(code=code):
+                backend = mock.Mock()
+                backend.updates.return_value = provider.TransactionResult((provider.Package(5, self.package_id, "Example"),))
+                if isinstance(result, Exception):
+                    backend.simulate.side_effect = result
+                else:
+                    backend.simulate.return_value = result
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    provider.confirmed_update_plan(backend, "a" * 64)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_boot_identity_is_fixed_bounded_and_strict(self):
+        value = "01234567-89ab-cdef-0123-456789abcdef"
+        for data in (value.encode(), (value + "\n").encode()):
+            with mock.patch("builtins.open", mock.mock_open(read_data=data)) as source:
+                self.assertEqual(provider.read_boot_id(), value)
+                source.assert_called_once_with("/proc/sys/kernel/random/boot_id", "rb")
+                source().read.assert_called_once_with(37)
+        for data in (b"", value.upper().encode(), b" " + value.encode(), value.encode() + b"x", b"\xff"):
+            with self.subTest(data=data), mock.patch("builtins.open", mock.mock_open(read_data=data)):
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.read_boot_id()
+        with mock.patch("builtins.open", side_effect=PermissionError):
+            with self.assertRaises(provider.SnapshotFailure):
+                provider.read_boot_id()
+
+    def test_output_failure_before_dispatch_preserves_recoverable_active_record(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            def write(chunk):
+                if "\tauthorizing\t" in chunk:
+                    raise BrokenPipeError("closed consumer")
+            with self.assertRaises(BrokenPipeError):
+                self.run_operation(journal, backend, [], write=write)
+            self.assertEqual(backend.connection.calls, [])
+            self.assertEqual(backend.connection.subscriptions, {})
+            with provider.lock_writable_journal(journal):
+                self.assertEqual(provider.load_writable_journal_state(journal).active.state, "authorizing")
+
+    def test_external_cancellation_checkpoint_is_reconciled_without_regression(self):
+        with self.journal() as journal:
+            def cancel(bus):
+                with provider.lock_writable_journal(journal):
+                    current = provider.load_writable_journal_state(journal).active
+                    provider.advance_journal_operation(journal, current,
+                        replace(current, state="cancel-requested", detail="Canceled by a second control"))
+                bus.progress(Status=3, Percentage=55)
+            chunks = []
+            backend = self.backend(journal, [lambda bus: bus.progress(Status=3), cancel,
+                                            lambda bus: bus.emit("Finished", (3, 0))])
+            self.assertEqual(self.run_operation(journal, backend, chunks).state, "canceled")
+            output = "".join(chunks)
+            self.assertIn("\tcancel-requested\t55\t", output)
+            self.assertNotIn("\trunning\t55\t", output)
+
+    def test_malformed_finished_is_interrupted_not_success(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [lambda bus: bus.emit("Finished", (True, 0))])
+            terminal = self.run_operation(journal, backend, [], update=True)
+            self.assertEqual((terminal.state, terminal.error_code, terminal.system_restart),
+                             ("interrupted", "malformed", "unknown"))
+
+
+class SessionEvidenceTests(unittest.TestCase):
+    class Variant:
+        def __init__(self, signature, value):
+            self.signature, self.value = signature, value
+
+        def get_type_string(self):
+            return self.signature
+
+        def unpack(self):
+            return self.value
+
+        def get_child_value(self, index):
+            return self.value[index]
+
+        def get_variant(self):
+            return self.value
+
+    def backend(self, path="/org/freedesktop/login1/session/_31", timestamp=None):
+        backend = provider.PackageKitBackend.__new__(provider.PackageKitBackend)
+        backend.GLib = types.SimpleNamespace(Variant=self.Variant, Error=RuntimeError,
+                                            VariantType=types.SimpleNamespace(new=lambda value: value))
+        backend.Gio = types.SimpleNamespace(DBusCallFlags=types.SimpleNamespace(NONE=0),
+            dbus_error_get_remote_error=lambda error: "org.freedesktop.DBus.Error." + str(error))
+        backend.connection = mock.Mock()
+        backend.connection.call_sync.side_effect = [self.Variant("(o)", (path,)),
+            self.Variant("(v)", (self.Variant("v", timestamp or self.Variant("t", 123)),))]
+        return backend
+
+    def test_fixed_own_session_and_typed_timestamp_share_deadline(self):
+        backend = self.backend()
+        with mock.patch.object(provider.time, "monotonic", side_effect=[100, 101, 102, 103, 104]), \
+                mock.patch.object(provider.os, "getpid", return_value=456):
+            self.assertEqual(backend.session_started(), 123)
+        first, second = backend.connection.call_sync.call_args_list
+        self.assertEqual(first.args[:4], ("org.freedesktop.login1", "/org/freedesktop/login1",
+                                          "org.freedesktop.login1.Manager", "GetSessionByPID"))
+        self.assertEqual(first.args[4].unpack(), (456,))
+        self.assertEqual(second.args[:4], ("org.freedesktop.login1", "/org/freedesktop/login1/session/_31",
+                                           provider.PROPERTIES_INTERFACE, "Get"))
+        self.assertEqual(second.args[4].unpack(), ("org.freedesktop.login1.Session", "TimestampMonotonic"))
+        self.assertEqual((first.args[5], second.args[5]), (None, None))
+        self.assertEqual((first.args[7], second.args[7]), (9000, 7000))
+
+    def service_backend(self, changes=None, final_identity=None):
+        backend = self.backend()
+        backend.Gio.dbus_error_get_remote_error = lambda error: str(error)
+        user_path = "/org/freedesktop/login1/user/_1000"
+        identity = ("7", "/org/freedesktop/login1/session/_37")
+        state = dict(User=(provider.os.getuid(), user_path), Id="7", Type="x11",
+                     Class="user", State="active", Active=True, Remote=False)
+        state.update(changes or {})
+        def boxed(signature, value):
+            return self.Variant("(v)", (self.Variant("v", self.Variant(signature, value)),))
+        backend.connection.call_sync.side_effect = [
+            RuntimeError("org.freedesktop.login1.NoSessionForPID"),
+            self.Variant("(o)", (user_path,)), boxed("(so)", identity),
+            self.Variant("(a{sv})", (state,)), boxed("t", 456),
+            boxed("(so)", final_identity or identity)]
+        return backend
+
+    def test_user_service_uses_verified_primary_display(self):
+        backend = self.service_backend()
+        with mock.patch.dict(provider.os.environ, {"XDG_SESSION_ID": "untrusted-other-session"}):
+            self.assertEqual(backend.session_started(), 456)
+        calls = backend.connection.call_sync.call_args_list
+        self.assertEqual(calls[1].args[3:5][0], "GetUser")
+        self.assertEqual(calls[1].args[4].unpack(), (provider.os.getuid(),))
+        self.assertEqual(calls[3].args[3], "GetAll")
+        self.assertEqual(calls[-1].args[4].unpack(), ("org.freedesktop.login1.User", "Display"))
+
+    def test_user_service_rejects_unverified_display(self):
+        for changes in ({"User": (provider.os.getuid() + 1, "/other")},
+                        {"Id": "other"}, {"Type": "tty"}, {"Class": "manager"},
+                        {"State": "closing"}, {"Active": False}, {"Remote": True}):
+            with self.subTest(changes=changes), self.assertRaises(provider.SnapshotFailure):
+                self.service_backend(changes).session_started()
+
+    def test_user_service_retains_guidance_when_display_changes(self):
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            self.service_backend(final_identity=("8", "/org/freedesktop/login1/session/_38")).session_started()
+        self.assertEqual(raised.exception.code, "missing-provider")
+
+    def test_malformed_session_path_never_reads_property(self):
+        for path in ("/other", "/org/freedesktop/login1/session/", "/org/freedesktop/login1/session/" + "x" * 257):
+            with self.subTest(path=path):
+                backend = self.backend(path=path)
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    backend.session_started()
+                self.assertEqual(raised.exception.code, "malformed")
+                self.assertEqual(backend.connection.call_sync.call_count, 1)
+
+    def test_signed_boolean_or_out_of_range_timestamp_is_not_recovery_evidence(self):
+        for signature, value in (("x", 123), ("b", True), ("t", True), ("t", -1), ("t", 1 << 64)):
+            with self.subTest(signature=signature, value=value):
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    self.backend(timestamp=self.Variant(signature, value)).session_started()
+                self.assertEqual(raised.exception.code, "malformed")
+
+    def test_wrong_outer_reply_type_is_a_malformed_result(self):
+        backend = self.backend()
+        backend.connection.call_sync.side_effect = [self.Variant("(s)", ("/org/freedesktop/login1/session/_31",))]
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            backend.session_started()
+        self.assertEqual(raised.exception.code, "malformed")
+
+    def test_missing_service_or_expired_deadline_does_not_guess_clear(self):
+        backend = self.backend()
+        backend.connection.call_sync.side_effect = RuntimeError("ServiceUnknown")
+        with self.assertRaises(provider.SnapshotFailure) as raised:
+            backend.session_started()
+        self.assertEqual(raised.exception.status, "unavailable")
+        self.assertEqual(raised.exception.code, "missing-provider")
+        backend = self.backend()
+        with mock.patch.object(provider.time, "monotonic", side_effect=[100, 101, 110]):
+            with self.assertRaises(provider.SnapshotFailure) as raised:
+                backend.session_started()
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertEqual(backend.connection.call_sync.call_count, 1)
+
+
+    def test_denied_and_timeout_replies_keep_distinct_failure_codes(self):
+        for message, code in (("AccessDenied", "permission-denied"), ("NoReply", "timeout"),
+                              ("TimedOut", "timeout"), ("Timeout", "timeout"),
+                              ("InvalidArgs", "malformed"), ("Unrecognized", "internal")):
+            with self.subTest(message=message):
+                backend = self.backend()
+                backend.connection.call_sync.side_effect = RuntimeError(message)
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    backend.session_started()
+                self.assertEqual(raised.exception.code, code)
+
+
+class NativeJournalOwnerTests(unittest.TestCase):
+    boot_id = JournalRetainedSessionTests.boot_id
+    session = JournalRetainedSessionTests.session
+
+    def begin(self, journal, action="timezone-set"):
+        return provider.begin_journal_operation(journal, action,
+            "2026-09-06T17:00:00Z", "Native ownership fixture")
+
+    @contextlib.contextmanager
+    def owner(self, journal, action="timezone-set"):
+        with contextlib.ExitStack() as retained:
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal, action)
+                retained.enter_context(provider.retain_native_journal_owner(journal, operation))
+            yield operation
+
+    def recover(self, journal):
+        backend = mock.Mock()
+        result = provider.recover_journal_active(journal, backend, boot_id=self.boot_id)
+        self.assertEqual(backend.mock_calls, [])
+        return result
+
+    def test_every_native_kind_retains_live_state_without_backend_or_terminal_writes(self):
+        for action in ("timezone-set", "ntp-set", "locale-set", "accounts-open", "password-open",
+                       "printers-open", "sources-open"):
+            with self.subTest(action=action), self.session() as (path, chain, journal):
+                with self.owner(journal, action) as operation:
+                    before = {name: (path / name).read_bytes() for name in ("active", "cursor", "handoff")}
+                    # Required service work does not retain the directory lock.
+                    with provider._journal_lock(chain.directory_descriptor, exclusive=True):
+                        pass
+                    with provider.retain_writable_journal(chain) as observer:
+                        for _ in range(2):
+                            state, evidence, failure = self.recover(observer)
+                            self.assertEqual(state.active, operation)
+                            self.assertIsNone(state.handoff)
+                            self.assertTrue(all(item is None for item in state.terminals))
+                            self.assertIsNone(evidence)
+                            self.assertIsNone(failure)
+                    self.assertEqual(before,
+                        {name: (path / name).read_bytes() for name in before})
+                state, _, _ = self.recover(journal)
+                self.assertIsNone(state.active)
+                self.assertEqual(state.terminals[operation.slot].state, "interrupted")
+                self.assertEqual(state.handoff.operation_id, operation.operation_id)
+
+    def test_same_descriptor_set_probe_and_recovery_cannot_release_its_owner(self):
+        with self.session() as (_path, chain, journal), self.owner(journal) as operation:
+            for state_name in ("pending", "authorizing", "running"):
+                with provider.lock_writable_journal(journal):
+                    if operation.state != state_name:
+                        operation = provider.advance_journal_operation(journal, operation,
+                            replace(operation, state=state_name))
+                    self.assertTrue(provider.native_journal_owner_busy(journal, operation))
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        with provider.retain_native_journal_owner(journal, operation):
+                            self.fail("nested owner stole the lease")
+                self.assertEqual(self.recover(journal)[0].active, operation)
+                with provider.retain_writable_journal(chain) as observer:
+                    with provider.lock_writable_journal(observer):
+                        self.assertTrue(provider.native_journal_owner_busy(observer, operation))
+                        with self.assertRaises(provider.JournalAdmissionError):
+                            with provider.retain_native_journal_owner(observer, operation):
+                                self.fail("a second descriptor set stole the lease")
+
+    def test_unlocked_stale_wrong_kind_and_terminal_targets_are_rejected(self):
+        with self.session() as (_path, _chain, journal):
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+            for function in (provider.native_journal_owner_busy, provider.retain_native_journal_owner):
+                with self.assertRaises(provider.JournalLockError):
+                    if function is provider.native_journal_owner_busy:
+                        function(journal, operation)
+                    else:
+                        with function(journal, operation):
+                            self.fail("unlocked lease was acquired")
+            with provider.lock_writable_journal(journal):
+                for invalid in (None, replace(operation, operation_id="op-" + "f" * 32),
+                                replace(operation, kind="update"), replace(operation, state="failed")):
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        provider.native_journal_owner_busy(journal, invalid)
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        with provider.retain_native_journal_owner(journal, invalid):
+                            self.fail("invalid lease was acquired")
+                self.assertFalse(provider.native_journal_owner_busy(journal, operation))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_body_and_unlock_failures_release_the_independent_lease_descriptor(self):
+        original_close = provider._close_descriptors
+        def close_failure(descriptors):
+            return original_close(descriptors) or OSError("close fixture")
+        for failure in ("body", "unlock", "close"):
+            with self.subTest(failure=failure), self.session() as (_path, _chain, journal):
+                if failure == "unlock":
+                    patch = mock.patch.object(provider, "_unlock_native_owner",
+                        side_effect=provider.JournalLockError("unlock fixture"))
+                elif failure == "close":
+                    patch = mock.patch.object(provider, "_close_descriptors", side_effect=close_failure)
+                else:
+                    patch = contextlib.nullcontext()
+                with self.assertRaisesRegex(RuntimeError if failure == "body" else provider.JournalLockError,
+                                            "fixture" if failure != "close" else "descriptor close failed"):
+                    with patch:
+                        with self.owner(journal) as operation:
+                            if failure == "body":
+                                raise RuntimeError("body fixture")
+                # The dedicated file description must be closed even when
+                # the explicit unlock failed, leaving no inherited lease.
+                with provider.lock_writable_journal(journal):
+                    self.assertFalse(provider.native_journal_owner_busy(journal, operation))
+
+    def test_kernel_lock_errors_are_explicit_and_do_not_clear_the_active_record(self):
+        with self.session() as (path, _chain, journal):
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+                before = (path / "active").read_bytes()
+                for number, expected in ((errno.EAGAIN, True), (errno.EACCES, True)):
+                    with mock.patch.object(provider.fcntl, "flock", side_effect=OSError(number, "fixture")):
+                        self.assertEqual(provider.native_journal_owner_busy(journal, operation), expected)
+                with mock.patch.object(provider.fcntl, "flock", side_effect=OSError(errno.EIO, "fixture")):
+                    with self.assertRaises(provider.JournalLockError):
+                        provider.native_journal_owner_busy(journal, operation)
+                self.assertEqual((path / "active").read_bytes(), before)
+
+    def test_lease_handle_is_separate_nonblocking_close_on_exec_and_closed_on_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), self.session() as (_path, chain, journal):
+                captured = []
+                original_open = os.open
+                def opened(name, flags, *args, **kwargs):
+                    descriptor = original_open(name, flags, *args, **kwargs)
+                    if name == "active" and kwargs.get("dir_fd") == chain.directory_descriptor:
+                        captured.append(descriptor)
+                        self.assertNotEqual(descriptor, journal.descriptor("active"))
+                        self.assertTrue(flags & os.O_NOFOLLOW)
+                        self.assertTrue(flags & os.O_NONBLOCK)
+                        self.assertTrue(flags & os.O_CLOEXEC)
+                        self.assertFalse(os.get_inheritable(descriptor))
+                    return descriptor
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                    with mock.patch.object(provider.os, "open", side_effect=opened):
+                        if fail:
+                            with mock.patch.object(provider, "_try_native_owner_lock",
+                                    side_effect=provider.JournalLockError("fixture")):
+                                with self.assertRaises(provider.JournalLockError):
+                                    with provider.retain_native_journal_owner(journal, operation):
+                                        self.fail("failed acquisition was accepted")
+                        else:
+                            with provider.retain_native_journal_owner(journal, operation):
+                                self.assertTrue(provider.native_journal_owner_busy(journal, operation))
+                    self.assertEqual(len(captured), 1)
+                    with self.assertRaises(OSError):
+                        os.fstat(captured[0])
+                    self.assertFalse(provider.native_journal_owner_busy(journal, operation))
+
+    def test_open_failure_is_explicit_and_preserves_active_state(self):
+        with self.session() as (path, _chain, journal):
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+                before = (path / "active").read_bytes()
+                with mock.patch.object(provider.os, "open", side_effect=OSError(errno.EACCES, "fixture")):
+                    with self.assertRaises(provider.JournalLockError):
+                        with provider.retain_native_journal_owner(journal, operation):
+                            self.fail("failed open was accepted")
+                self.assertEqual((path / "active").read_bytes(), before)
+                self.assertFalse(provider.native_journal_owner_busy(journal, operation))
+
+    def test_replaced_path_during_lease_open_is_rejected_and_handle_closed(self):
+        captured = []
+        with self.assertRaises(provider.JournalLayoutError):
+            with self.session() as (path, chain, journal):
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                    original_open = os.open
+                    def replaced(name, flags, *args, **kwargs):
+                        descriptor = original_open(name, flags, *args, **kwargs)
+                        if name == "active" and kwargs.get("dir_fd") == chain.directory_descriptor:
+                            captured.append(descriptor)
+                            active = path / "active"
+                            content = active.read_bytes()
+                            active.rename(path / "detached-active")
+                            active.write_bytes(content)
+                            active.chmod(0o600)
+                        return descriptor
+                    with mock.patch.object(provider.os, "open", side_effect=replaced):
+                        with provider.retain_native_journal_owner(journal, operation):
+                            self.fail("replaced lease path was accepted")
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(OSError):
+            os.fstat(captured[0])
+
+    def test_replaced_directory_during_owned_interval_is_rejected_before_recovery(self):
+        with self.assertRaises(provider.JournalLayoutError):
+            with self.session() as (path, _chain, journal), self.owner(journal):
+                before = (path / "active").read_bytes()
+                detached = path.with_name("detached-journal")
+                path.rename(detached)
+                path.mkdir(mode=0o700)
+                try:
+                    self.recover(journal)
+                    self.fail("detached journal was recovered")
+                finally:
+                    self.assertEqual((detached / "active").read_bytes(), before)
+
+    def test_recovery_probe_error_never_terminalizes_an_unknown_owner(self):
+        with self.session() as (path, _chain, journal):
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+            before = (path / "active").read_bytes()
+            backend = mock.Mock()
+            with mock.patch.object(provider, "_try_native_owner_lock",
+                    side_effect=provider.JournalLockError("probe fixture")):
+                with self.assertRaises(provider.JournalLockError):
+                    provider.recover_journal_active(journal, backend, boot_id=self.boot_id)
+            self.assertEqual(backend.mock_calls, [])
+            self.assertEqual((path / "active").read_bytes(), before)
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_durable_terminal_recovery_does_not_wait_for_live_owner_release(self):
+        with self.session() as (_path, chain, journal), self.owner(journal) as operation:
+            with provider.lock_writable_journal(journal):
+                operation = provider.advance_journal_operation(journal, operation,
+                    replace(operation, state="running"))
+                terminal = provider.advance_journal_operation(journal, operation,
+                    replace(operation, state="succeeded", finished_at="2026-09-06T17:01:00Z"))
+            with provider.retain_writable_journal(chain) as observer:
+                state, evidence, failure = self.recover(observer)
+            self.assertIsNone(state.active)
+            self.assertEqual(state.terminals[operation.slot], terminal)
+            self.assertEqual(state.handoff.operation_id, operation.operation_id)
+            self.assertIsNone(evidence)
+            self.assertIsNone(failure)
+
+    def test_process_exit_and_sigkill_release_ownership_before_orphan_recovery(self):
+        program = """
+import contextlib, runpy, sys
+p = runpy.run_path(sys.argv[1])
+with p["open_journal_directory_chain"](sys.argv[2]) as chain:
+    with p["retain_writable_journal"](chain) as journal, contextlib.ExitStack() as owner:
+        with p["lock_writable_journal"](journal):
+            operation = p["load_writable_journal_state"](journal).active
+            owner.enter_context(p["retain_native_journal_owner"](journal, operation))
+        print("ready", flush=True)
+        sys.stdin.buffer.read(1)
+"""
+        for killed in (False, True):
+            with self.subTest(killed=killed), self.session() as (_path, chain, journal):
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                child = subprocess.Popen([sys.executable, "-c", program, str(PROVIDER_PATH), chain.path],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+                try:
+                    self.assertTrue(select.select([child.stdout], [], [], 3)[0], "owner did not become ready")
+                    self.assertEqual(child.stdout.readline(16), b"ready\n")
+                    self.assertEqual(self.recover(journal)[0].active, operation)
+                    if killed:
+                        child.kill()
+                    _stdout, stderr = child.communicate(input=None if killed else b"x", timeout=3)
+                    self.assertEqual(child.returncode, -signal.SIGKILL if killed else 0, stderr)
+                    self.assertEqual(stderr, b"")
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate(timeout=3)
+                state, evidence, failure = self.recover(journal)
+                self.assertIsNone(state.active)
+                self.assertIsNone(evidence)
+                self.assertIsNone(failure)
+                self.assertEqual(state.terminals[operation.slot].state, "interrupted")
+
+
+class NativeJournalWatchTests(unittest.TestCase):
+    boot_id = NativeJournalOwnerTests.boot_id
+    session = NativeJournalOwnerTests.session
+    begin = NativeJournalOwnerTests.begin
+    owner = NativeJournalOwnerTests.owner
+
+    def checkpoint(self, journal, state, *, complete=True):
+        with provider.lock_writable_journal(journal):
+            current = provider.load_writable_journal_state(journal).active
+            if state == "succeeded" and current.state in {"pending", "authorizing"}:
+                current = provider.advance_journal_operation(journal, current, replace(current, state="running"))
+            if state == "permission-denied" and current.state == "pending":
+                current = provider.advance_journal_operation(journal, current, replace(current, state="authorizing"))
+            changes = dict(state=state, detail=f"Native fixture {state}")
+            if state in provider.JOURNAL_OPERATION_TERMINAL_STATES:
+                changes["finished_at"] = "2026-09-06T17:01:00Z"
+                if state == "failed":
+                    changes["error_code"] = "conflict"
+            current = provider.advance_journal_operation(journal, current, replace(current, **changes))
+            if complete and state in provider.JOURNAL_OPERATION_TERMINAL_STATES:
+                provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+            return current
+
+    def watch(self, journal, operation, write):
+        backend = mock.Mock(side_effect=AssertionError("native watch opened PackageKit"))
+        provider.watch_journal_operation(journal, operation.operation_id, write,
+            boot_id=self.boot_id, backend_factory=backend)
+        backend.assert_not_called()
+
+    @contextlib.contextmanager
+    def events(self, callback):
+        waiter = types.SimpleNamespace(wait=callback)
+        with mock.patch.object(provider, "NativeJournalEvents",
+                return_value=contextlib.nullcontext(waiter)):
+            yield
+
+    def test_each_kind_replays_exact_durable_result_without_backend_or_cancelability(self):
+        for action in ("timezone-set", "ntp-set", "locale-set", "accounts-open", "password-open",
+                       "printers-open", "sources-open"):
+            for result in ("succeeded", "permission-denied", "canceled", "failed", "interrupted"):
+                with self.subTest(action=action, result=result), self.session() as (_path, _chain, journal), \
+                        self.owner(journal, action) as operation:
+                    chunks = []
+                    def finish(_deadline):
+                        self.assertFalse(journal._exclusive)
+                        self.checkpoint(journal, result, complete=False)
+                    def write(chunk):
+                        if "complete\toperation" in chunk:
+                            state = provider.load_journal_state(journal.chain)
+                            self.assertIsNone(state.active)
+                            self.assertEqual(state.handoff.operation_id, operation.operation_id)
+                        chunks.append(chunk)
+                    with self.events(finish):
+                        self.watch(journal, operation, write)
+                    operations = rows("".join(chunks).splitlines(), "operation")
+                    self.assertEqual(operations[0][4], "pending")
+                    self.assertEqual(operations[-1][1:5],
+                        [operation.operation_id, action, operation.kind, result])
+                    self.assertTrue(all(row[5:7] == ["unknown", "no"] for row in operations))
+                    self.assertEqual(len(rows("".join(chunks).splitlines(), "audit")), 1)
+
+    def test_progress_coalesces_without_writing_and_deadline_does_not_extend(self):
+        with self.session() as (_path, _chain, journal), self.owner(journal) as operation:
+            chunks, deadlines = [], []
+            steps = iter(("pending", "authorizing", "authorizing", "running", "succeeded"))
+            def changed(deadline):
+                deadlines.append(deadline)
+                state = next(steps)
+                if state == provider.load_journal_state(journal.chain).active.state:
+                    return
+                self.checkpoint(journal, state)
+            with self.events(changed):
+                self.watch(journal, operation, chunks.append)
+            self.assertEqual(len(set(deadlines)), 1)
+            self.assertEqual([row[4] for row in rows("".join(chunks).splitlines(), "operation")],
+                ["pending", "authorizing", "running", "succeeded"])
+            self.assertEqual(provider.load_journal_state(journal.chain).handoff.operation_id, operation.operation_id)
+
+    def test_orphan_recovery_and_completion_during_watch_setup_are_exact(self):
+        for completed in (False, True):
+            with self.subTest(completed=completed), self.session() as (_path, _chain, journal):
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                @contextlib.contextmanager
+                def events(_journal):
+                    if completed:
+                        self.checkpoint(journal, "succeeded")
+                    yield types.SimpleNamespace(wait=mock.Mock(side_effect=AssertionError("unneeded wait")))
+                chunks = []
+                with mock.patch.object(provider, "NativeJournalEvents", side_effect=events):
+                    self.watch(journal, operation, chunks.append)
+                self.assertEqual(rows("".join(chunks).splitlines(), "operation")[-1][4],
+                    "succeeded" if completed else "interrupted")
+
+    def test_final_deadline_probe_recovers_close_before_unlock_race(self):
+        with self.session() as (_path, _chain, journal), contextlib.ExitStack() as owner:
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+                owner.enter_context(provider.retain_native_journal_owner(journal, operation))
+            clock, waits, chunks = [10], [], []
+            def wait(deadline):
+                waits.append(deadline)
+                if len(waits) == 1:
+                    return  # CLOSE_WRITE arrived while the lease was still busy.
+                owner.close()
+                clock[0] = deadline  # No further filesystem event followed.
+            with self.events(wait), mock.patch.object(provider.time, "monotonic", side_effect=lambda: clock[0]):
+                self.watch(journal, operation, chunks.append)
+            self.assertEqual(len(waits), 2)
+            self.assertEqual(rows("".join(chunks).splitlines(), "operation")[-1][4], "interrupted")
+
+    def test_timeout_or_output_loss_preserves_the_live_owner_and_has_no_terminal(self):
+        for fault in ("timeout", "output", "events"):
+            with self.subTest(fault=fault), self.session() as (path, _chain, journal), self.owner(journal) as operation:
+                before = (path / "active").read_bytes()
+                clock, chunks = [10], []
+                def wait(deadline):
+                    if fault == "events":
+                        raise provider.SnapshotFailure("interrupted", "events fixture")
+                    clock[0] = deadline
+                def write(chunk):
+                    chunks.append(chunk)
+                    if fault == "output":
+                        raise BrokenPipeError("output fixture")
+                with self.events(wait), mock.patch.object(provider.time, "monotonic", side_effect=lambda: clock[0]):
+                    with self.assertRaises(BrokenPipeError if fault == "output" else provider.SnapshotFailure):
+                        self.watch(journal, operation, write)
+                self.assertNotIn("complete\toperation", "".join(chunks))
+                self.assertEqual((path / "active").read_bytes(), before)
+                with provider.lock_writable_journal(journal):
+                    self.assertTrue(provider.native_journal_owner_busy(journal, operation))
+
+    def test_replacement_owner_is_never_followed(self):
+        with self.session() as (_path, _chain, journal), self.owner(journal) as operation:
+            following, chunks = [], []
+            def replace_owner(_deadline):
+                self.checkpoint(journal, "succeeded")
+                with provider.lock_writable_journal(journal):
+                    provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                    following.append(self.begin(journal, "ntp-set"))
+            with self.events(replace_owner), self.assertRaises(provider.JournalAdmissionError):
+                self.watch(journal, operation, chunks.append)
+            self.assertNotIn("complete\toperation", "".join(chunks))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, following[0])
+
+    def test_same_id_changed_immutable_fields_are_rejected_before_recovery_writes(self):
+        for changes in (dict(action_id="ntp-set", kind="ntp"),
+                        dict(action_id="updates-refresh", kind="refresh", transaction_path="/1_test"),
+                        dict(started_at="2026-09-06T16:00:00Z")):
+            with self.subTest(changes=changes), self.session() as (path, _chain, journal):
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                changed, before, chunks = replace(operation, **changes), {}, []
+                @contextlib.contextmanager
+                def events(_journal):
+                    with provider.lock_writable_journal(journal):
+                        provider.commit_writable_journal_path(journal, "active",
+                            provider.encode_journal_operation(changed))
+                    before.update({name: (path / name).read_bytes() for name in provider.JOURNAL_NAMES})
+                    yield types.SimpleNamespace(wait=mock.Mock(side_effect=AssertionError("unneeded wait")))
+                with mock.patch.object(provider, "NativeJournalEvents", side_effect=events):
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        self.watch(journal, operation, chunks.append)
+                for name, content in before.items():
+                    self.assertTrue((path / name).read_bytes() == content, f"Recovery changed {name}")
+                self.assertNotIn("complete\toperation", "".join(chunks))
+
+    def test_same_id_changed_terminal_is_rejected_without_rewriting_any_record(self):
+        with self.session() as (path, _chain, journal):
+            with provider.lock_writable_journal(journal):
+                operation = self.begin(journal)
+            before, chunks = {}, []
+            @contextlib.contextmanager
+            def events(_journal):
+                with provider.lock_writable_journal(journal):
+                    provider.commit_writable_journal_path(journal, "active",
+                        provider.encode_journal_operation(replace(operation, action_id="ntp-set", kind="ntp")))
+                self.checkpoint(journal, "succeeded")
+                before.update({name: (path / name).read_bytes() for name in provider.JOURNAL_NAMES})
+                yield types.SimpleNamespace(wait=mock.Mock(side_effect=AssertionError("unneeded wait")))
+            with mock.patch.object(provider, "NativeJournalEvents", side_effect=events):
+                with self.assertRaises(provider.JournalAdmissionError):
+                    self.watch(journal, operation, chunks.append)
+            for name, content in before.items():
+                self.assertTrue((path / name).read_bytes() == content, f"Recovery changed {name}")
+            self.assertNotIn("complete\toperation", "".join(chunks))
+
+    def test_real_inode_events_and_descriptor_cleanup(self):
+        with self.session() as (_path, _chain, journal):
+            with provider.NativeJournalEvents(journal) as events:
+                descriptor = events.descriptor
+                self.assertFalse(os.get_blocking(descriptor))
+                self.assertFalse(os.get_inheritable(descriptor))
+                with provider.lock_writable_journal(journal):
+                    self.begin(journal)
+                started = time.monotonic()
+                events.wait(started + 1)
+                self.assertLess(time.monotonic() - started, 0.5)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_overflow_lost_malformed_and_empty_notifications_fail_closed(self):
+        for fault in ("overflow", "ignored", "short", "name", "empty", "cookie", "unknown"):
+            with self.subTest(fault=fault), self.session() as (_path, _chain, journal), \
+                    provider.NativeJournalEvents(journal) as events:
+                data = provider.struct.pack("=iIII", events.watch, 2, 0, 0)
+                if fault == "overflow": data = provider.struct.pack("=iIII", -1, 0x4000, 0, 0)
+                elif fault == "ignored": data = provider.struct.pack("=iIII", events.watch, 0x8000, 0, 0)
+                elif fault == "short": data = data[:-1]
+                elif fault == "empty": data = b""
+                elif fault == "name": data = provider.struct.pack("=iIII", events.watch, 2, 0, 16)
+                elif fault == "cookie": data = provider.struct.pack("=iIII", events.watch, 2, 1, 0)
+                elif fault == "unknown": data = provider.struct.pack("=iIII", events.watch + 1, 2, 0, 0)
+                with mock.patch.object(events.selector, "select", return_value=[True]), \
+                        mock.patch.object(provider.os, "read", return_value=data):
+                    with self.assertRaises(provider.SnapshotFailure):
+                        events.wait(time.monotonic() + 1)
+
+    def test_setup_failure_closes_created_event_descriptor(self):
+        with self.session() as (_path, _chain, journal):
+            events = provider.NativeJournalEvents(journal)
+            captured = []
+            original_close = os.close
+            def close(descriptor):
+                captured.append(descriptor)
+                return original_close(descriptor)
+            with mock.patch.object(provider.selectors, "DefaultSelector", side_effect=OSError("selector fixture")), \
+                    mock.patch.object(provider.os, "close", side_effect=close):
+                with self.assertRaises(OSError):
+                    with events:
+                        self.fail("failed setup entered")
+            self.assertEqual(len(captured), 1)
+            self.assertIsNone(events.descriptor)
+            with self.assertRaises(OSError):
+                os.fstat(captured[0])
+
+    def test_live_snapshot_exposes_native_identity_without_enabling_origins(self):
+        for action in ("timezone-set", "ntp-set", "locale-set", "accounts-open", "password-open",
+                       "printers-open", "sources-open"):
+            with self.subTest(action=action), self.session() as (_path, _chain, journal), \
+                    self.owner(journal, action) as operation:
+                fixture = RecoverySnapshotTests()
+                backend = fixture.backend()
+                output = fixture.snapshot(journal, backend)
+                self.assertEqual(rows(output, "active-operation")[0][1:7],
+                    [operation.operation_id, action, operation.kind, "pending", "unknown", "no"])
+                self.assertEqual([row[2] for row in rows(output, "action")], ["unavailable"] * 3)
+                self.assertEqual(rows(output, "terminal-handoff"), [])
+                backend.probe_operation.assert_not_called()
+                backend.operation_history.assert_not_called()
+
+    def test_real_cli_watch_observes_completion_and_owner_sigkill(self):
+        owner_program = """
+import contextlib, dataclasses, runpy, sys
+p = runpy.run_path(sys.argv[1])
+with p["open_journal_directory_chain"](sys.argv[2]) as chain:
+    with p["retain_writable_journal"](chain) as journal, contextlib.ExitStack() as owner:
+        with p["lock_writable_journal"](journal):
+            operation = p["load_writable_journal_state"](journal).active
+            owner.enter_context(p["retain_native_journal_owner"](journal, operation))
+        print("ready", flush=True)
+        sys.stdin.buffer.read(1)
+        with p["lock_writable_journal"](journal):
+            running = p["advance_journal_operation"](journal, operation,
+                dataclasses.replace(operation, state="running"))
+            p["advance_journal_operation"](journal, running, dataclasses.replace(running,
+                state="succeeded", finished_at="2026-09-06T17:01:00Z"))
+            p["complete_journal_terminal"](journal)
+"""
+        watch_program = """
+import runpy, sys
+p = runpy.run_path(sys.argv[1])
+p["main"].__globals__["NATIVE_WATCH_SECONDS"] = 1
+def unexpected(*args, **kwargs):
+    raise AssertionError("Native watch must not open PackageKit")
+p["PackageKitBackend"].__init__ = unexpected
+raise SystemExit(p["main"](sys.argv[2:]))
+"""
+        for killed in (False, True):
+            with self.subTest(killed=killed), self.session() as (_path, chain, journal):
+                with provider.lock_writable_journal(journal):
+                    operation = self.begin(journal)
+                processes = []
+                try:
+                    owner = subprocess.Popen([sys.executable, "-c", owner_program, str(PROVIDER_PATH), chain.path],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, close_fds=True)
+                    processes.append(owner)
+                    self.assertTrue(select.select([owner.stdout], [], [], 3)[0])
+                    self.assertEqual(owner.stdout.readline(16), b"ready\n")
+                    environment = dict(os.environ, XDG_STATE_HOME=str(pathlib.Path(chain.path).parents[1]))
+                    watcher = subprocess.Popen([sys.executable, "-c", watch_program, str(PROVIDER_PATH),
+                        "watch-operation", operation.operation_id], stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, env=environment, bufsize=0, close_fds=True)
+                    processes.append(watcher)
+                    prefix = b""
+                    for _ in range(2):
+                        self.assertTrue(select.select([watcher.stdout], [], [], 3)[0])
+                        prefix += watcher.stdout.readline(1024)
+                    self.assertIn(b"\tpending\t", prefix)
+                    if killed:
+                        owner.kill()
+                    _output, diagnostic = owner.communicate(input=None if killed else b"x", timeout=3)
+                    self.assertEqual((owner.returncode, diagnostic), (-signal.SIGKILL if killed else 0, b""))
+                    output, diagnostic = watcher.communicate(timeout=4)
+                    self.assertEqual((watcher.returncode, diagnostic), (0, b""))
+                    records = (prefix + output).decode().splitlines()
+                    self.assertEqual(rows(records, "operation")[-1][4], "interrupted" if killed else "succeeded")
+                    self.assertEqual(records[-1], "complete\toperation")
+                    self.assertEqual(provider.load_journal_state(chain).handoff.operation_id, operation.operation_id)
+                finally:
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate(timeout=3)
+
+    def test_full_control_output_and_shared_diagnostics_detach_and_restore_writer_modes(self):
+        for terminal in (False, True):
+            for shared in (False, True):
+                for blocking in (False, True):
+                    with self.subTest(terminal=terminal, shared=shared, blocking=blocking), \
+                            self.session() as (path, chain, journal), self.owner(journal) as operation:
+                        if terminal:
+                            self.checkpoint(journal, "succeeded")
+                        before = {name: (path / name).read_bytes() for name in ("active", "handoff")}
+                        reader, writer = os.pipe()
+                        child = None
+                        try:
+                            os.set_blocking(writer, False)
+                            with self.assertRaises(BlockingIOError):
+                                while True:
+                                    os.write(writer, b"x" * 4096)
+                            os.set_blocking(writer, blocking)
+                            environment = dict(os.environ, XDG_STATE_HOME=str(pathlib.Path(chain.path).parents[1]))
+                            child = subprocess.Popen([sys.executable, str(PROVIDER_PATH), "watch-operation",
+                                operation.operation_id], stdout=writer, stderr=writer if shared else subprocess.PIPE,
+                                env=environment, close_fds=True)
+                            _output, diagnostic = child.communicate(timeout=3)
+                            self.assertEqual(child.returncode, 1)
+                            if not shared:
+                                self.assertEqual(diagnostic, b"operation observation was interrupted\n")
+                            self.assertEqual(os.get_blocking(writer), blocking)
+                            self.assertEqual(before, {name: (path / name).read_bytes() for name in before})
+                        finally:
+                            if child is not None:
+                                if child.poll() is None:
+                                    child.kill()
+                                child.communicate(timeout=3)
+                            os.close(reader)
+                            os.close(writer)
+
+    def test_short_output_is_failure_without_terminalizing_the_live_owner(self):
+        with self.session() as (path, chain, journal), self.owner(journal) as operation:
+            before = (path / "active").read_bytes()
+            state_home = str(pathlib.Path(chain.path).parents[1])
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state_home}), \
+                    mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                output = mock.Mock(return_value=1)
+                code = provider.run_operation_control("watch-operation", operation.operation_id, output, None)
+            self.assertEqual(code, 1)
+            self.assertEqual(diagnostic.getvalue(), "operation observation was interrupted\n")
+            output.assert_called_once()
+            self.assertEqual((path / "active").read_bytes(), before)
+
+    def test_control_signals_never_change_retained_pipe_modes_or_ownership(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGKILL):
+            for blocking in (False, True):
+                with self.subTest(signum=signum, blocking=blocking), self.session() as (path, chain, journal), \
+                        self.owner(journal) as operation:
+                    before = (path / "active").read_bytes()
+                    reader, writer = os.pipe()
+                    child = None
+                    try:
+                        os.set_blocking(writer, blocking)
+                        environment = dict(os.environ, XDG_STATE_HOME=str(pathlib.Path(chain.path).parents[1]))
+                        child = subprocess.Popen([sys.executable, str(PROVIDER_PATH), "watch-operation",
+                            operation.operation_id], stdout=writer, stderr=writer, env=environment, close_fds=True)
+                        self.assertTrue(select.select([reader], [], [], 3)[0])
+                        self.assertIn(b"\tpending\t", os.read(reader, 4096))
+                        self.assertEqual(os.get_blocking(writer), blocking)
+                        os.write(writer, b"parent output\n")
+                        self.assertTrue(select.select([reader], [], [], 3)[0])
+                        self.assertEqual(os.read(reader, 4096), b"parent output\n")
+                        child.send_signal(signum)
+                        child.communicate(timeout=3)
+                        self.assertEqual(child.returncode, -signal.SIGKILL if signum == signal.SIGKILL else 1)
+                        self.assertEqual(os.get_blocking(writer), blocking)
+                        self.assertEqual((path / "active").read_bytes(), before)
+                    finally:
+                        if child is not None:
+                            if child.poll() is None:
+                                child.kill()
+                            child.communicate(timeout=3)
+                        os.close(reader)
+                        os.close(writer)
+
+    def test_control_output_context_restores_existing_signal_handlers(self):
+        original = {signum: signal.getsignal(signum)
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(OSError, "fixture"):
+                with provider.control_output_writers():
+                    for signum, handler in original.items():
+                        self.assertIsNot(signal.getsignal(signum), handler)
+                    raise OSError("output fixture")
+        for signum, handler in original.items():
+            self.assertIs(signal.getsignal(signum), handler)
+
+    def test_isolated_pipe_and_terminal_writers_preserve_flags_and_close(self):
+        for terminal in (False, True):
+            for blocking in (False, True):
+                with self.subTest(terminal=terminal, blocking=blocking):
+                    reader, writer = pty.openpty() if terminal else os.pipe()
+                    opened = []
+                    real_open = os.open
+                    def capture(*args):
+                        descriptor = real_open(*args)
+                        opened.append(descriptor)
+                        return descriptor
+                    try:
+                        os.set_blocking(writer, blocking)
+                        original = provider.fcntl.fcntl(writer, provider.fcntl.F_GETFL)
+                        output = types.SimpleNamespace(fileno=lambda: writer)
+                        with contextlib.ExitStack() as resources, \
+                                mock.patch.object(provider.os, "open", side_effect=capture):
+                            send = provider.control_output_writer(output, resources)
+                            self.assertEqual(len(opened), 1)
+                            self.assertNotEqual(opened[0], writer)
+                            self.assertFalse(os.get_blocking(opened[0]))
+                            self.assertFalse(os.get_inheritable(opened[0]))
+                            self.assertEqual(send(b"watch"), 5)
+                            self.assertTrue(select.select([reader], [], [], 1)[0])
+                            self.assertEqual(os.read(reader, 4096), b"watch")
+                            os.write(writer, b"parent")
+                            self.assertTrue(select.select([reader], [], [], 1)[0])
+                            self.assertEqual(os.read(reader, 4096), b"parent")
+                            with self.assertRaises(BlockingIOError):
+                                for _ in range(256):
+                                    send(b"x" * 4096)
+                            self.assertEqual(provider.fcntl.fcntl(writer, provider.fcntl.F_GETFL), original)
+                        with self.assertRaises(OSError):
+                            os.fstat(opened[0])
+                        self.assertEqual(provider.fcntl.fcntl(writer, provider.fcntl.F_GETFL), original)
+                    finally:
+                        os.close(reader)
+                        os.close(writer)
+
+    def test_packet_pipe_writer_retains_packet_boundaries(self):
+        reader, writer = os.pipe2(os.O_DIRECT)
+        try:
+            with contextlib.ExitStack() as resources:
+                send = provider.control_output_writer(types.SimpleNamespace(fileno=lambda: writer), resources)
+                send(b"first")
+                send(b"second")
+                self.assertTrue(select.select([reader], [], [], 1)[0])
+                self.assertEqual(os.read(reader, 4096), b"first")
+                self.assertTrue(select.select([reader], [], [], 1)[0])
+                self.assertEqual(os.read(reader, 4096), b"second")
+                self.assertTrue(os.get_blocking(writer))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_socket_output_is_nonblocking_per_call_without_changing_flags(self):
+        for blocking in (False, True):
+            with self.subTest(blocking=blocking):
+                sender, reader = socket.socketpair()
+                with sender, reader, contextlib.ExitStack() as resources:
+                    sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                    sender.setblocking(blocking)
+                    send = provider.control_output_writer(sender, resources)
+                    self.assertEqual(send(b"watch"), 5)
+                    self.assertEqual(reader.recv(4096), b"watch")
+                    with self.assertRaises(BlockingIOError):
+                        for _ in range(64):
+                            send(b"x" * 4096)
+                    self.assertEqual(os.get_blocking(sender.fileno()), blocking)
+                    reader.close()
+                    with self.assertRaises(OSError):
+                        send(b"closed")
+                    self.assertEqual(os.get_blocking(sender.fileno()), blocking)
+
+    def test_regular_output_preserves_shared_offset_and_append_semantics(self):
+        for append in (False, True):
+            with self.subTest(append=append), tempfile.TemporaryFile() as output:
+                output.write(b"prefix")
+                output.flush()
+                flags = provider.fcntl.fcntl(output.fileno(), provider.fcntl.F_GETFL)
+                if append:
+                    flags |= os.O_APPEND
+                    provider.fcntl.fcntl(output.fileno(), provider.fcntl.F_SETFL, flags)
+                    output.seek(0)
+                with contextlib.ExitStack() as resources:
+                    send = provider.control_output_writer(output, resources)
+                    self.assertEqual(send(b"watch"), 5)
+                    os.write(output.fileno(), b"parent")
+                    self.assertEqual(provider.fcntl.fcntl(output.fileno(), provider.fcntl.F_GETFL), flags)
+                output.seek(0)
+                self.assertEqual(output.read(), b"prefixwatchparent")
+
+    def test_pipe_reopen_rejects_readonly_and_mismatched_output(self):
+        reader, writer = os.pipe()
+        closed = []
+        real_close = os.close
+        try:
+            with contextlib.ExitStack() as resources, mock.patch.object(provider.os, "open") as opened:
+                with self.assertRaisesRegex(OSError, "not writable"):
+                    provider.control_output_writer(types.SimpleNamespace(fileno=lambda: reader), resources)
+                opened.assert_not_called()
+            original = os.fstat(writer)
+            changed = types.SimpleNamespace(st_dev=original.st_dev, st_ino=original.st_ino + 1,
+                st_mode=original.st_mode, st_rdev=original.st_rdev)
+            def close(descriptor):
+                closed.append(descriptor)
+                real_close(descriptor)
+            with self.assertRaisesRegex(OSError, "identity changed"), contextlib.ExitStack() as resources, \
+                    mock.patch.object(provider.os, "fstat", side_effect=[original, changed]), \
+                    mock.patch.object(provider.os, "close", side_effect=close):
+                provider.control_output_writer(types.SimpleNamespace(fileno=lambda: writer), resources)
+            self.assertEqual(len(closed), 1)
+            with self.assertRaises(OSError):
+                os.fstat(closed[0])
+            self.assertTrue(os.get_blocking(writer))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_path_replacement_during_watch_never_publishes_completion(self):
+        chunks = []
+        with self.assertRaises(provider.JournalLayoutError):
+            with self.session() as (path, _chain, journal), self.owner(journal) as operation:
+                def replace_path(_deadline):
+                    active = path / "active"
+                    content = active.read_bytes()
+                    active.rename(path / "detached-active")
+                    active.write_bytes(content)
+                    active.chmod(0o600)
+                with self.events(replace_path):
+                    self.watch(journal, operation, chunks.append)
+        self.assertNotIn("complete\toperation", "".join(chunks))
+
+
+class OperationRecoveryTests(unittest.TestCase):
+    boot_id = PackageKitExecutionTests.boot_id
+    journal = PackageKitExecutionTests.journal
+
+    def begin(self, journal, kind="update", **changes):
+        with provider.lock_writable_journal(journal):
+            args = dict(transaction_path="/1_test", boot_id=self.boot_id) if kind in {"update", "refresh"} else {}
+            if kind == "update":
+                args.update(generation="a" * 64, boot_id=self.boot_id)
+            operation = provider.begin_journal_operation(journal,
+                {"update": "updates-install-all", "refresh": "updates-refresh", "timezone": "timezone-set"}[kind],
+                "2026-09-05T00:00:00Z", "Recovery fixture", **args)
+            if changes:
+                operation = provider.advance_journal_operation(journal, operation, replace(operation, **changes))
+            return operation
+
+    def backend(self, evidence=None, history=()):
+        backend = mock.Mock()
+        backend.probe_operation.return_value = evidence or provider.RecoveryEvidence(False)
+        backend.operation_history.return_value = history
+        return backend
+
+    def recover(self, journal, backend, **kwargs):
+        return provider.recover_journal_active(journal, backend, boot_id=kwargs.pop("boot_id", self.boot_id), **kwargs)
+
+    def test_exact_history_success_failure_and_absence_have_distinct_results(self):
+        for result, expected in ((True, "succeeded"), (False, "interrupted"), (None, "interrupted")):
+            with self.subTest(result=result), self.journal() as journal:
+                operation = self.begin(journal)
+                history = () if result is None else ((operation.transaction_path, result, 22, os.getuid()),)
+                state, evidence, failure = self.recover(journal, self.backend(history=history))
+                self.assertIsNone(state.active)
+                self.assertIsNone(evidence)
+                self.assertIsNone(failure)
+                terminal = state.terminals[operation.slot]
+                self.assertEqual((terminal.state, terminal.system_restart), (expected, "unknown"))
+                self.assertEqual(state.handoff.operation_id, operation.operation_id)
+                self.assertEqual(state.restart.system, "unknown")
+
+    def test_active_transaction_remains_owned_and_is_never_retried(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            observation = provider.RecoveryEvidence(True, status=3, allow_cancel=True, percent=45)
+            backend = self.backend(observation)
+            state, evidence, failure = self.recover(journal, backend)
+            self.assertEqual(state.active, operation)
+            self.assertEqual(evidence, observation)
+            self.assertIsNone(failure)
+            self.assertEqual([call[0] for call in backend.mock_calls], ["probe_operation", "operation_history"])
+
+    def test_timeout_is_not_absence_but_exact_history_can_supply_a_result(self):
+        for history_success in (False, True):
+            with self.subTest(history_success=history_success), self.journal() as journal:
+                operation = self.begin(journal)
+                history = ((operation.transaction_path, True, 22, os.getuid()),) if history_success else ()
+                backend = self.backend(history=history)
+                backend.probe_operation.side_effect = provider.SnapshotFailure("timeout", "Expired")
+                state, _, failure = self.recover(journal, backend)
+                self.assertEqual(failure.code, "timeout")
+                if history_success:
+                    self.assertIsNone(state.active)
+                    self.assertEqual(state.terminals[operation.slot].state, "succeeded")
+                else:
+                    self.assertEqual(state.active, operation)
+                    self.assertIsNone(state.handoff)
+
+    def test_unsuccessful_history_requires_confirmed_absence(self):
+        for lookup in ("present", "timeout"):
+            with self.subTest(lookup=lookup), self.journal() as journal:
+                operation = self.begin(journal, state="running")
+                observation = provider.RecoveryEvidence(True, status=3)
+                backend = self.backend(observation,
+                    ((operation.transaction_path, False, 22, os.getuid()),))
+                if lookup == "timeout":
+                    backend.probe_operation.side_effect = provider.SnapshotFailure("timeout", "Expired")
+                state, evidence, failure = self.recover(journal, backend)
+                self.assertEqual(state.active, operation)
+                self.assertIsNone(state.handoff)
+                self.assertTrue(all(terminal is None for terminal in state.terminals))
+                self.assertEqual(evidence, observation if lookup == "present" else None)
+                self.assertEqual(failure.code if failure else None, "timeout" if lookup == "timeout" else None)
+                with provider.lock_writable_journal(journal):
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        provider.prepare_journal_admission(journal)
+
+    def test_history_timeout_after_exact_absence_is_conservative_interruption(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend()
+            backend.operation_history.side_effect = provider.SnapshotFailure("timeout", "Expired history")
+            state, _, failure = self.recover(journal, backend)
+            self.assertEqual(failure.code, "timeout")
+            self.assertEqual(state.terminals[operation.slot].state, "interrupted")
+
+    def test_malformed_probe_or_history_preserves_nonterminal_record(self):
+        for source in ("probe_operation", "operation_history"):
+            with self.subTest(source=source), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend()
+                getattr(backend, source).side_effect = provider.SnapshotFailure("malformed", "Malformed evidence")
+                state, _, failure = self.recover(journal, backend)
+                self.assertEqual(state.active, operation)
+                self.assertEqual(failure.code, "malformed")
+                if source == "probe_operation":
+                    backend.operation_history.assert_not_called()
+
+    def test_refresh_and_regional_interruption_never_query_history(self):
+        for kind in ("refresh", "timezone"):
+            with self.subTest(kind=kind), self.journal() as journal:
+                operation = self.begin(journal, kind)
+                backend = self.backend()
+                state, _, _ = self.recover(journal, backend)
+                self.assertEqual(state.terminals[operation.slot].state, "interrupted")
+                backend.operation_history.assert_not_called()
+                if kind == "timezone":
+                    backend.probe_operation.assert_not_called()
+
+    def test_durable_terminal_recovery_opens_no_service(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="failed", finished_at="2026-09-05T00:01:00Z",
+                                   terminal_monotonic=100, error_code="package")
+            backend = self.backend()
+            state, _, _ = self.recover(journal, backend)
+            self.assertEqual(state.terminals[operation.slot], operation)
+            self.assertEqual(backend.mock_calls, [])
+
+    def test_restart_checkpoint_precedes_adopted_finished(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend()
+            def probe(_operation, *, on_restart, on_running):
+                on_restart(5)
+                on_restart(6)
+                with provider.lock_writable_journal(journal):
+                    active = provider.load_writable_journal_state(journal).active
+                    self.assertEqual((active.system_restart, active.session_restart), ("security-system", "security-session"))
+                    self.assertEqual(active.state, "pending")
+                return provider.RecoveryEvidence(False, "succeeded", restart_types=(5, 6), terminal_monotonic=100)
+            backend.probe_operation.side_effect = probe
+            state, _, _ = self.recover(journal, backend)
+            terminal = state.terminals[operation.slot]
+            self.assertEqual((terminal.system_restart, terminal.session_restart, terminal.terminal_monotonic),
+                             ("security-system", "security-session", 100))
+            backend.operation_history.assert_not_called()
+
+    def test_persistence_failure_never_consumes_a_later_success(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend()
+            def probe(_operation, *, on_restart, on_running):
+                with mock.patch.object(provider, "commit_writable_journal_path", side_effect=provider.JournalFileError("Fault")):
+                    on_restart(6)
+                self.fail("A persistence failure must stop recovered success")
+            backend.probe_operation.side_effect = probe
+            with self.assertRaises(provider.JournalFileError):
+                self.recover(journal, backend)
+            with provider.lock_writable_journal(journal):
+                state = provider.load_writable_journal_state(journal)
+            self.assertEqual(state.active, operation)
+            self.assertIsNone(state.handoff)
+
+    def test_partial_restart_adoption_cannot_prove_no_reboot(self):
+        for signals, session, application in (((1,), "none", False),
+                ((2,), "none", True), ((3,), "session", False),
+                ((5, 2), "security-session", True)):
+            with self.subTest(signals=signals), self.journal() as journal:
+                operation = self.begin(journal, state="running")
+                backend = self.backend(provider.RecoveryEvidence(False, "succeeded",
+                    restart_types=signals, status=3, terminal_monotonic=100))
+                state, _, _ = self.recover(journal, backend)
+                terminal = state.terminals[operation.slot]
+                self.assertEqual((terminal.system_restart, terminal.session_restart,
+                                  terminal.application_restart), ("unknown", session, application))
+                self.assertEqual((state.restart.system, state.restart.session,
+                                  state.restart.application), ("unknown", session, application))
+
+    def test_stale_probe_never_terminalizes_replacement_owner(self):
+        with self.journal() as journal:
+            self.begin(journal, "refresh")
+            replacement = None
+            backend = self.backend()
+            def probe(operation, **_kwargs):
+                nonlocal replacement
+                with provider.lock_writable_journal(journal):
+                    terminal = replace(operation, state="interrupted", finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100)
+                    provider.advance_journal_operation(journal, operation, terminal)
+                    provider.complete_journal_terminal(journal)
+                    provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                    replacement = provider.begin_journal_operation(journal, "updates-refresh", "2026-09-05T00:02:00Z", "New owner", transaction_path="/2_new", boot_id=self.boot_id)
+                return provider.RecoveryEvidence(False, "succeeded", terminal_monotonic=200)
+            backend.probe_operation.side_effect = probe
+            state, evidence, failure = self.recover(journal, backend)
+            self.assertEqual(state.active, replacement)
+            self.assertIsNone(evidence)
+            self.assertIsNone(failure)
+
+    def test_history_uncertainty_retains_lower_scopes_and_boot_change_clears_all(self):
+        for new_boot in (self.boot_id, "11111111-2222-3333-4444-555555555555"):
+            with self.subTest(boot=new_boot), self.journal() as journal:
+                operation = self.begin(journal, system_restart="security-system", session_restart="security-session", application_restart=True)
+                backend = self.backend(history=((operation.transaction_path, True, 22, os.getuid()),))
+                state, _, _ = self.recover(journal, backend, boot_id=new_boot)
+                terminal = state.terminals[operation.slot]
+                expected = ("unknown", "security-session", True) if new_boot == self.boot_id else ("none", "none", False)
+                self.assertEqual((terminal.system_restart, terminal.session_restart, terminal.application_restart), expected)
+                self.assertEqual((state.restart.system, state.restart.session, state.restart.application), expected)
+
+    def test_adoption_denial_or_proven_authorization_cancel_is_all_clear(self):
+        for result in ("permission-denied", "canceled"):
+            with self.subTest(result=result), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(provider.RecoveryEvidence(False, result, provider.SnapshotFailure(result, "Stopped"), status=31, terminal_monotonic=100))
+                state, _, _ = self.recover(journal, backend)
+                self.assertEqual((state.terminals[operation.slot].state, state.restart.system), (result, "none"))
+
+    def test_no_replay_replaces_system_evidence_but_partial_replay_merges_it(self):
+        for signals, expected in (((), "unknown"), ((2,), "security-system")):
+            with self.subTest(signals=signals), self.journal() as journal:
+                operation = self.begin(journal, state="running", system_restart="security-system")
+                backend = self.backend(provider.RecoveryEvidence(False, "succeeded",
+                    restart_types=signals, status=3, terminal_monotonic=100))
+                state, _, _ = self.recover(journal, backend)
+                self.assertEqual(state.terminals[operation.slot].system_restart, expected)
+                self.assertEqual(state.restart.system, expected)
+
+    def test_new_boot_prunes_old_cutoffs_before_recovered_terminal_commit(self):
+        with self.journal() as journal:
+            first = self.begin(journal, state="running", system_restart="system")
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, first, replace(first, state="succeeded",
+                    finished_at="2026-09-05T00:01:00Z", terminal_monotonic=1000000))
+                provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                provider.acknowledge_journal_handoff(journal, first.operation_id)
+            operation = self.begin(journal)
+            backend = self.backend(history=((operation.transaction_path, True, 22, os.getuid()),))
+            with mock.patch.object(provider.time, "monotonic_ns", return_value=200000):
+                state, _, _ = self.recover(journal, backend, boot_id="11111111-2222-3333-4444-555555555555")
+            self.assertEqual(state.terminals[operation.slot].terminal_monotonic, 200)
+            self.assertEqual(state.restart.system, "none")
+            self.assertEqual(state.terminals[first.slot].terminal_monotonic, 1000000)
+
+    def test_denial_with_running_or_unknown_adopted_status_retains_uncertainty(self):
+        for status, expected in ((0, "permission-denied"), (3, "failed")):
+            with self.subTest(status=status), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(provider.RecoveryEvidence(False, "permission-denied",
+                    provider.SnapshotFailure("permission-denied", "Denied"), status=status, terminal_monotonic=100))
+                state, _, _ = self.recover(journal, backend)
+                self.assertEqual((state.terminals[operation.slot].state, state.restart.system), (expected, "unknown"))
+
+    def test_observed_running_is_durable_before_a_later_recovery_attempt(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend()
+            def probe(_operation, *, on_restart, on_running):
+                on_running()
+                with provider.lock_writable_journal(journal):
+                    self.assertEqual(provider.load_writable_journal_state(journal).active.state, "running")
+                return provider.RecoveryEvidence(True, status=3)
+            backend.probe_operation.side_effect = probe
+            state, _, _ = self.recover(journal, backend)
+            self.assertEqual(state.active.state, "running")
+            backend = self.backend(provider.RecoveryEvidence(False, "canceled", status=31, terminal_monotonic=100))
+            state, _, _ = self.recover(journal, backend)
+            self.assertEqual((state.terminals[operation.slot].state, state.restart.system), ("canceled", "unknown"))
+
+    def test_recovery_override_cannot_weaken_arbitrary_contributions(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, system_restart="system", session_restart="session", application_restart=True)
+            for changes in ({"system_restart": "none"}, {"system_restart": "unknown", "session_restart": "none"},
+                            {"system_restart": "unknown", "application_restart": False}):
+                with self.subTest(changes=changes), provider.lock_writable_journal(journal):
+                    terminal = replace(operation, state="failed", error_code="internal",
+                        finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100, **changes)
+                    with self.assertRaises(provider.JournalAdmissionError):
+                        provider.advance_journal_operation(journal, operation, terminal, recovery_boot_id=self.boot_id)
+                    self.assertEqual(provider.load_writable_journal_state(journal).active, operation)
+
+    def test_active_list_and_history_identity_bounds(self):
+        self.assertEqual(provider.validate_transaction_list(["/1_test"]), ("/1_test",))
+        for values in (["/1_test"] * 2, [f"/{index}_test" for index in range(257)], ["/wrong/path"], None, "x"):
+            with self.subTest(values=str(values)[:40]), self.assertRaises(provider.SnapshotFailure):
+                provider.validate_transaction_list(values)
+        row = ("/1_test", "2026-09-05T00:00:00Z", True, 22, 10, "ignored package data", os.getuid(), "ignored command")
+        self.assertEqual(provider.validate_history_record(row), ("/1_test", True, 22, os.getuid()))
+        for index, value in ((0, "/wrong"), (2, 1), (3, True), (4, -1), (6, 1 << 32)):
+            malformed = list(row)
+            malformed[index] = value
+            with self.subTest(index=index), self.assertRaises(provider.SnapshotFailure):
+                provider.validate_history_record(malformed)
+        exact = ("/1_test", True, 22, os.getuid())
+        for records in ((exact, exact), (("/1_test", True, 13, os.getuid()),), (("/1_test", True, 22, os.getuid() + 1),)):
+            with self.subTest(records=records), self.assertRaises(provider.SnapshotFailure):
+                provider.match_update_history(records, "/1_test", os.getuid())
+
+
+class RecoveryAdapterTests(unittest.TestCase):
+    boot_id = PackageKitExecutionTests.boot_id
+    package_id = PackageKitExecutionTests.package_id
+    journal = PackageKitExecutionTests.journal
+    begin = OperationRecoveryTests.begin
+
+    def backend(self, journal):
+        backend = PackageKitExecutionTests.backend(self, journal, [])
+        backend.GLib.Variant = SessionEvidenceTests.Variant
+        return backend
+
+    def emit(self, backend, signal, signature, values, interface=None):
+        interface = interface or provider.TRANSACTION_INTERFACE
+        for args in tuple(backend.connection.subscriptions.values()):
+            if args[1] == interface:
+                args[-2](backend.connection, args[0], args[3], interface, signal,
+                         SessionEvidenceTests.Variant(signature, values), None)
+
+    def properties(self, **changes):
+        return {"Role": 22, "Uid": os.getuid(), "Status": 3, "AllowCancel": True, "Percentage": 45, **changes}
+
+    def test_probe_uses_exact_object_and_shared_deadline_without_cancellation(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            backend._recovery_call = mock.Mock(side_effect=[SessionEvidenceTests.Variant("(a{sv})", (self.properties(),)),
+                                                          SessionEvidenceTests.Variant("(ao)", ([operation.transaction_path],))])
+            result = backend.probe_operation(operation)
+            first, second = backend._recovery_call.call_args_list
+            self.assertEqual(first.args[:3], (operation.transaction_path, provider.PROPERTIES_INTERFACE, "GetAll"))
+            self.assertEqual(second.args[:3], (provider.PACKAGEKIT_PATH, provider.PACKAGEKIT_INTERFACE, "GetTransactionList"))
+            self.assertEqual(first.args[4], second.args[4])
+            self.assertEqual((result.present, result.status, result.allow_cancel, result.percent), (True, 3, True, 45))
+            self.assertEqual(backend.connection.calls, [])
+            self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_exact_unknown_object_and_empty_list_prove_absence(self):
+        for error in ("UnknownObject", "UnknownMethod"):
+            for listed in ([], ["/1_test"]):
+                with self.subTest(error=error, listed=listed), self.journal() as journal:
+                    operation = self.begin(journal)
+                    backend = self.backend(journal)
+                    failure = provider.SnapshotFailure("missing-provider", "Absent object")
+                    failure.__cause__ = backend.GLib.Error(error)
+                    backend._recovery_call = mock.Mock(side_effect=[failure, SessionEvidenceTests.Variant("(ao)", (listed,))])
+                    self.assertEqual(backend.probe_operation(operation).present, bool(listed))
+
+    def test_adapter_checkpoints_running_before_consuming_finished(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            checkpointed = []
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(),))
+                self.assertEqual(checkpointed, ["running"])
+                self.emit(backend, "Finished", "(uu)", (1, 1))
+                return SessionEvidenceTests.Variant("(ao)", ([],))
+            backend._recovery_call = mock.Mock(side_effect=request)
+            self.assertEqual(backend.probe_operation(operation, on_running=lambda: checkpointed.append("running")).state, "succeeded")
+
+    def test_destroy_cannot_be_overwritten_by_an_inflight_snapshot(self):
+        for stage in ("GetAll", "GetTransactionList"):
+            for listed in ([], ["/1_test"]):
+                with self.subTest(stage=stage, listed=listed), self.journal() as journal:
+                    operation = self.begin(journal, "refresh")
+                    backend = self.backend(journal)
+                    def request(_path, _interface, method, *_args):
+                        if method == stage:
+                            self.emit(backend, "Destroy", "()", ())
+                        if method == "GetAll":
+                            return SessionEvidenceTests.Variant("(a{sv})", (self.properties(Role=13),))
+                        return SessionEvidenceTests.Variant("(ao)", (listed,))
+                    backend._recovery_call = mock.Mock(side_effect=request)
+                    evidence = backend.probe_operation(operation)
+                    self.assertFalse(evidence.present)
+                    self.assertFalse(evidence.allow_cancel)
+                    state, _, _ = provider.recover_journal_active(journal, backend, boot_id=self.boot_id)
+                    self.assertEqual(state.terminals[operation.slot].state, "interrupted")
+
+    def test_destroy_requires_valid_signature_and_verified_identity(self):
+        for fault in ("signature", "identity"):
+            with self.subTest(fault=fault), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(journal)
+                def request(_path, _interface, method, *_args):
+                    if method == "GetAll":
+                        self.emit(backend, "Destroy", "(s)" if fault == "signature" else "()",
+                            ("invalid",) if fault == "signature" else ())
+                        if fault == "identity":
+                            failure = provider.SnapshotFailure("missing-provider", "No object identity")
+                            failure.__cause__ = backend.GLib.Error("UnknownObject")
+                            raise failure
+                        return SessionEvidenceTests.Variant("(a{sv})", (self.properties(),))
+                    return SessionEvidenceTests.Variant("(ao)", ([operation.transaction_path],))
+                backend._recovery_call = mock.Mock(side_effect=request)
+                if fault == "signature":
+                    with self.assertRaises(provider.SnapshotFailure) as raised:
+                        backend.probe_operation(operation)
+                    self.assertEqual(raised.exception.code, "malformed")
+                else:
+                    self.assertTrue(backend.probe_operation(operation).present)
+
+    def test_malformed_list_or_owner_never_becomes_absence(self):
+        for properties, listed in ((self.properties(Uid=os.getuid() + 1), []),
+                                   (self.properties(Role=13), []),
+                                   (self.properties(), ["/1_test", "/1_test"])):
+            with self.subTest(properties=properties, listed=listed), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(journal)
+                backend._recovery_call = mock.Mock(side_effect=[SessionEvidenceTests.Variant("(a{sv})", (properties,)),
+                                                              SessionEvidenceTests.Variant("(ao)", (listed,))])
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    backend.probe_operation(operation)
+                self.assertEqual(raised.exception.code, "malformed")
+                self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_terminal_evidence_does_not_depend_on_secondary_list(self):
+        for kind in ("refresh", "update"):
+            for result, expected in ((1, "succeeded"), (2, "failed")):
+                for stage in ("before-list", "timeout", "malformed", "invalid-list"):
+                    with self.subTest(kind=kind, result=result, stage=stage), self.journal() as journal:
+                        operation = self.begin(journal, kind)
+                        backend = self.backend(journal)
+                        def request(_path, _interface, method, *_args):
+                            if method == "GetAll":
+                                if stage == "before-list":
+                                    self.emit(backend, "Finished", "(uu)", (result, 1))
+                                return SessionEvidenceTests.Variant("(a{sv})", (self.properties(Role=13 if kind == "refresh" else 22),))
+                            self.assertNotEqual(stage, "before-list")
+                            self.emit(backend, "Finished", "(uu)", (result, 1))
+                            if stage == "invalid-list":
+                                return SessionEvidenceTests.Variant("(ao)", (["/1_duplicate", "/1_duplicate"],))
+                            raise provider.SnapshotFailure(stage, "Secondary lookup failed")
+                        backend._recovery_call = mock.Mock(side_effect=request)
+                        evidence = backend.probe_operation(operation)
+                        self.assertEqual(evidence.state, expected)
+                        self.assertIsInstance(evidence.terminal_monotonic, int)
+                        self.assertEqual(backend._recovery_call.call_count, 1 if stage == "before-list" else 2)
+                        self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_terminal_evidence_does_not_override_wrong_owner_or_duplicate_finish(self):
+        for fault in ("owner", "duplicate"):
+            with self.subTest(fault=fault), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(journal)
+                def request(*_args):
+                    self.emit(backend, "Finished", "(uu)", (1, 1))
+                    if fault == "duplicate":
+                        self.emit(backend, "Finished", "(uu)", (1, 1))
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(Uid=os.getuid() + (fault == "owner")),))
+                backend._recovery_call = mock.Mock(side_effect=request)
+                with self.assertRaises(provider.SnapshotFailure) as raised:
+                    backend.probe_operation(operation)
+                self.assertEqual(raised.exception.code, "malformed")
+
+    def test_unverified_object_cannot_checkpoint_buffered_signals(self):
+        for fault in ("uid", "role", "absent", "service", "signal", "valid"):
+            with self.subTest(fault=fault), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.backend(journal)
+                checkpoints = []
+                def request(_path, _interface, method, *_args):
+                    if method == "GetAll":
+                        if fault == "service":
+                            self.emit(backend, "NameOwnerChanged", "(sss)",
+                                (provider.PACKAGEKIT_NAME, ":1.2", ":1.3"), "org.freedesktop.DBus")
+                        elif fault == "signal":
+                            self.emit(backend, "RequireRestart", "(s)", ("invalid",))
+                        self.emit(backend, "PropertiesChanged", "(sa{sv}as)",
+                            (provider.TRANSACTION_INTERFACE, {"Status": 3}, []), provider.PROPERTIES_INTERFACE)
+                        self.emit(backend, "RequireRestart", "(us)", (6, self.package_id))
+                        self.emit(backend, "Finished", "(uu)", (1, 1))
+                        self.assertEqual(checkpoints, [])
+                        if fault == "absent":
+                            failure = provider.SnapshotFailure("missing-provider", "Absent object")
+                            failure.__cause__ = backend.GLib.Error("UnknownObject")
+                            raise failure
+                        return SessionEvidenceTests.Variant("(a{sv})", (self.properties(
+                            Uid=os.getuid() + (fault == "uid"), Role=13 if fault == "role" else 22),))
+                    self.emit(backend, "RequireRestart", "(us)", (4, self.package_id))
+                    self.emit(backend, "Finished", "(uu)", (1, 1))
+                    return SessionEvidenceTests.Variant("(ao)", ([],))
+                backend._recovery_call = mock.Mock(side_effect=request)
+                def probe():
+                    return backend.probe_operation(operation,
+                        on_running=lambda: checkpoints.append("running"),
+                        on_restart=lambda value: checkpoints.append(value))
+                if fault in {"uid", "role", "service", "signal"}:
+                    with self.assertRaises(provider.SnapshotFailure) as raised:
+                        probe()
+                    self.assertEqual(raised.exception.code, "missing-provider" if fault == "service" else "malformed")
+                else:
+                    evidence = probe()
+                    self.assertEqual(evidence.state, "succeeded" if fault == "valid" else None)
+                    self.assertEqual(evidence.restart_types, (6,) if fault == "valid" else ())
+                    if fault == "absent":
+                        self.assertEqual((evidence.status, evidence.allow_cancel, evidence.percent), (0, False, None))
+                self.assertEqual(checkpoints, ["running", 6] if fault == "valid" else [])
+                self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_probe_checkpoints_restart_before_finished_and_discards_late_signal(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            checkpointed = []
+            saved = []
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(),))
+                saved.extend(backend.connection.subscriptions.values())
+                self.emit(backend, "RequireRestart", "(us)", (6, self.package_id))
+                self.assertEqual(checkpointed, [6])
+                self.emit(backend, "Finished", "(uu)", (1, 1))
+                return SessionEvidenceTests.Variant("(ao)", ([],))
+            backend._recovery_call = mock.Mock(side_effect=request)
+            result = backend.probe_operation(operation, on_restart=checkpointed.append)
+            self.assertEqual((result.state, result.restart_types), ("succeeded", (6,)))
+            self.assertIsInstance(result.terminal_monotonic, int)
+            args = saved[0]
+            args[-2](backend.connection, args[0], args[3], args[1], "RequireRestart", SessionEvidenceTests.Variant("(us)", (4, self.package_id)), None)
+            self.assertEqual(checkpointed, [6])
+
+    def test_checkpoint_fault_suppresses_later_finished(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            def request(*_args):
+                self.emit(backend, "RequireRestart", "(us)", (6, self.package_id))
+                self.emit(backend, "Finished", "(uu)", (1, 1))
+                return SessionEvidenceTests.Variant("(a{sv})", (self.properties(),))
+            backend._recovery_call = mock.Mock(side_effect=request)
+            fault = provider.JournalFileError("Persistence fault")
+            with self.assertRaises(provider.JournalFileError) as raised:
+                backend.probe_operation(operation, on_restart=mock.Mock(side_effect=fault))
+            self.assertIs(raised.exception, fault)
+            self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_invalidated_status_and_cancel_permission_are_not_reused(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(Status=31),))
+                self.emit(backend, "PropertiesChanged", "(sa{sv}as)", (provider.TRANSACTION_INTERFACE, {}, ["Status", "AllowCancel"]), provider.PROPERTIES_INTERFACE)
+                self.emit(backend, "Finished", "(uu)", (3, 1))
+                return SessionEvidenceTests.Variant("(ao)", ([],))
+            backend._recovery_call = mock.Mock(side_effect=request)
+            result = backend.probe_operation(operation)
+            self.assertEqual((result.state, result.status, result.allow_cancel), ("canceled", 0, False))
+
+    def test_probe_timeout_detaches_without_canceling_recorded_transaction(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            backend._recovery_call = mock.Mock(side_effect=provider.SnapshotFailure("timeout", "Expired"))
+            with self.assertRaises(provider.SnapshotFailure):
+                backend.probe_operation(operation)
+            self.assertEqual(backend.connection.subscriptions, {})
+            self.assertEqual(backend.connection.calls, [])
+
+    def test_native_error_names_are_independent_of_message_text(self):
+        with self.journal() as journal:
+            backend = self.backend(journal)
+            cases = (("NoReply", "timeout"), ("Timeout", "timeout"), ("TimedOut", "timeout"),
+                     ("ServiceUnknown", "missing-provider"), ("NameHasNoOwner", "missing-provider"),
+                     ("UnknownObject", "missing-provider"), ("AccessDenied", "permission-denied"),
+                     ("AuthFailed", "permission-denied"), ("UnknownMethod", "unsupported"),
+                     ("UnknownInterface", "unsupported"), ("InvalidArgs", "malformed"),
+                     ("InvalidSignature", "malformed"), ("Failed", "internal"))
+            for name, expected in cases:
+                with self.subTest(name=name):
+                    backend.Gio.dbus_error_get_remote_error = mock.Mock(return_value="org.freedesktop.DBus.Error." + name)
+                    self.assertEqual(backend._dbus_failure(backend.GLib.Error("Opaque remote message")).code, expected)
+            backend.Gio.dbus_error_get_remote_error = mock.Mock(return_value="org.example.Unlisted")
+            self.assertEqual(backend._dbus_failure(backend.GLib.Error("NoReply Timeout AccessDenied")).code, "internal")
+            backend.Gio.dbus_error_get_remote_error = mock.Mock(return_value="org.freedesktop.PackageKit.Transaction.RefusedByPolicy")
+            self.assertEqual(backend._dbus_failure(backend.GLib.Error("Opaque policy denial")).code, "permission-denied")
+            backend.Gio.dbus_error_get_remote_error = mock.Mock(return_value=None)
+            backend.Gio.io_error_quark = lambda: 42
+            backend.Gio.IOErrorEnum = types.SimpleNamespace(TIMED_OUT=24)
+            local = mock.Mock(matches=lambda domain, code: (domain, code) == (42, 24))
+            self.assertEqual(backend._dbus_failure(local).code, "timeout")
+
+    def test_no_reply_before_deadline_can_use_exact_update_history(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            backend.Gio.dbus_error_get_remote_error = mock.Mock(return_value="org.freedesktop.DBus.Error.NoReply")
+            backend.operation_history = mock.Mock(return_value=((operation.transaction_path, True, 22, os.getuid()),))
+            def request(*_args):
+                error = backend.GLib.Error("Opaque connection loss")
+                raise backend._dbus_failure(error) from error
+            backend._recovery_call = mock.Mock(side_effect=request)
+            state, evidence, failure = provider.recover_journal_active(journal, backend, boot_id=self.boot_id)
+            self.assertIsNone(state.active)
+            self.assertIsNone(evidence)
+            self.assertEqual((state.terminals[operation.slot].state, state.restart.system), ("succeeded", "unknown"))
+            self.assertEqual(failure.code, "timeout")
+            backend.operation_history.assert_called_once_with()
+
+    def test_service_owner_change_invalidates_bounded_probe(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            checkpoint = mock.Mock()
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(),))
+                self.emit(backend, "NameOwnerChanged", "(sss)", (provider.PACKAGEKIT_NAME, ":1.2", ":1.3"), "org.freedesktop.DBus")
+                self.emit(backend, "RequireRestart", "(us)", (6, self.package_id))
+                return SessionEvidenceTests.Variant("(ao)", ([],))
+            backend._recovery_call = mock.Mock(side_effect=request)
+            with self.assertRaises(provider.SnapshotFailure) as raised:
+                backend.probe_operation(operation, on_restart=checkpoint)
+            self.assertEqual(raised.exception.code, "missing-provider")
+            checkpoint.assert_not_called()
+            self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_history_timeout_grace_does_not_accept_late_success(self):
+        with self.journal() as journal:
+            backend = self.backend(journal)
+            backend._recovery_call = mock.Mock(side_effect=[SessionEvidenceTests.Variant("(o)", ("/2_history",)),
+                provider.SnapshotFailure("timeout", "Expired")])
+            def grace(path, _loop, finished):
+                self.assertEqual(path, "/2_history")
+                self.emit(backend, "Transaction", "(osbuusus)", ("/1_test", "2026-09-05T00:00:00Z", True, 22, 1, "ignored", os.getuid(), "ignored"))
+                self.emit(backend, "Finished", "(uu)", (1, 1))
+                self.assertTrue(finished())
+            backend._cancel_with_grace = mock.Mock(side_effect=grace)
+            with self.assertRaises(provider.SnapshotFailure) as raised:
+                backend.operation_history()
+            self.assertEqual(raised.exception.code, "timeout")
+            self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_history_uses_fixed_limit_discards_payload_and_rejects_overflow(self):
+        for count in (1, 65):
+            with self.subTest(count=count), self.journal() as journal:
+                backend = self.backend(journal)
+                backend._cancel_with_grace = mock.Mock()
+                def request(_path, _interface, method, parameters, *_args):
+                    if method == "CreateTransaction":
+                        return SessionEvidenceTests.Variant("(o)", ("/2_history",))
+                    self.assertEqual(method, "GetOldTransactions")
+                    self.assertEqual(parameters.unpack(), (64,))
+                    for index in range(count):
+                        self.emit(backend, "Transaction", "(osbuusus)", (f"/{index}_old", "2026-09-05T00:00:00Z", True, 22, 1, "ignored", os.getuid(), "ignored"))
+                    if count == 1:
+                        self.emit(backend, "Finished", "(uu)", (1, 1))
+                    return SessionEvidenceTests.Variant("()", ())
+                backend._recovery_call = mock.Mock(side_effect=request)
+                if count == 1:
+                    self.assertEqual(backend.operation_history(), (("/0_old", True, 22, os.getuid()),))
+                    backend._cancel_with_grace.assert_not_called()
+                else:
+                    with self.assertRaises(provider.SnapshotFailure) as raised:
+                        backend.operation_history()
+                    self.assertEqual(raised.exception.code, "malformed")
+                    self.assertEqual(backend._cancel_with_grace.call_args.args[0], "/2_history")
+                self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_local_recovery_request_deadline_cancels_and_ignores_late_reply(self):
+        for expired, signature in ((False, "(ao)"), (True, "(ao)"), (False, "(as)")):
+            with self.subTest(expired=expired, signature=signature):
+                backend = provider.PackageKitBackend.__new__(provider.PackageKitBackend)
+                state = {}
+                class Loop:
+                    def run(self):
+                        if expired:
+                            state["timer"]()
+                        else:
+                            state["reply"](backend.connection, object(), None)
+                    def quit(self):
+                        pass
+                def timer(_delay, callback):
+                    state["timer"] = callback
+                    return 1
+                backend.GLib = types.SimpleNamespace(MainLoop=Loop, Error=RuntimeError, SOURCE_REMOVE=False,
+                    VariantType=types.SimpleNamespace(new=lambda value: value), timeout_add=timer, source_remove=mock.Mock())
+                cancellation = mock.Mock()
+                backend.Gio = types.SimpleNamespace(Cancellable=lambda: cancellation, DBusCallFlags=types.SimpleNamespace(NONE=0))
+                backend.connection = mock.Mock()
+                backend.connection.call.side_effect = lambda *args: state.update(reply=args[-2])
+                backend.connection.call_finish.return_value = SessionEvidenceTests.Variant(signature, ([],))
+                with mock.patch.object(provider.time, "monotonic", return_value=100):
+                    if expired or signature != "(ao)":
+                        with self.assertRaises(provider.SnapshotFailure) as raised:
+                            backend._recovery_call(provider.PACKAGEKIT_PATH, provider.PACKAGEKIT_INTERFACE, "GetTransactionList", None, 110, "(ao)")
+                        self.assertEqual(raised.exception.code, "timeout" if expired else "malformed")
+                    else:
+                        self.assertEqual(backend._recovery_call(provider.PACKAGEKIT_PATH, provider.PACKAGEKIT_INTERFACE, "GetTransactionList", None, 110, "(ao)").unpack(), ([],))
+                cancellation.cancel.assert_called_once_with()
+                before = backend.connection.call_finish.call_count
+                state["reply"](backend.connection, object(), None)
+                self.assertEqual(backend.connection.call_finish.call_count, before)
+
+
+class OperationWatchTests(unittest.TestCase):
+    """Live fixtures use the real adapter but never invoke a package action."""
+    boot_id = PackageKitExecutionTests.boot_id
+    package_id = PackageKitExecutionTests.package_id
+    journal = PackageKitExecutionTests.journal
+    begin = OperationRecoveryTests.begin
+    backend = RecoveryAdapterTests.backend
+    emit = RecoveryAdapterTests.emit
+    properties = RecoveryAdapterTests.properties
+
+    def live_backend(self, journal, events, **properties):
+        backend = self.backend(journal)
+        backend.session_started = mock.Mock(return_value=None)
+        backend._recovery_call = mock.Mock(side_effect=lambda _path, _interface, method, *_args:
+            SessionEvidenceTests.Variant("(a{sv})", (self.properties(**properties),)) if method == "GetAll"
+            else SessionEvidenceTests.Variant("(ao)", (["/1_test"],)))
+        test = self
+
+        class Loop:
+            stopped = False
+
+            def quit(self):
+                self.stopped = True
+
+            def run(self):
+                for event in events:
+                    test.assertFalse(journal._exclusive)
+                    if self.stopped:
+                        break
+                    event(backend)
+                test.assertTrue(self.stopped, "watch did not terminate from exact evidence")
+
+        backend.GLib.MainLoop = Loop
+        return backend
+
+    def progress(self, backend, **values):
+        self.emit(backend, "PropertiesChanged", "(sa{sv}as)",
+            (provider.TRANSACTION_INTERFACE, values, []), provider.PROPERTIES_INTERFACE)
+
+    def test_live_watch_keeps_subscriptions_and_commits_before_terminal_output(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            chunks = []
+            backend = self.live_backend(journal, [lambda bus: self.progress(bus, Status=3, AllowCancel=True, Percentage=42),
+                lambda bus: self.emit(bus, "RequireRestart", "(us)", (6, self.package_id)),
+                lambda bus: self.emit(bus, "Finished", "(uu)", (1, 1))], Status=31)
+
+            def write(chunk):
+                if "complete\toperation" in chunk:
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertIsNone(state.active)
+                    self.assertEqual(state.handoff.operation_id, operation.operation_id)
+                chunks.append(chunk)
+
+            provider.watch_journal_operation(journal, operation.operation_id, write,
+                boot_id=self.boot_id, backend_factory=lambda: backend)
+            output = "".join(chunks)
+            for value in ("\tauthorizing\t", "\trunning\t", "\t42\tyes\t", "\tsucceeded\t", "comparison is unavailable"):
+                self.assertIn(value, output)
+            self.assertEqual(backend.connection.calls, [])
+            self.assertEqual([call.args[2] for call in backend._recovery_call.call_args_list], ["GetAll", "GetTransactionList"])
+            self.assertEqual(backend.connection.subscriptions, {})
+            self.assertIsNone(backend.connection.closed_callback)
+            self.assertEqual(provider.load_journal_state(journal.chain).restart.system, "security-system")
+
+    def test_watch_has_no_silence_deadline_after_verified_adoption(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            clock = [100]
+            def later(bus):
+                clock[0] = 100000
+                self.progress(bus, Status=3)
+                self.emit(bus, "Finished", "(uu)", (1, 1))
+            backend = self.live_backend(journal, [later])
+            with mock.patch.object(provider.time, "monotonic", side_effect=lambda: clock[0]):
+                result = backend.probe_operation(operation, watch=True)
+            self.assertEqual(result.state, "succeeded")
+            self.assertEqual(backend.connection.calls, [])
+
+    def test_logind_lookup_follows_terminal_observation_and_precedes_commit(self):
+        for kind in ("refresh", "update"):
+            with self.subTest(kind=kind), self.journal() as journal:
+                operation = self.begin(journal, kind)
+                finished = []
+                def finish(bus):
+                    finished.append(True)
+                    self.emit(bus, "Finished", "(uu)", (1, 1))
+                    self.emit(bus, "Destroy", "()", ())
+                backend = self.live_backend(journal, [finish], Role=13 if kind == "refresh" else 22)
+                def session():
+                    self.assertEqual(finished, [True])
+                    self.assertFalse(journal._exclusive)
+                    self.assertIsNotNone(provider.load_journal_state(journal.chain).active)
+                    return None
+                backend.session_started.side_effect = session
+                chunks = []
+                provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                    boot_id=self.boot_id, backend_factory=lambda: backend)
+                backend.session_started.assert_called_once_with()
+                self.assertIn("\tsucceeded\t", "".join(chunks))
+
+    def test_completion_during_backend_creation_replays_the_exact_retained_result(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = mock.Mock()
+            def attach():
+                with provider.lock_writable_journal(journal):
+                    running = provider.advance_journal_operation(journal, operation,
+                        replace(operation, state="running"))
+                    provider.advance_journal_operation(journal, running, replace(running,
+                        state="succeeded", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=10))
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                return backend
+            chunks = []
+            provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                boot_id=self.boot_id, backend_factory=attach)
+            backend.probe_operation.assert_not_called()
+            backend.operation_history.assert_not_called()
+            backend.session_started.assert_not_called()
+            output = "".join(chunks).splitlines()
+            self.assertEqual(rows(output, "operation")[-1][1:5],
+                [operation.operation_id, operation.action_id, "update", "succeeded"])
+            self.assertEqual(output[-1], "complete\toperation")
+            self.assertEqual(provider.load_journal_state(journal.chain).handoff.operation_id, operation.operation_id)
+
+    def test_property_deltas_during_getall_override_its_stale_snapshot(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.live_backend(journal, [lambda bus: self.emit(bus, "Finished", "(uu)", (3, 0))])
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    self.progress(backend, Status=31, AllowCancel=True, Percentage=27)
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(Status=1, AllowCancel=False, Percentage=0),))
+                return SessionEvidenceTests.Variant("(ao)", ([operation.transaction_path],))
+            backend._recovery_call.side_effect = request
+            chunks = []
+            provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                boot_id=self.boot_id, backend_factory=lambda: backend)
+            self.assertIn("\tauthorizing\t27\tyes\t", "".join(chunks))
+
+    def test_unrelated_and_unchanged_signals_do_not_reload_the_journal(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            def noise(bus):
+                with mock.patch.object(provider, "load_writable_journal_state", side_effect=AssertionError("Noise reloaded journal")):
+                    for _ in range(100):
+                        self.emit(bus, "Package", "(uss)", (12, self.package_id, "Package"))
+                        self.emit(bus, "Packages", "(a(uss))", ([(12, self.package_id, "Package")],))
+                        self.progress(bus, Percentage=45, AllowCancel=True, Status=3)
+                        self.progress(bus, Speed=100)
+            backend = self.live_backend(journal, [noise, lambda bus: self.emit(bus, "Finished", "(uu)", (1, 0))])
+            chunks = []
+            provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                boot_id=self.boot_id, backend_factory=lambda: backend)
+            self.assertEqual("".join(chunks).splitlines()[-1], "complete\toperation")
+
+    def test_watch_uses_new_live_cancelability_not_stale_initial_false(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            progress = []
+            backend = self.live_backend(journal, [lambda bus: self.progress(bus, AllowCancel=True),
+                lambda bus: self.progress(bus, AllowCancel=False),
+                lambda bus: self.emit(bus, "Finished", "(uu)", (1, 1))], AllowCancel=False)
+            backend.probe_operation(operation, watch=True, on_progress=progress.append)
+            self.assertIn(True, [item.allow_cancel for item in progress])
+            self.assertFalse(progress[-1].allow_cancel)
+
+    def test_authorizing_watch_emits_cancelability_loss_without_claiming_running(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.live_backend(journal, [lambda bus: self.progress(bus, AllowCancel=False),
+                lambda bus: self.emit(bus, "Finished", "(uu)", (3, 0))], Status=31)
+            chunks = []
+            provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                boot_id=self.boot_id, backend_factory=lambda: backend)
+            operation_rows = rows("".join(chunks).splitlines(), "operation")
+            authorizing = [row for row in operation_rows if row[4] == "authorizing"]
+            self.assertEqual([row[6] for row in authorizing], ["yes", "no"])
+            self.assertNotIn("running", [row[4] for row in operation_rows])
+            self.assertEqual(operation_rows[-1][4], "canceled")
+
+    def test_live_authorization_is_displayed_without_erasing_unknown_execution(self):
+        for initial in ("invalid", "missing"):
+            with self.subTest(initial=initial), self.journal() as journal:
+                operation = self.begin(journal)
+                backend = self.live_backend(journal, [lambda bus: self.progress(bus, Status=31),
+                    lambda bus: self.emit(bus, "Finished", "(uu)", (3, 0))], Status="invalid")
+                if initial == "missing":
+                    values = self.properties()
+                    del values["Status"]
+                    backend._recovery_call.side_effect = [SessionEvidenceTests.Variant("(a{sv})", (values,)),
+                        SessionEvidenceTests.Variant("(ao)", ([operation.transaction_path],))]
+                chunks = []
+                provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                    boot_id=self.boot_id, backend_factory=lambda: backend)
+                self.assertIn("\tauthorizing\t", "".join(chunks))
+                state = provider.load_journal_state(journal.chain)
+                self.assertEqual((state.terminals[operation.slot].state, state.restart.system), ("canceled", "unknown"))
+
+    def test_cancelability_change_during_active_list_is_not_latched_out(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.live_backend(journal, [lambda bus: self.emit(bus, "Finished", "(uu)", (1, 1))], AllowCancel=False)
+            def request(_path, _interface, method, *_args):
+                if method == "GetAll":
+                    return SessionEvidenceTests.Variant("(a{sv})", (self.properties(AllowCancel=False),))
+                self.progress(backend, AllowCancel=True)
+                return SessionEvidenceTests.Variant("(ao)", ([operation.transaction_path],))
+            backend._recovery_call.side_effect = request
+            progress = []
+            backend.probe_operation(operation, watch=True, on_progress=progress.append)
+            self.assertTrue(progress[-1].allow_cancel)
+
+    def test_watch_bus_loss_malformed_signal_or_output_failure_detaches_without_cancel(self):
+        for fault in ("bus", "malformed", "output"):
+            with self.subTest(fault=fault), self.journal() as journal:
+                operation = self.begin(journal)
+                def event(bus):
+                    if fault == "bus":
+                        bus.connection.closed_callback()
+                    elif fault == "malformed":
+                        self.emit(bus, "Destroy", "(s)", ("wrong",))
+                    else:
+                        self.progress(bus, Percentage=40)
+                backend = self.live_backend(journal, [event])
+                def progress(evidence):
+                    if evidence.percent == 40:
+                        raise BrokenPipeError("closed consumer")
+                with self.assertRaises((provider.SnapshotFailure, BrokenPipeError)):
+                    backend.probe_operation(operation, watch=True, on_progress=progress)
+                self.assertEqual(backend.connection.calls, [])
+                self.assertEqual(backend.connection.subscriptions, {})
+                self.assertIsNone(backend.connection.closed_callback)
+                self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_destroyed_watch_recovers_conservative_interruption(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            backend = self.live_backend(journal, [lambda bus: self.emit(bus, "Destroy", "()", ())], Role=13)
+            chunks = []
+            provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                boot_id=self.boot_id, backend_factory=lambda: backend)
+            self.assertIn("\tinterrupted\t", "".join(chunks))
+            self.assertIn("complete\toperation", "".join(chunks))
+
+    def test_terminalized_active_replays_and_acknowledges_without_backend(self):
+        for kind in ("update", "refresh", "timezone"):
+            with self.subTest(kind=kind), self.journal() as journal:
+                operation = self.begin(journal, kind)
+                terminal = replace(operation, state="failed", error_code="internal",
+                    finished_at="2026-09-05T00:01:00Z", detail="Fixture failure",
+                    terminal_monotonic=100 if kind in {"refresh", "update"} else None)
+                with provider.lock_writable_journal(journal):
+                    provider.advance_journal_operation(journal, operation, terminal)
+                chunks = []
+                backend = mock.Mock(side_effect=AssertionError("replay opened a service"))
+                provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                    boot_id=self.boot_id, backend_factory=backend)
+                backend.assert_not_called()
+                self.assertIn("complete\toperation", "".join(chunks))
+                with provider.lock_writable_journal(journal):
+                    provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                    self.assertEqual(provider.retained_journal_operation(journal, operation.operation_id), terminal)
+
+    def test_stale_id_emits_no_stream_for_packagekit_and_native_owners(self):
+        for kind in ("refresh", "timezone"):
+            with self.subTest(kind=kind), self.journal() as journal:
+                operation = self.begin(journal, kind)
+                requested = "op-" + "0" * 32
+                chunks = []
+                backend = mock.Mock()
+                with self.assertRaises(provider.JournalAdmissionError):
+                    provider.watch_journal_operation(journal, requested, chunks.append,
+                        boot_id=self.boot_id, backend_factory=backend)
+                self.assertEqual(chunks, [])
+                backend.assert_not_called()
+                self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_service_free_controls_retain_lower_guidance_until_snapshot_has_session_evidence(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, session_restart="security-session", application_restart=True)
+            terminal = replace(operation, state="failed", error_code="internal", detail="Fixture",
+                finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100)
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, terminal)
+            backend = mock.Mock(side_effect=AssertionError("Replay opened a service"))
+            provider.watch_journal_operation(journal, operation.operation_id, lambda _chunk: None,
+                boot_id=self.boot_id, backend_factory=backend)
+            backend.assert_not_called()
+            with provider.lock_writable_journal(journal):
+                provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                state = provider.load_writable_journal_state(journal)
+                self.assertEqual((state.restart.session, state.restart.application), ("security-session", True))
+                provider.prune_journal_restart(journal, self.boot_id, 200)
+                state = provider.load_writable_journal_state(journal)
+                self.assertEqual((state.restart.session, state.restart.application), ("none", False))
+
+    def test_control_cli_has_fixed_syntax_and_stream_free_stale_diagnostics(self):
+        for args in ([], ["watch-operation"], ["ack-operation", "bad"], ["watch-operation", "op-" + "a" * 32, "extra"],
+                     ["updates-refresh", "extra"], ["updates-cancel"], ["updates-cancel", "bad"],
+                     ["updates-cancel", "op-" + "a" * 32, "extra"]):
+            with self.subTest(args=args), contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(provider.main(args), 2)
+                self.assertEqual(stdout.getvalue(), "")
+        for command, diagnostic in (("watch-operation", "watch"), ("ack-operation", "ack"), ("updates-cancel", "cancel")):
+            with self.subTest(command=command), mock.patch.object(provider, "open_journal_directory", side_effect=provider.JournalLayoutError("Unsafe raw text")), \
+                    mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(provider.main([command, "op-" + "a" * 32]), 3)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), f"{diagnostic} target is unavailable\n")
+
+    def test_owner_replaced_before_adoption_is_never_followed(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            backend = mock.Mock()
+            backend.session_started.return_value = None
+            following = []
+            def factory():
+                with provider.lock_writable_journal(journal):
+                    terminal = replace(operation, state="failed", error_code="internal", detail="Fixture",
+                        finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100)
+                    provider.advance_journal_operation(journal, operation, terminal)
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                    provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                following.append(self.begin(journal, "refresh"))
+                return backend
+            chunks = []
+            with self.assertRaises(provider.JournalAdmissionError):
+                provider.watch_journal_operation(journal, operation.operation_id, chunks.append,
+                    boot_id=self.boot_id, backend_factory=factory)
+            backend.probe_operation.assert_not_called()
+            self.assertNotIn("complete\toperation", "".join(chunks))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, following[0])
+
+    def test_cli_replay_and_ack_preserve_terminal_and_use_no_service(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            terminal = replace(operation, state="failed", error_code="internal", detail="Fixture",
+                finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100)
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, terminal)
+            state_home = str(pathlib.Path(journal.chain.path).parents[1])
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state_home}), \
+                    mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                    mock.patch.object(provider.PackageKitBackend, "__init__", side_effect=AssertionError("Unexpected service")), \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(provider.main(["watch-operation", operation.operation_id]), 0)
+                self.assertIn("complete\toperation", stdout.getvalue())
+                stdout.seek(0)
+                stdout.truncate(0)
+                self.assertEqual(provider.main(["ack-operation", operation.operation_id]), 0)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(provider.main(["ack-operation", operation.operation_id]), 3)
+                self.assertEqual(stderr.getvalue(), "ack target is unavailable\n")
+            state = provider.load_journal_state(journal.chain)
+            self.assertEqual(state.terminals[operation.slot], terminal)
+            self.assertIsNone(state.handoff)
+
+    def test_closed_cli_pipe_has_fixed_exit_and_preserves_handoff(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            terminal = replace(operation, state="failed", error_code="internal", detail="Fixture",
+                finished_at="2026-09-05T00:01:00Z", terminal_monotonic=100)
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, terminal)
+                provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+            environment = dict(os.environ, XDG_STATE_HOME=str(pathlib.Path(journal.chain.path).parents[1]))
+            reader, writer = os.pipe()
+            os.close(reader)
+            try:
+                result = subprocess.run(["/usr/bin/python3", str(PROVIDER_PATH), "watch-operation", operation.operation_id],
+                    stdout=writer, stderr=subprocess.PIPE, env=environment, timeout=10)
+            finally:
+                os.close(writer)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stderr, b"operation observation was interrupted\n")
+            self.assertEqual(provider.load_journal_state(journal.chain).handoff.operation_id, operation.operation_id)
+
+
+class RegionalInterruptionTests(unittest.TestCase):
+    catalog = LocaleEnumerationTests.catalog
+
+    def run_client(self, client):
+        with contextlib.ExitStack() as retained:
+            return provider.run_interruptible_regional(client, retained)
+
+    def test_locale_enumeration_stop_reaps_child_and_becomes_typed_rejection(self):
+        from gi.repository import GLib
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            gio = mock.Mock()
+            client = provider.RegionalMutation("locale-set", "LANG=C", "a" * 64,
+                mock.Mock(), mock.Mock(), gio, GLib)
+            with self.subTest(signum=signum), self.catalog("closed-pipes", signal_number=signum) as processes:
+                with mock.patch.object(provider, "read_fedora_identity"), \
+                        self.assertRaises(provider.RegionalCommandInterrupted) as raised:
+                    self.run_client(client)
+                self.assertIn("no change was sent", raised.exception.detail)
+                self.assertFalse(client.sent)
+                gio.bus_get.assert_not_called()
+                self.assertTrue(all(p.returncode is not None and p.stdout.closed and p.stderr.closed for p in processes))
+
+    def test_repeated_stop_coalesces_and_rejects_a_just_completed_read(self):
+        handlers = {number: signal.getsignal(number)
+                    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        for signum in handlers:
+            for sent in (False, True):
+                with self.subTest(signum=signum, sent=sent):
+                    client = mock.Mock(sent=sent)
+                    def run():
+                        signal.raise_signal(signum)
+                        signal.raise_signal(signum)
+                        return "verified"
+                    client.run.side_effect = run
+                    with self.assertRaises(provider.RegionalCommandInterrupted) as raised:
+                        self.run_client(client)
+                    self.assertEqual(raised.exception.code, "interrupted")
+                    self.assertIn("may still complete" if sent else "no change was sent", raised.exception.detail)
+                    client.GLib.idle_add.assert_called_once()
+                    client.GLib.source_remove.assert_called_once_with(client.GLib.idle_add.return_value)
+                    client.fail.assert_not_called()
+                    for number, handler in handlers.items():
+                        self.assertIs(signal.getsignal(number), handler)
+
+    def test_unrelated_system_exit_is_not_reclassified_as_a_stop(self):
+        for action, started, code in (("timezone-set", False, 143),
+                                      ("locale-set", True, 143), ("locale-set", False, 2)):
+            client = mock.Mock(action=action, started=started, sent=False)
+            client.run.side_effect = SystemExit(code)
+            with self.subTest(action=action, started=started, code=code), self.assertRaises(SystemExit) as raised:
+                self.run_client(client)
+            self.assertEqual(raised.exception.code, code)
+            client.GLib.idle_add.assert_not_called()
+
+    def test_startup_gap_cannot_lose_the_queued_stop(self):
+        from gi.repository import GLib
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            gio = mock.Mock()
+            client = provider.RegionalMutation("timezone-set", "Etc/UTC", "a" * 64,
+                mock.Mock(), mock.Mock(), gio, GLib)
+            loop = client.loop
+            expired = []
+            def guard_stop():
+                expired.append(True)
+                loop.quit()
+                return GLib.SOURCE_REMOVE
+            def start():
+                signal.raise_signal(signum)
+                loop.run()
+            client.loop = types.SimpleNamespace(run=start, quit=loop.quit)
+            guard = GLib.timeout_add(200, guard_stop)
+            try:
+                with mock.patch.object(provider, "read_fedora_identity"), \
+                        contextlib.redirect_stderr(io.StringIO()) as diagnostic, \
+                        self.assertRaises(provider.RegionalCommandInterrupted):
+                    self.run_client(client)
+                self.assertEqual(expired, [], "Regional stop was lost before loop startup")
+                self.assertNotIn("Traceback", diagnostic.getvalue())
+                self.assertTrue(client.done)
+                self.assertFalse(client.sent)
+                gio.bus_get_finish.assert_not_called()
+            finally:
+                if not expired:
+                    GLib.source_remove(guard)
+
+    def test_actual_cli_signal_matrix_on_private_bus(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-regional-interruption-bus.py"), str(PROVIDER_PATH)],
+            capture_output=True, text=True, timeout=90, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("Regional signal case: PASS"), 18)
+        self.assertIn("Private-bus regional interruption: PASS", result.stdout)
+
+
+class RegionalOwnerTests(unittest.TestCase):
+    boot_id = JournalRetainedSessionTests.boot_id
+    session = JournalRetainedSessionTests.session
+
+    def setup_client(self, journal, mode="success", action="timezone-set", argument="Etc/UTC"):
+        state = (provider.parse_locale_configuration(["LANG=POSIX"]) if action == "locale-set" else
+                 provider.RegionalTimeState("UTC", True, False, True))
+        preview = provider.make_regional_preview(action, argument, state,
+            ["C", "POSIX"] if action == "locale-set" else ["UTC", "Etc/UTC"])
+        self.events = []
+        self.during = lambda: None
+        self.before_admission = lambda: None
+        self.client = None
+
+        def factory(received_action, received_argument, generation, before, after):
+            self.assertEqual((received_action, received_argument), (action, argument))
+            client = types.SimpleNamespace(sent=False, acknowledged=False, hook_error=None,
+                kind="locale-state" if action == "locale-set" else "time-state")
+            self.client = client
+
+            def hook(callback, *args):
+                try:
+                    callback(*args)
+                except Exception as error:
+                    client.hook_error = error
+                    raise provider.SnapshotFailure("interrupted", "Fixture checkpoint failed") from error
+
+            def run():
+                provider.require_regional_generation(preview, generation)
+                if mode == "preflight":
+                    raise provider.SnapshotFailure("missing-provider", "Fixture preflight unavailable")
+                self.before_admission()
+                hook(before, preview)
+                with provider.lock_writable_journal(journal):
+                    current = provider.load_writable_journal_state(journal).active
+                    self.assertEqual(current.state, "authorizing")
+                    self.assertTrue(provider.native_journal_owner_busy(journal, current))
+                # This interval is unlocked; only the active-file lease is held.
+                with provider._journal_lock(journal.chain.directory_descriptor, exclusive=True):
+                    pass
+                if mode == "stale-before-send":
+                    raise provider.SnapshotFailure("conflict", "Fixture confirmation changed")
+                client.sent = True
+                self.events.append("sent")
+                if mode in {"denied", "method-error", "timeout", "transport"}:
+                    code = {"denied": "permission-denied", "method-error": "internal",
+                            "timeout": "timeout", "transport": "interrupted"}[mode]
+                    raise provider.SnapshotFailure(code, "Fixture service outcome")
+                client.acknowledged = True
+                hook(after)
+                self.during()
+                self.events.append("verified")
+                if mode == "mismatch":
+                    raise provider.SnapshotFailure("conflict", "Fixture verification mismatch")
+                return state
+            client.run = run
+            return client
+        return factory, preview.generation
+
+    def invoke(self, journal, mode="success", action="timezone-set", argument="Etc/UTC", write=None,
+               on_admission=None, configure=None):
+        factory, generation = self.setup_client(journal, mode, action, argument)
+        if configure is not None:
+            configure()
+        output = []
+        with mock.patch.object(provider, "RegionalMutation", side_effect=factory) as client, \
+                mock.patch.object(provider, "RegionalRead") as fresh, \
+                mock.patch.object(provider, "PackageKitBackend") as packagekit:
+            terminal = provider.run_regional_mutation(journal, action, argument, generation,
+                output.append if write is None else write, on_admission=on_admission)
+            packagekit.assert_not_called()
+            client.assert_called_once()
+        return terminal, "".join(output), fresh
+
+    def test_successful_fixed_actions_have_durable_handoffs_and_no_update_restart_changes(self):
+        for action, argument in (("timezone-set", "Etc/UTC"), ("ntp-set", "enabled"), ("locale-set", "LANG=C")):
+            with self.subTest(action=action), self.session() as (path, _chain, journal):
+                with provider.lock_writable_journal(journal):
+                    previous = provider.begin_journal_operation(journal, "updates-install-all",
+                        "2026-09-06T21:00:00Z", "Earlier update", generation="a" * 64,
+                        transaction_path="/1_test", boot_id=self.boot_id)
+                    provider.advance_journal_operation(journal, previous, replace(previous, state="running"))
+                    previous = provider.load_writable_journal_state(journal).active
+                    provider.advance_journal_operation(journal, previous, replace(previous, state="succeeded",
+                        system_restart="system", session_restart="session", application_restart=True,
+                        finished_at="2026-09-06T21:01:00Z", terminal_monotonic=100))
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                    provider.acknowledge_journal_handoff(journal, previous.operation_id)
+                restart = (path / "restart").read_bytes()
+                terminal, output, fresh = self.invoke(journal, action=action, argument=argument)
+                self.assertEqual(self.events, ["sent", "verified"])
+                self.assertEqual(terminal.state, "succeeded")
+                self.assertIsNone(terminal.boot_id)
+                self.assertIsNone(terminal.generation)
+                self.assertIsNone(terminal.terminal_monotonic)
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                self.assertEqual(state.handoff.operation_id, terminal.operation_id)
+                self.assertEqual(state.terminals[terminal.slot], terminal)
+                self.assertEqual((path / "restart").read_bytes(), restart)
+                self.assertEqual([row[4] for row in rows(output.splitlines(), "operation")],
+                    ["pending", "authorizing", "running", "succeeded"])
+                self.assertTrue(all(row[5:7] == ["unknown", "no"] for row in rows(output.splitlines(), "operation")))
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+                fresh.assert_not_called()
+                if action == "locale-set":
+                    self.assertIn("sign out and back in", terminal.detail)
+
+    def test_denial_conflict_and_explicit_error_have_exact_typed_terminals(self):
+        for mode, state, code in (("denied", "permission-denied", "permission-denied"),
+                                  ("method-error", "failed", "internal"),
+                                  ("mismatch", "failed", "conflict"),
+                                  ("stale-before-send", "failed", "conflict")):
+            with self.subTest(mode=mode), self.session() as (_path, _chain, journal):
+                terminal, output, fresh = self.invoke(journal, mode)
+                self.assertEqual((terminal.state, terminal.error_code), (state, code))
+                self.assertEqual(rows(output.splitlines(), "error")[0][1:3], ["regional", code])
+                self.assertEqual(self.client.sent, mode != "stale-before-send")
+                fresh.assert_not_called()
+
+    def test_ambiguous_terminal_is_durable_and_lease_free_before_independent_read(self):
+        for mode in ("timeout", "transport"):
+            with self.subTest(mode=mode), self.session() as (_path, _chain, journal):
+                factory, generation = self.setup_client(journal, mode)
+                output = []
+                def reread():
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertIsNone(state.active)
+                    self.assertEqual(state.terminals[state.handoff.slot].state, "interrupted")
+                    self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                    provider._unlock_native_owner(journal.descriptor("active"))
+                    self.assertTrue(output[-1].endswith("complete\toperation\n"))
+                    raise provider.SnapshotFailure("permission-denied", "Fresh read unavailable")
+                with mock.patch.object(provider, "RegionalMutation", side_effect=factory), \
+                        mock.patch.object(provider, "RegionalRead") as reader:
+                    reader.return_value.run.side_effect = reread
+                    terminal = provider.run_regional_mutation(journal, "timezone-set", "Etc/UTC",
+                        generation, output.append)
+                    reader.assert_called_once_with("time-state")
+                    reader.return_value.run.assert_called_once()
+                self.assertEqual(terminal.state, "interrupted")
+                self.assertEqual(terminal.error_code, "timeout" if mode == "timeout" else "interrupted")
+                self.assertEqual(self.events, ["sent"])
+
+    def test_preflight_failure_never_admits_or_emits_an_operation(self):
+        with self.session() as (_path, _chain, journal):
+            before = provider.load_journal_state(journal.chain)
+            output, admitted = [], mock.Mock()
+            with self.assertRaises(provider.SnapshotFailure):
+                self.invoke(journal, "preflight", write=output.append, on_admission=admitted)
+            self.assertEqual(output, [])
+            admitted.assert_not_called()
+            self.assertEqual(provider.load_journal_state(journal.chain), before)
+
+    def test_local_stop_terminalizes_a_running_owner_without_another_service_wait(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signum=signum), self.session() as (_path, _chain, journal):
+                def configure():
+                    self.before_admission = lambda: setattr(self.client, "GLib", mock.Mock())
+                    self.during = lambda: signal.raise_signal(signum)
+                terminal, output, fresh = self.invoke(journal, configure=configure)
+                self.assertEqual((terminal.state, terminal.error_code), ("interrupted", "interrupted"))
+                self.assertEqual([row[4] for row in rows(output.splitlines(), "operation")],
+                    ["pending", "authorizing", "running", "interrupted"])
+                fresh.assert_not_called()
+                durable = provider.load_journal_state(journal.chain)
+                self.assertIsNone(durable.active)
+                self.assertEqual(durable.terminals[durable.handoff.slot], terminal)
+                self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                provider._unlock_native_owner(journal.descriptor("active"))
+
+    def test_repeated_stop_during_terminal_commit_and_lease_release_is_coalesced(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signum=signum), self.session() as (_path, _chain, journal):
+                def configure():
+                    self.before_admission = lambda: setattr(self.client, "GLib", mock.Mock())
+                    self.during = lambda: signal.raise_signal(signum)
+                advance, unlock = provider.advance_journal_operation, provider._unlock_native_owner
+                terminal_started = []
+                def commit(current_journal, current, following, **kwargs):
+                    if following.state == "interrupted":
+                        terminal_started.append(True)
+                        signal.raise_signal(signum)
+                    return advance(current_journal, current, following, **kwargs)
+                def release(descriptor):
+                    if terminal_started:
+                        signal.raise_signal(signum)
+                    return unlock(descriptor)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                        provider.control_output_writers(), \
+                        mock.patch.object(provider, "advance_journal_operation", side_effect=commit), \
+                        mock.patch.object(provider, "_unlock_native_owner", side_effect=release):
+                    terminal, _output, fresh = self.invoke(journal, configure=configure)
+                self.assertEqual(terminal.state, "interrupted")
+                fresh.assert_not_called()
+                durable = provider.load_journal_state(journal.chain)
+                self.assertIsNone(durable.active)
+                self.assertEqual(durable.terminals[durable.handoff.slot], terminal)
+                self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                provider._unlock_native_owner(journal.descriptor("active"))
+
+    def test_first_stop_during_timeout_handoff_skips_the_optional_read(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signum=signum), self.session() as (_path, _chain, journal):
+                complete = provider.complete_journal_terminal
+                def handoff(*args, **kwargs):
+                    signal.raise_signal(signum)
+                    return complete(*args, **kwargs)
+                with mock.patch.object(provider, "complete_journal_terminal", side_effect=handoff):
+                    terminal, _output, fresh = self.invoke(journal, mode="timeout")
+                self.assertEqual((terminal.state, terminal.error_code), ("interrupted", "timeout"))
+                self.assertTrue(self.client.local_interrupted)
+                fresh.assert_not_called()
+                durable = provider.load_journal_state(journal.chain)
+                self.assertIsNone(durable.active)
+                self.assertEqual(durable.terminals[durable.handoff.slot], terminal)
+
+    def test_stop_during_independent_read_preserves_the_durable_terminal(self):
+        from gi.repository import GLib
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signum=signum), self.session() as (_path, _chain, journal):
+                factory, generation = self.setup_client(journal, mode="transport")
+                gio = mock.Mock()
+                read = provider.RegionalRead("time-state", gio, GLib)
+                expired, output = [], []
+                trigger_source = 0
+                def trigger():
+                    nonlocal trigger_source
+                    trigger_source = 0
+                    durable = provider.load_journal_state(journal.chain)
+                    self.assertIsNone(durable.active)
+                    self.assertEqual(durable.terminals[durable.handoff.slot].state, "interrupted")
+                    self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                    provider._unlock_native_owner(journal.descriptor("active"))
+                    signal.raise_signal(signum)
+                    return GLib.SOURCE_REMOVE
+                def guard_stop():
+                    expired.append(True)
+                    read.loop.quit()
+                    return GLib.SOURCE_REMOVE
+                guard = GLib.timeout_add(1000, guard_stop)
+                trigger_source = GLib.idle_add(trigger)
+                try:
+                    with mock.patch.object(provider, "RegionalMutation", side_effect=factory), \
+                            mock.patch.object(provider, "RegionalRead", return_value=read), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()) as diagnostic, \
+                            provider.control_output_writers():
+                        terminal = provider.run_regional_mutation(journal, "timezone-set", "Etc/UTC",
+                            generation, output.append)
+                    self.assertEqual(expired, [], "Independent read ignored the local stop")
+                    self.assertNotIn("Traceback", diagnostic.getvalue())
+                    self.assertTrue(read.done)
+                    self.assertEqual((terminal.state, terminal.error_code), ("interrupted", "interrupted"))
+                    durable = provider.load_journal_state(journal.chain)
+                    self.assertEqual(durable.terminals[durable.handoff.slot], terminal)
+                    self.assertTrue(output[-1].endswith("complete\toperation\n"))
+                finally:
+                    if not expired:
+                        GLib.source_remove(guard)
+                    if trigger_source:
+                        GLib.source_remove(trigger_source)
+
+    def test_output_loss_before_dispatch_aborts_but_after_dispatch_keeps_verification(self):
+        for phase in ("pending", "authorizing", "running", "succeeded"):
+            with self.subTest(phase=phase), self.session() as (_path, _chain, journal):
+                output = []
+                def write(chunk):
+                    if "\t" + phase + "\t" in chunk:
+                        raise BrokenPipeError("Fixture output closed")
+                    output.append(chunk)
+                with self.assertRaises(BrokenPipeError):
+                    self.invoke(journal, write=write)
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                terminal = state.terminals[state.handoff.slot]
+                sent = phase in {"running", "succeeded"}
+                self.assertEqual(self.client.sent, sent)
+                self.assertEqual(terminal.state, "succeeded" if sent else "failed")
+                self.assertEqual(self.events, ["sent", "verified"] if sent else [])
+                self.assertNotIn("complete\toperation", "".join(output))
+
+    def test_checkpoint_failures_suppress_terminal_success_and_release_the_lease(self):
+        for phase in ("authorizing", "running", "succeeded"):
+            for after_write in (False, True):
+                with self.subTest(phase=phase, after_write=after_write), self.session() as (_path, _chain, journal):
+                    output = []
+                    original = provider.advance_journal_operation
+                    def advance(current_journal, current, following, **kwargs):
+                        if following.state == phase:
+                            if after_write:
+                                original(current_journal, current, following, **kwargs)
+                            raise provider.JournalCommitError("Fixture sync failure")
+                        return original(current_journal, current, following, **kwargs)
+                    with mock.patch.object(provider, "advance_journal_operation", side_effect=advance), \
+                            self.assertRaises(provider.JournalCommitError):
+                        self.invoke(journal, write=output.append)
+                    self.assertNotIn("complete\toperation", "".join(output))
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertIsNotNone(state.active)
+                    self.assertIsNone(state.handoff)
+                    self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                    provider._unlock_native_owner(journal.descriptor("active"))
+                    self.assertEqual(self.client.sent, phase != "authorizing")
+
+    def test_admission_race_does_not_replace_a_competing_owner(self):
+        with self.session() as (_path, _chain, journal):
+            admitted = mock.Mock()
+            def configure():
+                def competing():
+                    with provider.lock_writable_journal(journal):
+                        provider.begin_journal_operation(journal, "ntp-set", "2026-09-06T22:00:00Z", "Competing request")
+                self.before_admission = competing
+            with self.assertRaises(provider.JournalAdmissionError):
+                self.invoke(journal, on_admission=admitted, configure=configure)
+            admitted.assert_not_called()
+            self.assertEqual(provider.load_journal_state(journal.chain).active.action_id, "ntp-set")
+            self.assertFalse(self.client.sent)
+
+    def test_native_cli_routes_only_fixed_valid_arguments(self):
+        for args in (["timezone-set", "UTC", "a" * 64], ["ntp-set", "enabled", "b" * 64],
+                     ["locale-set", "LANG=C", "c" * 64]):
+            with mock.patch.object(provider, "native_command", return_value=0) as command:
+                self.assertEqual(provider.main(args), 0)
+                command.assert_called_once_with(*args)
+        for args in (["timezone-set"], ["timezone-set", "../UTC", "a" * 64],
+                     ["ntp-set", "true", "a" * 64], ["locale-set", "LANG=C", "A" * 64],
+                     ["locale-set", "LANG=C", "a" * 64, "extra"]):
+            with mock.patch.object(provider, "native_command") as command, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(provider.main(args), 2)
+                command.assert_not_called()
+
+
+class RegionalCommandTests(unittest.TestCase):
+    boot_id = RegionalOwnerTests.boot_id
+    session = RegionalOwnerTests.session
+    setup_client = RegionalOwnerTests.setup_client
+
+    def invoke(self, journal, mode="success", writer=None):
+        factory, generation = self.setup_client(journal, mode)
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(pathlib.Path(journal.chain.path).parents[1])}), \
+                mock.patch.object(provider, "read_fedora_identity", return_value={"ID": "fedora"}), \
+                mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                mock.patch.object(provider, "RegionalMutation", side_effect=factory), \
+                mock.patch.object(provider, "RegionalRead"), \
+                mock.patch.object(provider, "PackageKitBackend") as packagekit, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = provider.run_native_command("timezone-set", "Etc/UTC", generation, writer, None)
+            packagekit.assert_not_called()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_confirmed_success_and_denial_have_durable_exact_results(self):
+        for mode, expected, code in (("success", "succeeded", 0), ("denied", "permission-denied", 1)):
+            with self.subTest(mode=mode), self.session() as (_path, _chain, journal):
+                result, output, diagnostic = self.invoke(journal, mode)
+                self.assertEqual((result, diagnostic), (code, ""))
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                terminal = state.terminals[state.handoff.slot]
+                self.assertEqual(terminal.state, expected)
+                self.assertEqual(rows(output.splitlines(), "audit")[0][1:5],
+                    [terminal.operation_id, "timezone-set", "timezone", expected])
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+
+    def test_preflight_rejection_and_overlap_do_not_change_the_journal(self):
+        for mode in ("preflight", "active", "handoff"):
+            with self.subTest(mode=mode), self.session() as (_path, _chain, journal):
+                if mode != "preflight":
+                    with provider.lock_writable_journal(journal):
+                        active = provider.begin_journal_operation(journal, "ntp-set", "2026-09-06T22:00:00Z", "Existing")
+                        if mode == "handoff":
+                            provider.advance_journal_operation(journal, active, replace(active, state="failed",
+                                error_code="internal", finished_at="2026-09-06T22:01:00Z"))
+                            provider.complete_journal_terminal(journal)
+                before = provider.load_journal_state(journal.chain)
+                code, output, diagnostic = self.invoke(journal, "preflight" if mode == "preflight" else "success")
+                self.assertEqual((code, diagnostic), (1, ""))
+                self.assertEqual(rows(output.splitlines(), "error")[0][1:3],
+                    ["regional", "missing-provider" if mode == "preflight" else "conflict"])
+                self.assertIn("no regional mutation was dispatched", output)
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+                self.assertEqual(provider.load_journal_state(journal.chain), before)
+
+    def test_uncertain_admission_and_terminal_handoff_never_fabricate_completion(self):
+        for stage in ("admission", "handoff"):
+            for after in (False, True):
+                with self.subTest(stage=stage, after=after), self.session() as (_path, _chain, journal):
+                    name = "begin_journal_operation" if stage == "admission" else "complete_journal_terminal"
+                    original = getattr(provider, name)
+                    def fail(*args, **kwargs):
+                        if after:
+                            original(*args, **kwargs)
+                        raise provider.JournalCommitError("Fixture private detail")
+                    with mock.patch.object(provider, name, side_effect=fail):
+                        code, output, diagnostic = self.invoke(journal)
+                    self.assertEqual(code, 1)
+                    self.assertNotIn("complete\toperation", output)
+                    self.assertEqual(diagnostic,
+                        "regional result could not be confirmed; refresh state and observe the existing operation\n")
+                    self.assertEqual(self.client.sent, stage == "handoff")
+                    if stage == "admission":
+                        self.assertEqual(output, "")
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertEqual(state.handoff is not None, stage == "handoff" and after)
+
+    def test_raw_short_full_and_closed_output_abort_before_dispatch(self):
+        for result in (0, BlockingIOError("Full"), BrokenPipeError("Closed")):
+            with self.subTest(result=result), self.session() as (_path, _chain, journal):
+                writer = mock.Mock(**({"side_effect": result} if isinstance(result, Exception) else {"return_value": result}))
+                code, output, diagnostic = self.invoke(journal, writer=writer)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn("observe the existing operation", diagnostic)
+                writer.assert_called_once()
+                self.assertFalse(self.client.sent)
+                state = provider.load_journal_state(journal.chain)
+                self.assertEqual(state.terminals[state.handoff.slot].state, "failed")
+
+    def test_non_fedora_rejects_before_opening_journal(self):
+        with mock.patch.object(provider, "read_fedora_identity", side_effect=provider.SnapshotFailure("unsupported", "Not Fedora")), \
+                mock.patch.object(provider, "open_journal_directory") as journal, \
+                mock.patch.object(provider, "RegionalMutation") as client, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(provider.run_native_command("timezone-set", "UTC", "a" * 64, None, None), 1)
+            journal.assert_not_called()
+            client.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_private_bus_actual_cli_journal_and_output_loss(self):
+        result = subprocess.run(["dbus-run-session", "--", "/usr/bin/python3",
+            str(REPO / "tests/fixtures/system-regional-owner-bus.py"), str(PROVIDER_PATH)],
+            capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Private-bus regional owner: PASS", result.stdout)
+
+
+class DelegatedOwnerTests(unittest.TestCase):
+    boot_id = RegionalOwnerTests.boot_id
+    session = RegionalOwnerTests.session
+
+    def invoke(self, journal, action="accounts-open", *, write=None, failure=None, admitted=None):
+        output = []
+        def launch(command):
+            self.assertEqual(command, ("/usr/bin/fixture",))
+            with provider.lock_writable_journal(journal):
+                active = provider.load_writable_journal_state(journal).active
+                self.assertEqual(active.state, "running")
+                self.assertEqual(active.action_id, action)
+                self.assertTrue(provider.native_journal_owner_busy(journal, active))
+            with provider._journal_lock(journal.chain.directory_descriptor, exclusive=True):
+                pass
+            if failure is not None:
+                raise provider.SnapshotFailure(failure, "Fixture launch result")
+        with mock.patch.object(provider, "delegated_command", return_value=(("/usr/bin/fixture",), "Fixture tool")), \
+                mock.patch.object(provider, "launch_delegated_tool", side_effect=launch) as launcher, \
+                mock.patch.object(provider, "PackageKitBackend") as packagekit:
+            result = provider.run_delegated_launch(journal, action, output.append if write is None else write,
+                on_admission=admitted)
+            packagekit.assert_not_called()
+        return result, "".join(output), launcher
+
+    def test_all_fixed_launches_have_exact_durable_launch_only_results(self):
+        for action in provider.DELEGATED_ACTIONS:
+            with self.subTest(action=action), self.session() as (path, _chain, journal):
+                restart = (path / "restart").read_bytes()
+                result, output, launcher = self.invoke(journal, action)
+                launcher.assert_called_once()
+                self.assertEqual((result.kind, result.state), ("delegate", "succeeded"))
+                self.assertIn("launch accepted", result.detail)
+                self.assertIn("not tracked here", result.detail)
+                self.assertIsNone(result.generation)
+                self.assertIsNone(result.boot_id)
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                self.assertEqual(state.terminals[state.handoff.slot], result)
+                self.assertEqual((path / "restart").read_bytes(), restart)
+                self.assertEqual([row[4] for row in rows(output.splitlines(), "operation")], ["pending", "running", "succeeded"])
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+                self.assertTrue(all(row[6] == "no" for row in rows(output.splitlines(), "operation")))
+
+    def test_launch_errors_and_ambiguity_have_scoped_results_without_retry(self):
+        for code in ("missing-provider", "permission-denied", "unsupported", "internal", "interrupted"):
+            with self.subTest(code=code), self.session() as (_path, _chain, journal):
+                result, output, launcher = self.invoke(journal, failure=code)
+                launcher.assert_called_once()
+                self.assertEqual(result.state, "interrupted" if code == "interrupted" else "failed")
+                self.assertEqual(rows(output.splitlines(), "error")[0][1:3], ["accounts", code])
+
+    def test_output_loss_before_launch_aborts_and_after_acceptance_preserves_handoff(self):
+        for phase in ("pending", "running", "succeeded"):
+            with self.subTest(phase=phase), self.session() as (_path, _chain, journal):
+                output = []
+                def write(chunk):
+                    if "\t" + phase + "\t" in chunk:
+                        raise BrokenPipeError()
+                    output.append(chunk)
+                with mock.patch.object(provider, "delegated_command", return_value=(("/usr/bin/fixture",), "Fixture")), \
+                        mock.patch.object(provider, "launch_delegated_tool") as launch, self.assertRaises(BrokenPipeError):
+                    provider.run_delegated_launch(journal, "printers-open", write)
+                self.assertEqual(launch.call_count, int(phase == "succeeded"))
+                state = provider.load_journal_state(journal.chain)
+                self.assertEqual(state.terminals[state.handoff.slot].state, "succeeded" if phase == "succeeded" else "failed")
+                self.assertNotIn("complete\toperation", "".join(output))
+
+    def test_unavailable_tool_and_admission_race_preserve_existing_state(self):
+        for race in (False, True):
+            with self.subTest(race=race), self.session() as (_path, _chain, journal):
+                admitted, output = mock.Mock(), []
+                def resolve(_action):
+                    if not race:
+                        raise provider.SnapshotFailure("missing-provider", "Unavailable fixture")
+                    with provider.lock_writable_journal(journal):
+                        provider.begin_journal_operation(journal, "ntp-set", "2026-09-06T23:00:00Z", "Competing")
+                    return ("/usr/bin/fixture",), "Fixture"
+                with mock.patch.object(provider, "delegated_command", side_effect=resolve), \
+                        mock.patch.object(provider, "launch_delegated_tool") as launch, \
+                        self.assertRaises(provider.JournalAdmissionError if race else provider.SnapshotFailure):
+                    provider.run_delegated_launch(journal, "accounts-open", output.append, on_admission=admitted)
+                admitted.assert_not_called()
+                launch.assert_not_called()
+                self.assertEqual(output, [])
+                self.assertEqual(provider.load_journal_state(journal.chain).active is not None, race)
+
+    def test_uncertain_admission_or_handoff_never_emits_complete(self):
+        for stage in ("begin_journal_operation", "complete_journal_terminal"):
+            for after in (False, True):
+                with self.subTest(stage=stage, after=after), self.session() as (_path, _chain, journal):
+                    original, admitted, output = getattr(provider, stage), mock.Mock(), []
+                    def fail(*args, **kwargs):
+                        if after:
+                            original(*args, **kwargs)
+                        raise provider.JournalCommitError("Uncertain fixture write")
+                    with mock.patch.object(provider, stage, side_effect=fail), self.assertRaises(provider.JournalCommitError):
+                        self.invoke(journal, write=output.append, admitted=admitted)
+                    admitted.assert_called_once()
+                    self.assertNotIn("complete\toperation", "".join(output))
+                    self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                    provider._unlock_native_owner(journal.descriptor("active"))
+
+    def test_cli_fixed_grammar_and_preflight_rejection(self):
+        for action in provider.DELEGATED_ACTIONS:
+            with mock.patch.object(provider, "native_command", return_value=0) as command:
+                self.assertEqual(provider.main([action]), 0)
+                command.assert_called_once_with(action)
+            with mock.patch.object(provider, "native_command") as command, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(provider.main([action, "unexpected"]), 2)
+                command.assert_not_called()
+            with self.session() as (path, _chain, journal), \
+                    mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(path.parents[1])}), \
+                    mock.patch.object(provider, "read_fedora_identity", return_value={"ID": "fedora"}), \
+                    mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                    mock.patch.object(provider, "delegated_command", side_effect=provider.SnapshotFailure("missing-provider", "Fixture tool missing")), \
+                    mock.patch.object(provider, "launch_delegated_tool") as launch, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(provider.main([action]), 1)
+                self.assertIn("no administration tool was launched", stdout.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                self.assertIsNone(state.handoff)
+                launch.assert_not_called()
+
+    def test_real_child_is_detached_and_never_inherits_journal_or_output(self):
+        for mode in ("open", "failed-work", "lost-output"):
+            with self.subTest(mode=mode), self.session() as (path, _chain, journal):
+                report = path.parent / "child.json"
+                command = ("/usr/bin/python3", str(REPO / "tests/fixtures/system-delegated-tool.py"), str(report), mode)
+                original, children, output = os.posix_spawn, [], []
+                def spawn(*args, **kwargs):
+                    pid = original(*args, **kwargs)
+                    children.append(pid)
+                    return pid
+                def write(chunk):
+                    if mode == "lost-output" and "\tsucceeded\t" in chunk:
+                        raise BrokenPipeError()
+                    output.append(chunk)
+                try:
+                    with mock.patch.object(provider, "delegated_command", return_value=(command, "Fixture")), \
+                            mock.patch.object(provider.os, "posix_spawn", side_effect=spawn):
+                        if mode == "lost-output":
+                            with self.assertRaises(BrokenPipeError):
+                                provider.run_delegated_launch(journal, "sources-open", write)
+                        else:
+                            provider.run_delegated_launch(journal, "sources-open", write)
+                    deadline = time.monotonic() + 3
+                    while not report.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    value = json.loads(report.read_text())
+                    self.assertEqual(value["pid"], children[0])
+                    self.assertEqual(value["sid"], children[0])
+                    self.assertEqual(value["descriptors"], {"0": "/dev/null", "1": "/dev/null", "2": "/dev/null"})
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertIsNone(state.active)
+                    terminal = state.terminals[state.handoff.slot]
+                    self.assertEqual(terminal.state, "succeeded")
+                    self.assertIn("launch accepted", terminal.detail)
+                    self.assertTrue(provider._try_native_owner_lock(journal.descriptor("active")))
+                    provider._unlock_native_owner(journal.descriptor("active"))
+                    if mode == "failed-work":
+                        pid, status = os.waitpid(children.pop(), 0)
+                        self.assertEqual(pid, value["pid"])
+                        self.assertEqual(os.waitstatus_to_exitcode(status), 42)
+                        self.assertEqual(provider.load_journal_state(journal.chain).terminals[terminal.slot], terminal)
+                    replay = []
+                    with mock.patch.object(provider, "launch_delegated_tool", side_effect=AssertionError("Unexpected relaunch")):
+                        provider.watch_journal_operation(journal, terminal.operation_id, replay.append, boot_id=self.boot_id)
+                    self.assertTrue("".join(replay).endswith("complete\toperation\n"))
+                finally:
+                    for pid in children:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+
+
+class UpdateCommandTests(unittest.TestCase):
+    boot_id = PackageKitExecutionTests.boot_id
+    package_id = PackageKitExecutionTests.package_id
+    journal = PackageKitExecutionTests.journal
+    backend = PackageKitExecutionTests.backend
+    begin = OperationRecoveryTests.begin
+
+    def generation(self):
+        return provider.snapshot_generation([self.package_id],
+            [provider.PlanRow(self.package_id, "update", "example", "2", "Example")])
+
+    def invoke(self, journal, args, backend, output=None, boot_id=None):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(pathlib.Path(journal.chain.path).parents[1])}), \
+                mock.patch.object(provider, "read_boot_id", return_value=boot_id or self.boot_id), \
+                mock.patch.object(provider, "PackageKitBackend", **({"side_effect": backend} if isinstance(backend, Exception) else {"return_value": backend})), \
+                contextlib.redirect_stdout(io.StringIO() if output is None else output) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = provider.main(args)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_fixed_grammar_rejects_before_opening_journal_or_backend(self):
+        for args in (["updates-refresh", "extra"], ["updates-install-all"], ["updates-install-all", "bad"],
+                     ["updates-install-all", "A" * 64], ["updates-install-all", "a" * 64, "extra"],
+                     ["updates-install-all", "--force"], ["--updates-refresh"]):
+            with self.subTest(args=args), mock.patch.object(provider, "open_journal_directory") as journal, \
+                    mock.patch.object(provider, "PackageKitBackend") as backend, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(provider.main(args), 2)
+                journal.assert_not_called()
+                backend.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+
+    def test_refresh_and_confirmed_install_use_real_owner_and_durable_handoff(self):
+        for update in (False, True):
+            with self.subTest(update=update), self.journal() as journal:
+                backend = self.backend(journal, [lambda bus: bus.progress(Status=3, Percentage=45),
+                    lambda bus: bus.emit("Finished", (1, 0))])
+                args = ["updates-install-all", self.generation()] if update else ["updates-refresh"]
+                code, output, diagnostic = self.invoke(journal, args, backend)
+                self.assertEqual((code, diagnostic), (0, ""))
+                state = provider.load_journal_state(journal.chain)
+                self.assertIsNone(state.active)
+                terminal = state.terminals[state.handoff.slot]
+                self.assertEqual(terminal.state, "succeeded")
+                self.assertEqual(rows(output.splitlines(), "audit")[0][1:5],
+                    [terminal.operation_id, args[0], "update" if update else "refresh", "succeeded"])
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+                self.assertEqual(backend.connection.calls[0][3], "UpdatePackages" if update else "RefreshCache")
+                backend.require_mutation_safe.assert_called_once_with()
+
+    def test_denied_failed_and_canceled_terminal_results_exit_one(self):
+        for exit_code, error_code, expected in ((8, 48, "permission-denied"), (2, 1, "failed"), (3, 17, "canceled")):
+            with self.subTest(expected=expected), self.journal() as journal:
+                backend = self.backend(journal, [lambda bus: bus.emit("ErrorCode", (error_code, "Fixture result")),
+                    lambda bus: bus.emit("Finished", (exit_code, 0))])
+                code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend)
+                self.assertEqual((code, diagnostic), (1, ""))
+                self.assertEqual(rows(output.splitlines(), "operation")[-1][4], expected)
+                self.assertEqual(provider.load_journal_state(journal.chain).terminals[0].state, expected)
+
+    def test_preflight_and_backend_failures_emit_rejection_without_journal_change(self):
+        for stage in ("backend", "security", "inventory", "simulation", "generation", "create"):
+            with self.subTest(stage=stage), self.journal() as journal:
+                before = provider.load_journal_state(journal.chain)
+                backend = self.backend(journal, [])
+                failure = provider.SnapshotFailure("network", "Fixture preflight failure")
+                args = ["updates-install-all", self.generation()]
+                if stage == "backend":
+                    backend = failure
+                elif stage == "generation":
+                    args[1] = "0" * 64
+                else:
+                    attribute = {"security": "require_mutation_safe", "inventory": "updates",
+                                 "simulation": "simulate", "create": "create_mutation"}[stage]
+                    getattr(backend, attribute).side_effect = failure
+                code, output, diagnostic = self.invoke(journal, args, backend)
+                self.assertEqual((code, diagnostic), (1, ""))
+                self.assertEqual([row[4] for row in rows(output.splitlines(), "operation")], ["pending", "failed"])
+                self.assertEqual(rows(output.splitlines(), "error")[0][2], "conflict" if stage == "generation" else "network")
+                self.assertEqual(len(rows(output.splitlines(), "audit")), 1)
+                self.assertEqual(output.splitlines()[-1], "complete\toperation")
+                self.assertIn("no package mutation was dispatched", output)
+                self.assertEqual(provider.load_journal_state(journal.chain), before)
+                if stage != "backend":
+                    self.assertEqual(backend.connection.calls, [])
+
+    def test_active_and_handoff_conflicts_preserve_existing_identity(self):
+        for handoff in (False, True):
+            with self.subTest(handoff=handoff), self.journal() as journal:
+                operation = self.begin(journal)
+                if handoff:
+                    with provider.lock_writable_journal(journal):
+                        provider.advance_journal_operation(journal, operation, replace(operation, state="failed",
+                            error_code="internal", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+                        provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                before = provider.load_journal_state(journal.chain)
+                backend = self.backend(journal, [])
+                code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend)
+                self.assertEqual((code, diagnostic), (1, ""))
+                self.assertEqual(rows(output.splitlines(), "error")[0][2], "conflict")
+                self.assertNotEqual(rows(output.splitlines(), "audit")[0][1], operation.operation_id)
+                self.assertEqual(provider.load_journal_state(journal.chain), before)
+                backend.require_mutation_safe.assert_not_called()
+                backend.create_mutation.assert_not_called()
+
+    def test_direct_post_reboot_commands_prune_before_any_backend_preflight(self):
+        new_boot = "abcdef01-2345-6789-abcd-ef0123456789"
+        for update in (False, True):
+            with self.subTest(update=update), self.journal() as journal:
+                operation = self.begin(journal, state="running")
+                with provider.lock_writable_journal(journal):
+                    provider.advance_journal_operation(journal, operation, replace(operation, state="succeeded",
+                        system_restart="system", session_restart="session", application_restart=True,
+                        finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+                    provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                    provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                backend = self.backend(journal, [lambda bus: bus.progress(Status=3),
+                    lambda bus: bus.emit("Finished", (1, 0))])
+                def preflight():
+                    state = provider.load_journal_state(journal.chain)
+                    self.assertEqual(state.restart, provider.JournalRestart(new_boot, None, "none", "none", 0, False, 0))
+                    self.assertIsNone(state.active)
+                    self.assertIsNone(state.handoff)
+                backend.require_mutation_safe.side_effect = preflight
+                args = ["updates-install-all", self.generation()] if update else ["updates-refresh"]
+                code, output, diagnostic = self.invoke(journal, args, backend, boot_id=new_boot)
+                self.assertEqual((code, diagnostic), (0, ""))
+                self.assertEqual(rows(output.splitlines(), "operation")[-1][4], "succeeded")
+                self.assertEqual(provider.load_journal_state(journal.chain).restart.boot_id, new_boot)
+
+    def test_old_boot_active_or_handoff_is_still_a_read_only_conflict(self):
+        new_boot = "abcdef01-2345-6789-abcd-ef0123456789"
+        for handoff in (False, True):
+            with self.subTest(handoff=handoff), self.journal() as journal:
+                operation = self.begin(journal)
+                if handoff:
+                    with provider.lock_writable_journal(journal):
+                        provider.advance_journal_operation(journal, operation, replace(operation, state="failed",
+                            error_code="internal", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+                        provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                before = provider.load_journal_state(journal.chain)
+                backend = self.backend(journal, [])
+                code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend, boot_id=new_boot)
+                self.assertEqual((code, diagnostic), (1, ""))
+                self.assertEqual(rows(output.splitlines(), "error")[0][2], "conflict")
+                self.assertEqual(provider.load_journal_state(journal.chain), before)
+                backend.require_mutation_safe.assert_not_called()
+                backend.create_mutation.assert_not_called()
+
+    def test_admission_race_rejects_before_any_write_attempt(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            competing = []
+            def create():
+                competing.append(self.begin(journal, "refresh"))
+                return "/1_test"
+            backend.create_mutation.side_effect = create
+            code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend)
+            self.assertEqual((code, diagnostic), (1, ""))
+            self.assertEqual(rows(output.splitlines(), "error")[0][2], "conflict")
+            self.assertEqual(provider.load_journal_state(journal.chain).active, competing[0])
+            self.assertEqual(backend.connection.calls, [])
+
+    def test_failed_admission_commit_never_fabricates_rejected_or_terminal_stream(self):
+        for after_commit in (False, True):
+            with self.subTest(after_commit=after_commit), self.journal() as journal:
+                backend = self.backend(journal, [])
+                begin = provider.begin_journal_operation
+                def fail(*args, **kwargs):
+                    if after_commit:
+                        begin(*args, **kwargs)
+                    raise provider.JournalCommitError("Uncertain commit")
+                with mock.patch.object(provider, "begin_journal_operation", side_effect=fail):
+                    code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn("refresh status and observe the existing operation", diagnostic)
+                self.assertEqual(provider.load_journal_state(journal.chain).active is not None, after_commit)
+                self.assertEqual(backend.connection.calls, [])
+
+    def test_lost_observation_after_admission_keeps_one_incomplete_stream(self):
+        with self.journal() as journal:
+            backend = self.backend(journal, [])
+            backend.execute_mutation = mock.Mock(side_effect=provider.SnapshotFailure("interrupted", "Lost observation"))
+            code, output, diagnostic = self.invoke(journal, ["updates-refresh"], backend)
+            self.assertEqual(code, 1)
+            self.assertEqual(len(rows(output.splitlines(), "operation")), 1)
+            self.assertNotIn("complete\toperation", output)
+            self.assertNotIn("audit\t", output)
+            self.assertNotIn("Request rejected", output)
+            self.assertIsNotNone(provider.load_journal_state(journal.chain).active)
+            self.assertIn("observe the existing operation", diagnostic)
+
+    def test_unsafe_journal_or_id_generation_failure_has_fixed_stream_free_guidance(self):
+        for stage in ("open", "id"):
+            with self.subTest(stage=stage), self.journal() as journal:
+                failure = provider.SnapshotFailure("missing-provider", "Backend unavailable")
+                name = "open_journal_directory" if stage == "open" else "generate_journal_operation_id"
+                with mock.patch.object(provider, name, side_effect=provider.JournalLayoutError("Raw unsafe diagnostic")):
+                    code, output, diagnostic = self.invoke(journal, ["updates-refresh"], failure)
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(diagnostic, "operation result could not be confirmed; refresh status and observe the existing operation\n")
+
+    def test_output_failure_before_or_after_dispatch_preserves_recovery_without_retry(self):
+        for phase in ("pending", "running"):
+            with self.subTest(phase=phase), self.journal() as journal:
+                class FailingOutput(io.StringIO):
+                    failed_writes = 0
+
+                    def write(self, value):
+                        if f"\t{phase}\t" in value:
+                            self.failed_writes += 1
+                            raise OSError("Injected output failure")
+                        return super().write(value)
+
+                output = FailingOutput()
+                backend = self.backend(journal, [lambda bus: bus.progress(Status=3),
+                    lambda bus: bus.emit("Finished", (1, 0))])
+                code, text, diagnostic = self.invoke(journal, ["updates-refresh"], backend, output)
+                self.assertEqual((code, output.failed_writes), (1, 1))
+                self.assertNotIn("Request rejected", text)
+                self.assertNotIn("complete\toperation", text)
+                self.assertIn("observe the existing operation", diagnostic)
+                state = provider.load_journal_state(journal.chain)
+                if phase == "pending":
+                    self.assertEqual(state.active.state, "pending")
+                    self.assertEqual(backend.connection.calls, [])
+                else:
+                    self.assertIsNone(state.active)
+                    self.assertEqual(state.terminals[state.handoff.slot].state, "succeeded")
+
+    def test_rejected_request_formatter_validates_before_output_and_never_builds_journal_payload(self):
+        for failure in (provider.SnapshotFailure("unknown", "Invalid"), None):
+            output = []
+            with self.assertRaises(provider.OperationProtocolError):
+                provider.reject_unadmitted_operation("op-" + "1" * 32, "updates-refresh",
+                    "2026-09-05T01:00:00Z", failure, output.append)
+            self.assertEqual(output, [])
+        output = []
+        with mock.patch.object(provider, "encode_journal_operation", side_effect=AssertionError("Must not fabricate a transaction")):
+            provider.reject_unadmitted_operation("op-" + "1" * 32, "updates-install-all",
+                "2026-09-05T01:00:00Z", provider.SnapshotFailure("conflict", "Changed preview"), output.append)
+        self.assertEqual(rows("".join(output).splitlines(), "audit")[0][2:5], ["updates-install-all", "update", "failed"])
+
+
+class OperationCancelTests(unittest.TestCase):
+    boot_id = PackageKitExecutionTests.boot_id
+    package_id = PackageKitExecutionTests.package_id
+    journal = PackageKitExecutionTests.journal
+    begin = OperationRecoveryTests.begin
+    emit = RecoveryAdapterTests.emit
+    properties = RecoveryAdapterTests.properties
+
+    def backend(self, journal, *, changes=None, event=None):
+        backend = RecoveryAdapterTests.backend(self, journal)
+        backend.GLib.MainContext = types.SimpleNamespace(default=lambda: types.SimpleNamespace(pending=lambda: False))
+        def request(path, interface, method, parameters, deadline, signature, *, destination):
+            self.assertFalse(journal._exclusive)
+            if event is not None:
+                event(backend, method)
+            if method == "GetNameOwner":
+                self.assertEqual((destination, path, interface, parameters.unpack(), signature),
+                    ("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", (provider.PACKAGEKIT_NAME,), "(s)"))
+                return SessionEvidenceTests.Variant("(s)", (":1.77",))
+            self.assertEqual((destination, path), (":1.77", "/1_test"))
+            if method == "GetAll":
+                self.assertEqual((interface, parameters.unpack(), signature),
+                    (provider.PROPERTIES_INTERFACE, (provider.TRANSACTION_INTERFACE,), "(a{sv})"))
+                return SessionEvidenceTests.Variant("(a{sv})", (self.properties(**(changes or {})),))
+            self.assertEqual((method, interface, parameters, signature), ("Cancel", provider.TRANSACTION_INTERFACE, None, "()"))
+            return SessionEvidenceTests.Variant("()", ())
+        backend._recovery_call = mock.Mock(side_effect=request)
+        return backend
+
+    def cancel(self, journal, operation, backend, *, boot_id=None):
+        dispatched = mock.Mock()
+        provider.cancel_journal_operation(journal, operation.operation_id, boot_id=boot_id or self.boot_id,
+            backend_factory=lambda: backend, on_dispatch=dispatched)
+        return dispatched
+
+    def cli(self, journal, operation_id, backend):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(pathlib.Path(journal.chain.path).parents[1])}), \
+                mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                mock.patch.object(provider, "PackageKitBackend", return_value=backend), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = provider.main(["updates-cancel", operation_id])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_exact_cancel_is_unlocked_pinned_and_never_claims_completion(self):
+        for kind in ("refresh", "update"):
+            for state in ("pending", "authorizing", "running"):
+                with self.subTest(kind=kind, state=state), self.journal() as journal:
+                    operation = self.begin(journal, kind, **({} if state == "pending" else {"state": state}))
+                    backend = self.backend(journal, changes={"Role": 13 if kind == "refresh" else 22})
+                    dispatched = self.cancel(journal, operation, backend)
+                    dispatched.assert_called_once_with()
+                    current = provider.load_journal_state(journal.chain)
+                    self.assertEqual(current.active.state, "cancel-requested" if state == "running" else state)
+                    self.assertEqual(current.active.operation_id, operation.operation_id)
+                    self.assertIsNone(current.handoff)
+                    self.assertEqual(current.terminals, (None,) * 32)
+                    self.assertEqual([call.args[2] for call in backend._recovery_call.call_args_list],
+                                     ["GetNameOwner", "GetAll", "Cancel"])
+                    self.assertEqual(len({call.args[4] for call in backend._recovery_call.call_args_list}), 1)
+                    self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_stale_terminal_regional_and_previous_boot_never_open_backend(self):
+        for case in ("stale", "terminal", "regional", "boot"):
+            with self.subTest(case=case), self.journal() as journal:
+                operation = self.begin(journal, "timezone" if case == "regional" else "update")
+                if case == "terminal":
+                    with provider.lock_writable_journal(journal):
+                        provider.advance_journal_operation(journal, operation, replace(operation, state="failed",
+                            error_code="internal", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+                before = provider.load_journal_state(journal.chain)
+                factory = mock.Mock()
+                with self.assertRaises(provider.CancelTargetUnavailable):
+                    provider.cancel_journal_operation(journal, "op-" + "0" * 32 if case == "stale" else operation.operation_id,
+                        boot_id="abcdef01-2345-6789-abcd-ef0123456789" if case == "boot" else self.boot_id,
+                        backend_factory=factory, on_dispatch=mock.Mock())
+                factory.assert_not_called()
+                self.assertEqual(provider.load_journal_state(journal.chain), before)
+
+    def test_unavailable_identity_and_cancelability_leave_active_unchanged(self):
+        for changes in ({"Role": 13}, {"Role": 0}, {"Role": True}, {"Uid": os.getuid() + 1},
+                        {"Uid": True}, {"AllowCancel": False}, {"AllowCancel": 1},
+                        {"Status": 18}, {"Status": None}, {"Status": 37}):
+            with self.subTest(changes=changes), self.journal() as journal:
+                operation = self.begin(journal, state="running")
+                backend = self.backend(journal, changes=changes)
+                self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+                self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+                self.assertNotIn("Cancel", [call.args[2] for call in backend._recovery_call.call_args_list])
+                self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_revocation_or_finish_during_getall_cannot_be_overwritten(self):
+        for member, signature, values, interface in (
+            ("PropertiesChanged", "(sa{sv}as)", (provider.TRANSACTION_INTERFACE, {"AllowCancel": False}, []), provider.PROPERTIES_INTERFACE),
+            ("PropertiesChanged", "(sa{sv}as)", (provider.TRANSACTION_INTERFACE, {}, ["Uid"]), provider.PROPERTIES_INTERFACE),
+            ("Finished", "(uu)", (1, 1), None), ("Destroy", "()", (), None),
+            ("NameOwnerChanged", "(sss)", (provider.PACKAGEKIT_NAME, ":1.77", ":1.88"), "org.freedesktop.DBus"),
+        ):
+            with self.subTest(member=member, values=values), self.journal() as journal:
+                operation = self.begin(journal)
+                def event(backend, method):
+                    if method == "GetAll":
+                        self.emit(backend, member, signature, values, interface)
+                backend = self.backend(journal, event=event)
+                self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+                self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_queued_revocation_after_journal_check_prevents_dispatch(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            queued = [True]
+            def iterate(_blocking):
+                queued.clear()
+                self.emit(backend, "PropertiesChanged", "(sa{sv}as)",
+                    (provider.TRANSACTION_INTERFACE, {"AllowCancel": False}, []), provider.PROPERTIES_INTERFACE)
+            backend.GLib.MainContext = types.SimpleNamespace(default=lambda: types.SimpleNamespace(
+                pending=lambda: bool(queued), iteration=iterate))
+            self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_noisy_context_is_bounded_and_never_dispatches(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            iterate = mock.Mock()
+            backend.GLib.MainContext = types.SimpleNamespace(default=lambda: types.SimpleNamespace(pending=lambda: True, iteration=iterate))
+            self.assertEqual(self.cli(journal, operation.operation_id, backend)[0], 3)
+            self.assertEqual(iterate.call_count, 64)
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_completion_during_lookup_is_rechecked_before_send(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            def event(_backend, method):
+                if method == "GetAll":
+                    with provider.lock_writable_journal(journal):
+                        provider.advance_journal_operation(journal, operation, replace(operation, state="succeeded",
+                            finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+            backend = self.backend(journal, event=event)
+            self.assertEqual(self.cli(journal, operation.operation_id, backend)[0], 3)
+            self.assertEqual(provider.load_journal_state(journal.chain).active.state, "succeeded")
+            self.assertNotIn("Cancel", [call.args[2] for call in backend._recovery_call.call_args_list])
+
+    def test_accepted_cancel_cannot_advance_a_replacement_operation(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            replacement = []
+            def event(_backend, method):
+                if method == "Cancel":
+                    with provider.lock_writable_journal(journal):
+                        provider.advance_journal_operation(journal, operation, replace(operation, state="succeeded",
+                            finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+                        provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                        provider.acknowledge_journal_handoff(journal, operation.operation_id)
+                    replacement.append(self.begin(journal, "refresh", state="running"))
+            self.assertEqual(self.cli(journal, operation.operation_id, self.backend(journal, event=event)), (0, "", ""))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, replacement[0])
+
+    def test_lost_cancel_reply_is_not_stale_rejection_or_completion(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            def event(_backend, method):
+                if method == "Cancel":
+                    raise provider.SnapshotFailure("timeout", "Lost cancel reply")
+            result = self.cli(journal, operation.operation_id, self.backend(journal, event=event))
+            self.assertEqual(result, (1, "", "cancellation request could not be confirmed; observe the existing operation\n"))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_backend_stale_rejection_after_send_is_stream_free_status_three(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            def event(backend, method):
+                if method == "Cancel":
+                    failure = provider.SnapshotFailure("internal", "Backend rejected stale cancel")
+                    failure.__cause__ = backend.GLib.Error("stale")
+                    raise failure
+            backend = self.backend(journal, event=event)
+            backend.Gio.dbus_error_get_remote_error = lambda _error: provider.TRANSACTION_INTERFACE + ".NotRunning"
+            self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_cancel_persistence_failure_retains_observation_guidance(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running")
+            with mock.patch.object(provider, "advance_journal_operation", side_effect=provider.JournalCommitError("Injected write failure")):
+                result = self.cli(journal, operation.operation_id, self.backend(journal))
+            self.assertEqual(result[0], 1)
+            self.assertEqual(result[1], "")
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+    def test_lookup_failure_cleans_subscriptions_without_dispatch_or_journal_change(self):
+        for stage in ("GetNameOwner", "GetAll"):
+            with self.subTest(stage=stage), self.journal() as journal:
+                operation = self.begin(journal)
+                def event(_backend, method):
+                    if method == stage:
+                        raise provider.SnapshotFailure("timeout", "Lookup timed out")
+                backend = self.backend(journal, event=event)
+                self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+                self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+                self.assertEqual(backend.connection.subscriptions, {})
+
+    def test_invalid_peer_is_rejected_before_object_access(self):
+        with self.journal() as journal:
+            operation = self.begin(journal)
+            backend = self.backend(journal)
+            backend._recovery_call = mock.Mock(return_value=SessionEvidenceTests.Variant("(s)", (provider.PACKAGEKIT_NAME,)))
+            self.assertEqual(self.cli(journal, operation.operation_id, backend), (3, "", "cancel target is unavailable\n"))
+            backend._recovery_call.assert_called_once()
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+
+
+class RecoverySnapshotTests(unittest.TestCase):
+    boot_id = PackageKitExecutionTests.boot_id
+    journal = PackageKitExecutionTests.journal
+    begin = OperationRecoveryTests.begin
+
+    def backend(self, **kwargs):
+        backend = FixtureBackend(**kwargs)
+        backend.require_mutation_safe = mock.Mock()
+        backend.session_started = mock.Mock(return_value=0)
+        backend.probe_operation = mock.Mock(return_value=provider.RecoveryEvidence(False))
+        backend.operation_history = mock.Mock(return_value=())
+        return backend
+
+    def snapshot(self, journal, backend, *, boot_id=None):
+        state_home = str(pathlib.Path(journal.chain.path).parents[1])
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state_home}), \
+                mock.patch.object(provider, "read_boot_id", return_value=boot_id or self.boot_id):
+            return provider.build_managed_snapshot(backend)
+
+    def restart(self, journal, **changes):
+        cutoffs = sorted({changes[key] for key in ("session_cutoff", "application_cutoff") if key in changes}) or [100]
+        for index, cutoff in enumerate(cutoffs):
+            operation = self.begin(journal, state="running",
+                system_restart=changes.get("system", "none") if index == 0 else "none",
+                session_restart=changes.get("session", "none") if cutoff == changes.get("session_cutoff") else "none",
+                application_restart=changes.get("application", False) if cutoff == changes.get("application_cutoff") else False)
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, replace(operation,
+                    state="succeeded", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=cutoff))
+                provider.complete_journal_terminal(journal, boot_id=self.boot_id)
+                provider.acknowledge_journal_handoff(journal, operation.operation_id)
+
+    def restart_row(self, output):
+        return next(row for row in rows(output, "state") if row[1] == "update-restart")
+
+    def test_core_cli_never_constructs_optional_information_readers(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": directory}), \
+                mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                mock.patch.object(provider, "PackageKitBackend", return_value=self.backend()), \
+                mock.patch.object(provider, "NativeSnapshotSources", return_value=FixtureNativeSources()), \
+                mock.patch.object(provider, "InformationSnapshotSources", side_effect=AssertionError("Optional probe")) as information, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(provider.main(["snapshot-core"]), 0)
+        information.assert_not_called()
+        self.assertEqual(stdout.getvalue().splitlines()[0], "system-management-protocol\t1\t1")
+        self.assertEqual(len(rows(stdout.getvalue().splitlines(), "provider")), 6)
+
+    def test_cli_initializes_only_its_fixed_journal_and_offers_safe_refresh(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": directory}), \
+                mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                mock.patch.object(provider, "PackageKitBackend", return_value=self.backend()), \
+                mock.patch.object(provider, "NativeSnapshotSources", return_value=FixtureNativeSources()), \
+                mock.patch.object(provider, "InformationSnapshotSources", return_value=InformationSnapshotTests().sources()), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(provider.main(["snapshot"]), 0)
+            output = stdout.getvalue().splitlines()
+            self.assertEqual(output[-1], "complete\tsnapshot")
+            self.assertEqual(self.restart_row(output)[2:4], ["available", "none"])
+            self.assertEqual([row[2] for row in rows(output, "action")[:3]],
+                ["available", "unavailable", "unavailable"])
+            self.assertEqual(output[0], "system-management-protocol\t1\t2")
+            self.assertEqual(len(rows(output, "action")), 11)
+            path = pathlib.Path(directory) / "dwm-titus" / "system-management"
+            self.assertEqual({item.name for item in path.iterdir()}, set(provider.JOURNAL_NAMES))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_complete_safe_plan_offers_confirmed_origins_without_dispatch(self):
+        update = package(8, "fixture;2;noarch;updates", "Update")
+        backend = self.backend(updates=(update,), plan=(
+            package(11, update.package_id, "Update"),
+            package(12, "dependency;1;noarch;updates", "Dependency"),
+            package(15, "old;1;noarch;installed", "Obsolete")))
+        with self.journal() as journal:
+            output = self.snapshot(journal, backend)
+            self.assertEqual([row[2] for row in rows(output, "action")],
+                ["available", "available", "unavailable"])
+            self.assertEqual(rows(output, "provider")[0][2], "available")
+            self.assertEqual(len(rows(output, "package-change")), 3)
+            backend.require_mutation_safe.assert_called_once_with()
+            self.assertIsNone(provider.load_journal_state(journal.chain).active)
+            self.assertIsNone(provider.load_journal_state(journal.chain).handoff)
+
+    def test_unsafe_backend_blocks_origins_without_hiding_inventory(self):
+        update = package(8, "fixture;2;noarch;updates", "Update")
+        backend = self.backend(updates=(update,), plan=(package(11, update.package_id, "Update"),))
+        backend.require_mutation_safe.side_effect = provider.SnapshotFailure(
+            "unsupported", "PackageKit security floor is not satisfied", "unsupported")
+        with self.journal() as journal:
+            output = self.snapshot(journal, backend)
+            self.assertEqual([row[2] for row in rows(output, "action")], ["unavailable"] * 3)
+            self.assertEqual(len(rows(output, "update")), 1)
+            self.assertEqual(len(rows(output, "package-change")), 1)
+            self.assertIn(["error", "updates", "unsupported", "PackageKit security floor is not satisfied"],
+                rows(output, "error"))
+
+    def test_failed_or_unsupported_plan_blocks_only_install(self):
+        update = package(8, "fixture;2;noarch;updates", "Update")
+        cases = (
+            {"plan_failure": provider.SnapshotFailure("timeout", "Simulation timed out")},
+            {"plan": ()},
+            {"plan": (package(11, update.package_id, "Update"),
+                      package(19, "extra;1;noarch;installed", "Reinstall"))},
+        )
+        for case in cases:
+            with self.subTest(case=case), self.journal() as journal:
+                output = self.snapshot(journal, self.backend(updates=(update,), **case))
+                self.assertEqual([row[2] for row in rows(output, "action")],
+                    ["available", "unavailable", "unavailable"])
+                self.assertEqual(len(rows(output, "update")), 1)
+
+    def test_failed_discovery_can_offer_explicit_refresh_but_not_install(self):
+        with self.journal() as journal:
+            output = self.snapshot(journal, self.backend(updates_failure=
+                provider.SnapshotFailure("network", "Repository is offline")))
+            self.assertEqual([row[2] for row in rows(output, "action")],
+                ["available", "unavailable", "unavailable"])
+            self.assertIn(["error", "updates", "network", "Repository is offline"], rows(output, "error"))
+
+    def test_incomplete_recovery_blocks_origins_and_skips_security_probe(self):
+        backend = self.backend()
+        backend.session_started.side_effect = provider.SnapshotFailure("timeout", "Logind timed out")
+        with self.journal() as journal:
+            output = self.snapshot(journal, backend)
+            self.assertEqual([row[2] for row in rows(output, "action")], ["unavailable"] * 3)
+            backend.require_mutation_safe.assert_not_called()
+
+    def test_malformed_inventory_blocks_all_origins(self):
+        for result in (
+            {"updates": (package(99, "fixture;2;noarch;updates", "Invalid info"),)},
+            {"updates_failure": provider.SnapshotFailure("malformed", "Invalid transaction output")},
+        ):
+            with self.subTest(result=result), self.journal() as journal:
+                output = self.snapshot(journal, self.backend(**result))
+                self.assertEqual([row[2] for row in rows(output, "action")], ["unavailable"] * 3)
+                self.assertEqual(rows(output, "update"), [])
+                self.assertEqual(rows(output, "package-change"), [])
+                self.assertIn("malformed", [row[2] for row in rows(output, "error")])
+
+    def test_existing_owner_or_handoff_blocks_origins_and_skips_security_probe(self):
+        for active in (True, False):
+            with self.subTest(active=active), self.journal() as journal:
+                operation = self.begin(journal, "refresh")
+                backend = self.backend()
+                if active:
+                    backend.probe_operation.return_value = provider.RecoveryEvidence(True, allow_cancel=True)
+                output = self.snapshot(journal, backend)
+                self.assertEqual([row[2] for row in rows(output, "action")][:2], ["unavailable"] * 2)
+                backend.require_mutation_safe.assert_not_called()
+                self.assertEqual(rows(output, "active-operation" if active else "terminal-handoff")[0][1],
+                    operation.operation_id)
+
+    def test_durable_restart_overrides_discovery_and_survives_missing_packagekit(self):
+        for unavailable in (False, True):
+            with self.subTest(unavailable=unavailable), self.journal() as journal:
+                self.restart(journal, system="system", session="security-session", session_cutoff=100)
+                backend = self.backend(restart_types=(1,), updates_failure=
+                    provider.SnapshotFailure("missing-provider", "PackageKit is absent", "unavailable") if unavailable else None)
+                output = self.snapshot(journal, backend)
+                self.assertEqual(self.restart_row(output)[2:4], ["available", "security-system"])
+                self.assertEqual(output[-1], "complete\tsnapshot")
+
+    def test_new_session_prunes_independent_cutoffs_before_display(self):
+        with self.journal() as journal:
+            self.restart(journal, session="security-session", session_cutoff=100, application=True, application_cutoff=300)
+            backend = self.backend()
+            backend.session_started.return_value = 200
+            output = self.snapshot(journal, backend)
+            self.assertEqual(self.restart_row(output)[2:4], ["available", "application"])
+            state = provider.load_journal_state(journal.chain)
+            self.assertEqual((state.restart.session, state.restart.application), ("none", True))
+
+    def test_missing_session_evidence_retains_known_guidance_as_partial(self):
+        with self.journal() as journal:
+            self.restart(journal, session="security-session", session_cutoff=100)
+            backend = self.backend()
+            backend.session_started.side_effect = provider.SnapshotFailure("timeout", "Logind timed out")
+            output = self.snapshot(journal, backend)
+            self.assertEqual(self.restart_row(output)[2:4], ["partial", "security-session"])
+            self.assertIn(["error", "recovery", "timeout", "Logind timed out"], rows(output, "error"))
+            self.assertEqual(provider.load_journal_state(journal.chain).restart.session, "security-session")
+
+    def test_new_boot_clears_all_guidance_durably(self):
+        with self.journal() as journal:
+            self.restart(journal, system="unknown", session="session", session_cutoff=100, application=True, application_cutoff=100)
+            new_boot = "abcdef01-2345-6789-abcd-ef0123456789"
+            output = self.snapshot(journal, self.backend(), boot_id=new_boot)
+            self.assertEqual(self.restart_row(output)[2:4], ["available", "none"])
+            self.assertEqual(provider.load_journal_state(journal.chain).restart.boot_id, new_boot)
+
+    def test_logind_failure_does_not_reintroduce_guidance_satisfied_by_reboot(self):
+        with self.journal() as journal:
+            self.restart(journal, system="unknown", session="session", session_cutoff=100)
+            backend = self.backend()
+            backend.session_started.side_effect = provider.SnapshotFailure("missing-provider", "Logind missing")
+            output = self.snapshot(journal, backend, boot_id="abcdef01-2345-6789-abcd-ef0123456789")
+            self.assertEqual(self.restart_row(output)[2:4], ["partial", "none"])
+
+    def test_read_only_journal_failure_preserves_validated_prior_guidance(self):
+        with self.journal() as journal:
+            self.restart(journal, system="security-system")
+            with mock.patch.object(provider, "initialize_journal_layout", side_effect=OSError(errno.EROFS, "Read-only fixture")):
+                output = self.snapshot(journal, self.backend())
+            self.assertEqual(self.restart_row(output)[2:4], ["partial", "security-system"])
+
+    def test_active_lookup_precedes_logind_and_emits_exact_finite_identity(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            backend = self.backend()
+            def probe(record, **_kwargs):
+                self.assertEqual(record, operation)
+                self.assertFalse(journal._exclusive)
+                backend.session_started.assert_not_called()
+                return provider.RecoveryEvidence(True, percent=27, allow_cancel=True)
+            backend.probe_operation.side_effect = probe
+            output = self.snapshot(journal, backend)
+            self.assertEqual(rows(output, "active-operation")[0][1:7],
+                [operation.operation_id, operation.action_id, "refresh", "pending", "27", "yes"])
+            self.assertEqual(next(row[2] for row in rows(output, "action") if row[1] == "updates-cancel"), "available")
+            self.assertEqual(rows(output, "terminal-handoff"), [])
+            self.assertEqual(output[-1], "complete\tsnapshot")
+
+    def test_lookup_timeout_preserves_active_identity_and_does_not_guess_absence(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            backend = self.backend()
+            backend.probe_operation.side_effect = provider.SnapshotFailure("timeout", "Lookup expired")
+            output = self.snapshot(journal, backend)
+            self.assertEqual(rows(output, "active-operation")[0][1], operation.operation_id)
+            self.assertEqual(rows(output, "active-operation")[0][6], "no")
+            self.assertEqual(next(row[2] for row in rows(output, "action") if row[1] == "updates-cancel"), "unavailable")
+            self.assertEqual(provider.load_journal_state(journal.chain).active, operation)
+            self.assertIn(["error", "recovery", "timeout", "Lookup expired"], rows(output, "error"))
+
+    def test_absent_refresh_becomes_durable_interrupted_handoff(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            output = self.snapshot(journal, self.backend())
+            self.assertEqual(rows(output, "active-operation"), [])
+            self.assertEqual(rows(output, "terminal-handoff"),
+                [["terminal-handoff", operation.operation_id, operation.action_id, "refresh"]])
+            self.assertEqual(provider.load_journal_state(journal.chain).terminals[operation.slot].state, "interrupted")
+
+    def test_terminalized_update_is_completed_and_pruned_before_handoff(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, state="running", session_restart="session")
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, replace(operation,
+                    state="succeeded", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+            backend = self.backend()
+            backend.session_started.return_value = 200
+            output = self.snapshot(journal, backend)
+            backend.probe_operation.assert_not_called()
+            backend.operation_history.assert_not_called()
+            self.assertEqual(self.restart_row(output)[2:4], ["available", "none"])
+            self.assertEqual(rows(output, "terminal-handoff")[0][1], operation.operation_id)
+            self.assertIsNone(provider.load_journal_state(journal.chain).active)
+
+    def test_stranded_regional_state_is_not_emitted_as_packagekit_active(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "timezone")
+            backend = self.backend()
+            output = self.snapshot(journal, backend)
+            backend.probe_operation.assert_not_called()
+            self.assertEqual(rows(output, "active-operation"), [])
+            self.assertEqual(rows(output, "terminal-handoff")[0][1], operation.operation_id)
+            self.assertEqual(provider.load_journal_state(journal.chain).terminals[operation.slot].state, "interrupted")
+
+    def test_prune_failure_retains_prior_guidance_without_publishing_handoff(self):
+        with self.journal() as journal:
+            self.restart(journal, session="security-session", session_cutoff=100)
+            backend = self.backend()
+            backend.session_started.return_value = 200
+            with mock.patch.object(provider, "commit_writable_journal_path", side_effect=provider.JournalCommitError("Injected write failure")):
+                output = self.snapshot(journal, backend)
+            self.assertEqual(self.restart_row(output)[2:4], ["partial", "security-session"])
+            self.assertEqual(rows(output, "active-operation") + rows(output, "terminal-handoff"), [])
+            self.assertEqual(provider.load_journal_state(journal.chain).restart.session, "security-session")
+
+    def test_unsafe_journal_does_not_hide_readable_inventory_or_touch_replacement(self):
+        with self.journal() as journal:
+            path = pathlib.Path(journal.chain.path) / "handoff"
+            path.chmod(0o644)
+            try:
+                before = path.read_bytes()
+                backend = self.backend(updates=(package(9, "held;2;x86_64;updates", "Held"),))
+                output = self.snapshot(journal, backend)
+                self.assertEqual(len(rows(output, "update")), 1)
+                self.assertEqual(rows(output, "active-operation") + rows(output, "terminal-handoff"), [])
+                self.assertEqual(self.restart_row(output)[2:4], ["partial", "unknown"])
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+            finally:
+                path.chmod(0o600)
+
+    def test_backend_construction_failure_still_completes_durable_handoff(self):
+        with self.journal() as journal:
+            operation = self.begin(journal, "refresh")
+            with provider.lock_writable_journal(journal):
+                provider.advance_journal_operation(journal, operation, replace(operation,
+                    state="failed", error_code="internal", finished_at="2026-09-05T01:00:00Z", terminal_monotonic=100))
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(pathlib.Path(journal.chain.path).parents[1])}), \
+                    mock.patch.object(provider, "read_boot_id", return_value=self.boot_id), \
+                    mock.patch.object(provider, "PackageKitBackend", side_effect=provider.SnapshotFailure("missing-provider", "Bindings missing")), \
+                    mock.patch.object(provider, "NativeSnapshotSources", return_value=FixtureNativeSources()), \
+                mock.patch.object(provider, "InformationSnapshotSources", return_value=InformationSnapshotTests().sources()), \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(provider.main(["snapshot"]), 0)
+            self.assertEqual(rows(stdout.getvalue().splitlines(), "terminal-handoff")[0][1], operation.operation_id)
+
+
+class FixtureNativeSources:
+    """Typed finite results; no test silently consults or launches host providers."""
+
+    def __init__(self):
+        self.time_state = mock.Mock(return_value=provider.RegionalTimeState("America/Chicago", True, True, False))
+        self.locale_state = mock.Mock(return_value=provider.parse_locale_configuration(("LANG=en_US.UTF-8", "LC_TIME=C")))
+        account = provider.AccountRecord("/arbitrary/current", "current", "Current user", "fixture", True)
+        self.accounts = mock.Mock(return_value=provider.AccountInventory((account,), (account.path,), account.path, "available", ()))
+        self.printers = mock.Mock(return_value=provider.CupsState("available", "socket-ready", (), ()))
+        self.repositories = mock.Mock(return_value=(provider.RepositoryRow("fedora", True, "Fedora"),
+            provider.RepositoryRow("disabled", False, "Disabled source")))
+        self.delegate = mock.Mock(return_value=(("/usr/bin/fixed-fixture",), "Fixture tool"))
+        self.admission = mock.Mock()
+
+
+class NativeSnapshotTests(unittest.TestCase):
+    def snapshot(self, sources=None, *, backend=None, active=False, recovery_failure=None, missing_state=False, information=None):
+        fixture = RecoverySnapshotTests()
+        sources = sources or FixtureNativeSources()
+        backend = backend or fixture.backend()
+        with fixture.journal() as journal:
+            if active:
+                fixture.begin(journal, "timezone")
+            recovery = provider.RecoverySnapshot(None if missing_state else provider.load_journal_state(journal.chain),
+                failures=(recovery_failure,) if recovery_failure else ())
+            with mock.patch.object(provider, "read_recovery_snapshot", return_value=recovery), \
+                    mock.patch.object(provider, "launch_delegated_tool") as launch:
+                output = provider.build_managed_snapshot(backend, native_sources=sources, information_sources=information)
+            launch.assert_not_called()
+            return output
+
+    def by_id(self, output, kind):
+        return {row[1]: row for row in rows(output, kind)}
+
+    def test_minor_two_keeps_information_and_health_available_during_blocked_recovery(self):
+        source = FixtureNativeSources()
+        source.admission.side_effect = provider.SnapshotFailure("conflict", "Journal blocked")
+        output = self.snapshot(source, information=InformationSnapshotTests().sources())
+        self.assertEqual(output[0], "system-management-protocol\t1\t2")
+        self.assertEqual(len(rows(output, "provider")), 10)
+        self.assertEqual(len(rows(output, "state")), 28)
+        actions = self.by_id(output, "action")
+        self.assertEqual(actions["health-open"][2:5], ["available", "user-session", "diagnostics"])
+        self.assertEqual(actions["timezone-set"][2], "unavailable")
+        self.assertEqual(self.by_id(output, "state")["selinux"][2:4], ["available", "enforcing"])
+        self.assertEqual(len(rows(output, "filesystem")), 1)
+        self.assertEqual(rows(output, "snapshot-generation"), rows(self.snapshot(), "snapshot-generation"))
+        output = self.snapshot(active=True, information=InformationSnapshotTests().sources())
+        self.assertEqual(self.by_id(output, "action")["health-open"][2], "available")
+
+    def test_information_requires_the_complete_native_minor(self):
+        with self.assertRaises(ValueError), mock.patch.object(provider, "read_recovery_snapshot") as recovery:
+            provider.build_managed_snapshot(FixtureBackend(), information_sources=InformationSnapshotTests().sources())
+        recovery.assert_not_called()
+
+    def test_complete_cumulative_set_and_no_dispatch(self):
+        sources = FixtureNativeSources()
+        output = self.snapshot(sources)
+        self.assertEqual(output[0], "system-management-protocol\t1\t1")
+        self.assertEqual(output[-1], "complete\tsnapshot")
+        self.assertEqual(len(rows(output, "provider")), 6)
+        self.assertEqual(len(rows(output, "state")), 9)
+        self.assertEqual(len(rows(output, "action")), 10)
+        self.assertEqual(len(rows(output, "account")), 1)
+        self.assertEqual(len(rows(output, "repository")), 2)
+        self.assertEqual(self.by_id(output, "state")["accounts-count"][2:4], ["available", "1"])
+        self.assertEqual(self.by_id(output, "state")["ntp-synchronized"][3], "no")
+        self.assertEqual(self.by_id(output, "state")["locale"][3:], ["en_US.UTF-8", "LC_TIME=C"])
+        for method in (sources.time_state, sources.locale_state, sources.accounts,
+                       sources.printers, sources.repositories, sources.admission):
+            method.assert_called_once_with()
+        self.assertEqual({call.args[0] for call in sources.delegate.call_args_list}, provider.DELEGATED_ACTIONS)
+        self.assertEqual(rows(output, "error"), [])
+        self.assertEqual(provider.build_snapshot(FixtureBackend())[0], "system-management-protocol\t1\t0")
+
+    def test_independent_reader_failures_keep_every_mandatory_record(self):
+        for name, owner, state_id in (("time_state", "regional", "timezone"),
+                ("locale_state", "regional", "locale"), ("accounts", "accounts", "accounts-count"),
+                ("printers", "printers", "cups-service"), ("repositories", "sources", None)):
+            with self.subTest(name=name):
+                sources = FixtureNativeSources()
+                getattr(sources, name).side_effect = provider.SnapshotFailure("permission-denied", "Read denied", "restricted")
+                output = self.snapshot(sources)
+                self.assertEqual(len(rows(output, "provider")), 6)
+                self.assertEqual(len(rows(output, "state")), 9)
+                self.assertEqual(len(rows(output, "action")), 10)
+                if state_id:
+                    self.assertEqual(self.by_id(output, "state")[state_id][2:4], ["restricted", "unknown"])
+                self.assertIn(["error", owner, "permission-denied", "Read denied"], rows(output, "error"))
+                self.assertEqual(self.by_id(output, "state")["locale" if name == "time_state" else "timezone"][2], "available")
+                self.assertEqual(self.by_id(output, "action")["accounts-open"][2], "available")
+
+    def test_missing_tools_preserve_rows_and_readable_state(self):
+        sources = FixtureNativeSources()
+        sources.delegate.side_effect = provider.SnapshotFailure("missing-provider", "Tool is missing", "unavailable")
+        output = self.snapshot(sources)
+        self.assertEqual(len(rows(output, "account")), 1)
+        self.assertEqual(len(rows(output, "repository")), 2)
+        self.assertEqual(self.by_id(output, "state")["cups-service"][2:4], ["available", "socket-ready"])
+        for identifier in provider.DELEGATED_ACTIONS:
+            self.assertEqual(self.by_id(output, "action")[identifier][2], "unavailable")
+        self.assertEqual(self.by_id(output, "action")["timezone-set"][2], "available")
+
+    def test_partial_accounts_and_running_printer_survive_scoped_errors(self):
+        sources = FixtureNativeSources()
+        failure = provider.SnapshotFailure("timeout", "Optional lookup timed out", "unavailable")
+        sources.accounts.return_value = replace(sources.accounts.return_value, status="partial", errors=(failure,))
+        sources.printers.return_value = provider.CupsState("available", "running", (), (failure,))
+        output = self.snapshot(sources)
+        self.assertEqual(len(rows(output, "account")), 1)
+        self.assertEqual(self.by_id(output, "state")["accounts-count"][2:4], ["partial", "unknown"])
+        self.assertEqual(self.by_id(output, "state")["cups-service"][2:4], ["available", "running"])
+        self.assertEqual(self.by_id(output, "provider")["printers"][2], "partial")
+
+    def test_native_offers_do_not_require_packagekit_or_logind_safety(self):
+        fixture = RecoverySnapshotTests()
+        backend = fixture.backend()
+        backend.require_mutation_safe.side_effect = provider.SnapshotFailure("unsupported", "Update security floor is unavailable")
+        for failure in (None, provider.SnapshotFailure("missing-provider", "No logind session", "unavailable")):
+            with self.subTest(failure=failure):
+                sources = FixtureNativeSources()
+                output = self.snapshot(sources, backend=backend, recovery_failure=failure)
+                actions = self.by_id(output, "action")
+                self.assertEqual(actions["updates-refresh"][2], "unavailable")
+                for identifier in provider.JOURNAL_OPERATION_ACTION_KINDS:
+                    if identifier not in {"updates-refresh", "updates-install-all"}:
+                        self.assertEqual(actions[identifier][2], "available")
+                sources.admission.assert_called_once_with()
+
+    def test_missing_recovery_active_owner_and_admission_failures_block_native(self):
+        for scenario in ("missing", "active", "admission"):
+            with self.subTest(scenario=scenario):
+                sources = FixtureNativeSources()
+                if scenario == "admission":
+                    sources.admission.side_effect = provider.SnapshotFailure("conflict", "Journal is busy")
+                output = self.snapshot(sources, active=scenario == "active", missing_state=scenario == "missing")
+                for row in rows(output, "action")[3:]:
+                    self.assertEqual(row[2], "unavailable")
+                if scenario != "admission":
+                    sources.admission.assert_not_called()
+                self.assertEqual(self.by_id(output, "state")["timezone"][2], "available")
+
+    def test_ntp_and_unwritable_locale_preserve_readable_status(self):
+        for assignments in (("LANG=en_US.UTF-8", "LANGUAGE=en:fr"), ("LANG=en_US.UTF-8", "LC_TIME=")):
+            sources = FixtureNativeSources()
+            sources.time_state.return_value = replace(sources.time_state.return_value, can_ntp=False)
+            sources.locale_state.return_value = provider.parse_locale_configuration(assignments)
+            output = self.snapshot(sources)
+            actions = self.by_id(output, "action")
+            self.assertEqual(actions["ntp-set"][2], "unavailable")
+            self.assertEqual(actions["locale-set"][2], "unavailable")
+            self.assertEqual(actions["timezone-set"][2], "available")
+            self.assertEqual(self.by_id(output, "state")["locale"][2:4], ["available", "en_US.UTF-8"])
+        sources.locale_state.return_value = provider.parse_locale_configuration(("LANG=old:invalid", "LC_TIME=C"))
+        self.assertEqual(self.by_id(self.snapshot(sources), "action")["locale-set"][2], "available")
+        sources.locale_state.return_value = provider.parse_locale_configuration(("LANG=",))
+        output = self.snapshot(sources)
+        self.assertEqual(self.by_id(output, "state")["locale"][2:4], ["available", ""])
+        self.assertEqual(self.by_id(output, "action")["locale-set"][2], "available")
+
+    def test_list_count_byte_and_duplicate_failures_discard_only_owner(self):
+        for family in ("account-count", "account-bytes", "account-duplicate", "repository-count", "repository-bytes", "repository-duplicate"):
+            with self.subTest(family=family):
+                sources = FixtureNativeSources()
+                if family.startswith("account"):
+                    original = sources.accounts.return_value
+                    count = 257 if family.endswith("count") else 256 if family.endswith("bytes") else 2
+                    records = tuple(provider.AccountRecord("/arbitrary/" + str(i) if not family.endswith("duplicate") else "/same",
+                        "other", "x" * 512, "y" * 512, True) for i in range(count))
+                    sources.accounts.return_value = replace(original, records=records)
+                    owner, kind = "accounts", "account"
+                else:
+                    count = 513 if family.endswith("count") else 512 if family.endswith("bytes") else 2
+                    records = tuple(provider.RepositoryRow((str(i) + "x" * 500) if not family.endswith("duplicate") else "same",
+                        True, "y" * 512) for i in range(count))
+                    sources.repositories.return_value = records
+                    owner, kind = "sources", "repository"
+                output = self.snapshot(sources)
+                self.assertEqual(rows(output, kind), [])
+                self.assertTrue(any(row[1:3] == [owner, "malformed"] for row in rows(output, "error")))
+                self.assertEqual(self.by_id(output, "state")["timezone"][2], "available")
+
+    def test_non_list_and_total_byte_reservations(self):
+        provider.validate_snapshot_size(["account\trow"] * 9216)
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.validate_snapshot_size(["account\trow"] * 9217)
+        provider.validate_snapshot_size(["future\t" + "x" * (1024 * 1024 - 8)])
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.validate_snapshot_size(["future\t" + "x" * (1024 * 1024 - 7)])
+        with self.assertRaises(provider.SnapshotFailure):
+            provider.validate_snapshot_size(["account\t" + "x" * (8 * 1024 * 1024)])
+
+    def test_real_native_admission_is_fedora_gated_and_does_not_commit(self):
+        fixture = RecoverySnapshotTests()
+        with fixture.journal() as journal:
+            before = {name: os.pread(journal.descriptor(name), provider.JOURNAL_FILE_SIZE, 0) for name in provider.JOURNAL_NAMES}
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(pathlib.Path(journal.chain.path).parents[1])}), \
+                    mock.patch.object(provider, "read_fedora_identity", return_value={"ID": "fedora"}) as identity:
+                provider.NativeSnapshotSources().admission()
+                identity.assert_called_once_with()
+            self.assertEqual(before, {name: os.pread(journal.descriptor(name), provider.JOURNAL_FILE_SIZE, 0) for name in provider.JOURNAL_NAMES})
+            with mock.patch.object(provider, "read_fedora_identity", side_effect=provider.SnapshotFailure("unsupported", "Not Fedora")), \
+                    mock.patch.object(provider, "open_journal_directory") as open_journal:
+                with self.assertRaises(provider.SnapshotFailure):
+                    provider.NativeSnapshotSources().admission()
+                open_journal.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

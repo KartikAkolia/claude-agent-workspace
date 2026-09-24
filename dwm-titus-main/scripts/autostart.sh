@@ -330,7 +330,6 @@ resume_theme_preview() {
 	fi
 }
 
-PICOM_BACKEND=${PICOM_BACKEND:-xrender}
 WM_GRAPHICAL_SESSION=wm-graphical-session.service
 
 # ── Phase 1: Blocking ──────────────────────────────────────────────────────────
@@ -380,6 +379,53 @@ THEME_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/dwm-titus/theme-env.sh"
 # shellcheck disable=SC1090
 [ -f "$THEME_ENV" ] && . "$THEME_ENV"
 
+# Share custom installation data roots with GTK, the shell and D-Bus apps.
+data_updater=$(command -v dwm-desktop-update 2>/dev/null || :)
+# dwm execs this user-data script directly. Its executable identifies the
+# installation even when the display manager did not add PREFIX/bin to PATH.
+session_executable=$(readlink "/proc/$PPID/exe" 2>/dev/null || :)
+session_executable=${session_executable%" (deleted)"}
+case $session_executable in
+*/bin/dwm)
+	if [ -x "${session_executable%/*}/dwm-desktop-update" ]; then
+		data_updater=${session_executable%/*}/dwm-desktop-update
+		# Descendant shell/settings helpers must select this installation too.
+		case $PATH in
+		"${session_executable%/*}:"*) ;;
+		*)
+			PATH=${session_executable%/*}:$PATH
+			export PATH
+			;;
+		esac
+	fi
+	;;
+esac
+if [ -n "$data_updater" ] && session_data_dirs=$("$data_updater" data-directories 2>/dev/null); then
+	XDG_DATA_DIRS=$session_data_dirs
+	export XDG_DATA_DIRS
+fi
+XDG_DATA_DIRS=${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+export XDG_DATA_DIRS
+
+# Native GTK applications in the plain Xorg session consume text scaling from
+# XSETTINGS. Reconcile the project-owned xsettingsd instance before launching
+# the shell, portals, or XDG autostart applications.
+xsettings_helper=
+case $0 in
+*/*)
+	xsettings_candidate=${0%/*}/dwm-xsettings
+	[ ! -x "$xsettings_candidate" ] || xsettings_helper=$xsettings_candidate
+	;;
+esac
+if [ -z "$xsettings_helper" ] && command -v dwm-xsettings >/dev/null 2>&1; then
+	xsettings_helper=dwm-xsettings
+fi
+if [ -n "$xsettings_helper" ]; then
+	timeout --signal=TERM --kill-after=1 8 \
+		"$xsettings_helper" session-apply >/dev/null 2>&1 ||
+		printf '%s\n' 'dwm-titus: managed X11 text scaling is unavailable' >&2
+fi
+
 desktop_tokens=${XDG_CURRENT_DESKTOP:-}
 case :$desktop_tokens: in
 *:dwm:*) ;;
@@ -403,7 +449,7 @@ if command -v systemctl >/dev/null 2>&1; then
 	{
 		systemctl --user unset-environment WAYLAND_DISPLAY
 		systemctl --user import-environment \
-			DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP DESKTOP_SESSION \
+			DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP DESKTOP_SESSION XDG_DATA_DIRS \
 			XDG_SESSION_TYPE QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME \
 			XCURSOR_THEME XCURSOR_SIZE
 	} &
@@ -413,7 +459,7 @@ if command -v dbus-update-activation-environment >/dev/null 2>&1; then
 	{
 		dbus-update-activation-environment WAYLAND_DISPLAY=
 		dbus-update-activation-environment --systemd \
-			DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP DESKTOP_SESSION \
+			DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP DESKTOP_SESSION XDG_DATA_DIRS \
 			XDG_SESSION_TYPE QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME \
 			XCURSOR_THEME XCURSOR_SIZE
 	} 2>/dev/null &
@@ -424,7 +470,11 @@ fi
 
 # Start Quickshell before XDG autostart applications, then wait for the tray IPC
 # endpoint before activating the rest of the graphical session.
-QUICKSHELL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/shell.qml"
+case ${XDG_CONFIG_HOME:-} in
+/*) quickshell_config_home=$XDG_CONFIG_HOME ;;
+*) quickshell_config_home=${HOME:?HOME is required for XDG_CONFIG_HOME fallback}/.config ;;
+esac
+QUICKSHELL_CONFIG=$quickshell_config_home/quickshell/shell.qml
 if [ -f "$QUICKSHELL_CONFIG" ]; then
 	quickshell_check=
 	quickshell_compatible=0
@@ -452,12 +502,11 @@ xdg_autostart_started=0
 
 # Activate user graphical-session.target through the wm shim so portal services
 # and XDG autostart entries start only after the display environment is ready.
+# Refresh generated entries first: an installer may have seeded user exclusions
+# after this user manager started, even when the wm shim already exists.
 if command -v systemctl >/dev/null 2>&1; then
-	if systemctl --user start "$WM_GRAPHICAL_SESSION" 2>/dev/null ||
-		{
-			systemctl --user daemon-reload 2>/dev/null &&
-				systemctl --user start "$WM_GRAPHICAL_SESSION" 2>/dev/null
-		}; then
+	if systemctl --user daemon-reload 2>/dev/null &&
+		systemctl --user start "$WM_GRAPHICAL_SESSION" 2>/dev/null; then
 		xdg_autostart_started=1
 	fi
 fi
@@ -486,7 +535,10 @@ if command -v feh >/dev/null 2>&1; then
 fi
 
 # Compositor
-start_detached_once picom picom --backend "$PICOM_BACKEND"
+if command -v picom >/dev/null 2>&1; then
+	picom_helper=$(command -v dwm-settings-picom 2>/dev/null || printf '%s' "${0%/*}/dwm-settings-picom")
+	"$picom_helper" start >/dev/null 2>&1 &
+fi
 
 # dwm root-window status publisher for Quickshell's event-driven panel.
 start_detached_display_command_once dwm-status

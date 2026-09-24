@@ -3,10 +3,15 @@
 # Build an installer ISO with:
 # scripts/build-dwm-fedora-installer-iso.sh --variant nvidia
 # The local checkout is available at /run/install/repo/dwm-titus during install.
-# Storage, locale, keyboard layout, timezone, hostname, root password, and user
-# creation are intentionally left to the Anaconda UI.
+# Drive selection, erasure confirmation, locale, keyboard layout, timezone,
+# hostname, root password, and user creation remain in the Anaconda UI.
 
 network --bootproto=dhcp --activate
+
+# Use regular partitions with /home inside the root filesystem. Anaconda
+# supplies firmware-specific boot partitions. The ISO builder sets uncapped
+# layout defaults through product.img. Leave partitioning commands out so
+# installation still requires the user to review and confirm selected disks.
 
 firstboot --disable
 selinux --disabled
@@ -78,6 +83,7 @@ xset
 xsetroot
 xinput
 setxkbmap
+xkbset
 dbus-x11
 procps-ng
 psmisc
@@ -85,14 +91,32 @@ xclip
 xdotool
 xprop
 xdg-utils
+celluloid
+mpv
+sxiv
+desktop-file-utils
+brave-origin
 flatpak
 %include /tmp/dwm-titus-gaming-packages
 quickshell
+bubblewrap
+libseccomp
+PackageKit
+PackageKit-glib
+python3
+python3-gobject
+python3-rpm
+accountsservice
+cups
+system-config-printer
+lxqt-admin
+dnfdragora
 lightdm
 slick-greeter
 alacritty
 kitty
 picom
+xsettingsd
 feh
 maim
 dex-autostart
@@ -116,6 +140,8 @@ libnotify
 light-locker
 xorg-x11-drv-libinput
 dconf
+adwaita-icon-theme
+papirus-icon-theme
 arc-theme
 adw-gtk3-theme
 numix-gtk-theme
@@ -162,6 +188,9 @@ set -eu
 
 repo_dir=/opt/dwm-titus
 install_sudoers=/etc/sudoers.d/90-dwm-titus-install
+# Never leave installer-only authorization behind after a failed setup.
+trap 'rm -f "$install_sudoers"' EXIT
+trap 'exit 1' HUP INT TERM
 target_user=$(
 	awk -F: '$3 >= 1000 && $3 < 60000 && $6 ~ "^/home/" && $7 !~ /(nologin|false)$/ { print $1; exit }' /etc/passwd
 )
@@ -203,8 +232,11 @@ chown -R "$target_user:$target_group" "$target_repo_dir"
 install -m 0440 /dev/null "$install_sudoers"
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$target_user" > "$install_sudoers"
 
-su - "$target_user" -c 'cd "$HOME/.local/share/dwm-titus" && ./install.sh --non-interactive --profile core'
-su - "$target_user" -c 'cd "$HOME/.local/share/dwm-titus" && scripts/install-gearlever'
+# The complete desktop needs the recommended profile's verified Meslo font
+# and Gear Lever setup. Do not query the installer's host AccountsService from
+# this target chroot: it cannot resolve the newly created target user. This
+# private provisioning bus does not change the installed session's policy.
+su - "$target_user" -c 'cd "$HOME/.local/share/dwm-titus" && dbus-run-session -- sh -c "export DBUS_SYSTEM_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS; exec ./install.sh --non-interactive --profile recommended"'
 
 if getent group gamemode >/dev/null 2>&1; then
 	usermod -aG gamemode "$target_user"

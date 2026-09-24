@@ -109,7 +109,7 @@ else
 	printf "  ${RED}✗${NC} Xorg or Xlibre ${YELLOW}(missing)${NC}\n"
 	MISSING=$((MISSING + 1))
 fi
-for command in startx xrandr xset xsetroot; do
+for command in startx xrandr xset xsetroot xkbset; do
 	check_cmd "$command"
 done
 
@@ -118,6 +118,8 @@ echo "Runtime Dependencies (desktop experience):"
 check_cmd "quickshell"
 check_cmd "picom"
 check_cmd "feh"
+check_cmd "xsettingsd"
+check_cmd "bwrap"
 check_optional_cmd "maim"
 check_cmd "xclip"
 check_cmd "xdotool"
@@ -136,14 +138,14 @@ echo ""
 # ── Terminal emulators ──────────────────────────────────
 echo "Terminal Emulators (at least one required):"
 TERM_FOUND=0
-for term in alacritty kitty st; do
+for term in dwmterm alacritty kitty st warp-terminal xterm; do
 	if command -v "$term" &>/dev/null; then
 		printf "  ${GREEN}✓${NC} %s\n" "$term"
 		TERM_FOUND=1
 	fi
 done
 if [ $TERM_FOUND -eq 0 ]; then
-	printf "  ${RED}✗${NC} No supported terminal found ${YELLOW}(install alacritty, kitty, or st)${NC}\n"
+	printf "  ${RED}✗${NC} No supported terminal found ${YELLOW}(install dwmterm, alacritty, kitty, st, warp-terminal, or xterm)${NC}\n"
 	MISSING=$((MISSING + 1))
 fi
 if command -v herdr &>/dev/null; then

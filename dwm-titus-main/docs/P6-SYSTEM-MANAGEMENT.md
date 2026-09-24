@@ -1,0 +1,2967 @@
+# Phase 6 System Management Contract
+
+<!-- markdownlint-disable MD013 -->
+
+Date: 2026-09-02
+
+## Scope and Ownership
+
+Phase 6 adds bounded Fedora system management without making Quickshell an
+administration shell. Settings and all QML remain unprivileged. Each operation
+has one fixed owner, and system policy and authorization stay with the Fedora
+service or trusted Fedora tool that already owns them.
+
+The implementation boundaries are:
+
+1. PackageKit-backed Fedora update status and transactions.
+2. Regional state plus trusted account, printer, and software-source entry
+   points.
+3. System information, storage, privacy/security status, diagnostics, and
+   recovery integration.
+4. Combined Fedora 44 and nested-X11 qualification.
+
+No Phase 6 operation expands the project-owned privileged helper allowlist.
+An operation that cannot satisfy the project privilege contract remains
+delegated or unsupported.
+
+## Capability and Mutation Inventory
+
+| Capability | Read owner | Mutation owner | Class | Cancellation and denial | Phase 6 disposition |
+| --- | --- | --- | --- | --- | --- |
+| Update status and available packages | Patched PackageKit system D-Bus API using the Fedora DNF5 backend | PackageKit `UpdatePackages` with the fixed `ONLY_TRUSTED` transaction flag and PackageKit polkit policy | Read-only and delegated | Mutation requires upstream PackageKit 1.3.5 or newer, or Fedora's `1.3.4-3.fc44` security backport. Blocked updates remain visible but are excluded from installation. The transaction `AllowCancel` property is authoritative. Cancel is offered only while true. Authorization denial ends the operation without hiding the last readable snapshot. | Implement |
+| Package metadata refresh | PackageKit transaction | PackageKit `RefreshCache` transaction | Delegated | Starts only from an explicit Refresh action. PackageKit owns cancellation and repository/network errors. | Implement |
+| Update interruption and history | PackageKit active transaction list, transaction signals, and PackageKit transaction history | None | Read-only | An operation journal identifies incomplete local operations. PackageKit remains the source of truth for transaction completion. | Implement |
+| Date, timezone, and NTP | `org.freedesktop.timedate1` properties | `SetTimezone` and `SetNTP` with interactive authorization | Read-only and delegated | A pending confirmation can be canceled before the D-Bus call. Denial preserves properties and reports no change. Manual clock setting is not exposed. | Implement |
+| System locale | `org.freedesktop.locale1` properties | `SetLocale` with interactive authorization | Read-only and delegated | A pending confirmation can be canceled before the D-Bus call. Denial preserves properties and reports no change. Success includes logout guidance. Keyboard layout remains owned by Input Settings. | Implement |
+| User accounts | AccountsService object and user properties | Fedora `lxqt-admin-user` entry point; current-user password uses a fixed terminal `passwd` entry point | Read-only and delegated | Settings never accepts usernames, passwords, group names, or arbitrary account commands. Missing tools leave the account summary readable. | Implement entry points; do not implement account mutation |
+| Printers | CUPS service availability | Fedora `system-config-printer` | Read-only and delegated | The trusted tool and CUPS own printer discovery, authentication, cancellation, and device policy. Missing CUPS or tool state is capability-scoped. | Implement entry point |
+| Software sources | PackageKit repository records | Fedora `dnfdragora` when installed | Read-only and delegated | Settings does not accept repository identifiers for mutation. The delegated tool owns confirmation and authorization. | Implement entry point |
+| System identity and resources | Bounded `/etc/os-release`, `uname(2)`, `org.freedesktop.hostname1`, `/proc/cpuinfo`, `/proc/meminfo`, `CLOCK_BOOTTIME`, and fixed `findmnt --json` records | None | Read-only | Probe failures remain per record. No background poller is added. | Implement |
+| Storage overview | Existing `dwm-system-health` structured snapshot | Existing fixed user and installed-helper repairs only | Read-only, user-session, and privileged | Existing confirmation, authorization-denial, and fixed repair allowlists remain unchanged. | Reuse and link |
+| Privacy and security status | The fixed sources in the Security Status section below | Trusted Fedora tools or documented recovery guidance | Read-only and delegated | Probe status and semantic value remain distinct: for example, an inaccessible probe is `restricted` with value `unknown`, while a successful disabled probe is `available` with value `disabled`. No firewall, encryption, or SELinux mutation is added. | Implement status and guidance |
+| Diagnostics and recovery | Existing `dwm-system-health` and `dwm-diagnostics` records | Existing fixed repair actions and exported evidence | Read-only, user-session, and privileged | Denial leaves the user scan visible. Broad service names and commands remain rejected. | Reuse and link |
+| Advanced storage, firewall policy, general services, encryption setup, and factory reset | No narrow provider | Trusted external administration or reinstall/recovery documentation | Delegated | Unsupported status is used where no trusted entry point exists. No generic elevation, command runner, device path, service name, or arbitrary file path crosses QML. | Explicitly exclude |
+
+## Selected Fedora Interfaces
+
+### Package Updates
+
+PackageKit is the Phase 6 update owner. Fedora 44 exposes PackageKit 1.3 with
+the DNF5 backend, update discovery, repository discovery, update transactions,
+transaction lists, authorization checks, progress signals, error codes,
+restart guidance, and cancellation state. The provider consumes the documented
+PackageKit GLib/D-Bus API rather than parsing `dnf`, `pkcon`, or terminal text.
+Update inventory always calls `SetHints` with the exact read-only hints
+`background=true`, `interactive=false`, and `cache-age=4294967295` before
+calling `GetUpdates` with PackageKit's `NONE` filter. The maximum unsigned
+cache age directs PackageKit to reuse any usable metadata. PackageKit may still
+acquire metadata when its backend requires that work to return any result; the
+UI presents that as update discovery, never as a user-requested refresh. The
+transaction has a 120-second monotonic aggregate deadline from
+`CreateTransaction` through `Finished` and accepts at most 4096 unique update
+rows. A timeout or additional row uses the same bounded cancel, five-second
+grace, and detach sequence defined below, reports `timeout` or `malformed`, and
+does not start simulation. The explicit Refresh action calls `RefreshCache`
+with `force=true`; passive
+discovery never calls that method or starts a mutable update transaction.
+Beyond its required read-only `GetUpdates` transaction, it may create only the
+separate unjournaled `SIMULATE|ONLY_TRUSTED` read-only transaction defined in
+the lifecycle contract below.
+
+The update command grammar is fixed:
+
+```text
+dwm-system-management snapshot
+dwm-system-management watch-updates
+dwm-system-management watch-operation OPERATION_ID
+dwm-system-management ack-operation OPERATION_ID
+dwm-system-management updates-refresh
+dwm-system-management updates-install-all GENERATION
+dwm-system-management updates-cancel OPERATION_ID
+```
+
+`GENERATION` is the exact 64-character lowercase hexadecimal generation emitted
+with the confirmed snapshot. It is an opaque provider-created value, not a
+package ID or caller-selected transaction parameter. No update command accepts
+another option or trailing argument.
+
+The refresh and install CLI entry points now use the durable execution owner.
+Before opening a backend, they require an empty active record and handoff and
+apply current-boot restart pruning under the journal lock. A direct CLI request
+after reboot therefore does not depend on a prior snapshot. Existing active or
+unacknowledged operations still reject as conflicts without changing their
+journal state; snapshot recovery and exact acknowledgment remain explicit.
+An explicit install request requires the exact confirmed generation, repeats
+inventory and simulation, and rejects mismatch before mutable admission. These
+commands return 0 only after a durable `succeeded` result and complete stream;
+every other terminal result returns 1. A rejection before admission emits a
+`pending` then `failed` request, its typed error, audit, and completion, using a
+fresh ID collision-checked against validated journal identities under the lock.
+This rejected request is not persisted or replayable: no PackageKit path,
+active record, terminal slot, restart contribution, or handoff is fabricated.
+The original operation, if any, is unchanged. If the journal cannot safely
+supply an ID, the command instead returns 1 without a stream and with fixed
+recovery guidance. Once an admission write may have started or output has been
+attempted, a failure never falls back to that rejected-request stream. It
+returns 1 with recovery guidance and leaves the actual journal for observation.
+The root-scoped Quickshell observer now restores active operations and terminal
+handoffs from a finite startup snapshot, retains a sole exact-ID watch across
+Settings closure, and acknowledges only a fully validated matching result.
+Stream parsing consumes each run's raw-byte notifications; process completion
+never reuses output retained by an earlier collector run. Terminal text is
+provisional until audit, completion, and normal exit pass. Malformed observers
+are terminated without canceling the PackageKit transaction. Three delayed
+snapshot-and-watch retries use one, two, and four seconds; exhaustion and failed
+acknowledgment retain explicit reload guidance. Pane-only reads still stop when
+Settings closes, while required recovery reads continue. The root owner also
+accepts the two fixed update origins and seven fixed native origins, validates their origin-specific exit code,
+and retains nonterminal progress logs until a verified terminal can be appended.
+Pre-admission failed requests reconcile a fresh empty journal without inventing
+a handoff or acknowledgment. Uncertain origins use the same bounded watch
+recovery without reissuing the mutable command. Exact-ID cancellation shares one
+bounded control process with acknowledgment; it reports only an accepted request,
+keeps the observer alive, and reconciles handoffs received while cancellation is
+running. These internal calls are not exposed by IPC. Settings requires a visible
+confirmation, fresh discovery, complete recovery, exact action availability,
+and an unowned update workflow before preparing or accepting a new action.
+An unconfirmed cancellation reply retains a separate exact-ID uncertainty guard,
+without claiming acceptance or resending the control. Same-ID observer recovery
+keeps that guard despite repeated `AllowCancel` hints; a different operation does
+not inherit it. The existing stream and bounded recovery remain the outcome
+owners.
+A stale-target cancellation response uses a distinct exact-ID conflict guard
+before releasing control ownership. Cached progress and same-ID recovery cannot
+resend that rejected control; a different operation establishes a new target.
+
+The System pane separates read-only **Reload status** from **Refresh metadata**
+and **Install updates**. Both mutable actions open an explicit confirmation;
+installation captures a copied, complete bounded preview including dependency
+additions and removals, with full package identities. The preview is current
+evidence, not an atomic frozen PackageKit plan. Confirm rechecks the captured
+generation, discovery epoch, request generation, action availability, and owner
+state. Global invalidation publishes nonfresh state before clearing the prompt,
+preventing reentrant callbacks from using the old inventory. Acknowledgment
+invalidates discovery after journal ownership clears; a burst that exhausts the
+two-read limit requires the visible Reload status action, not an automatic third
+read. Denial preserves the readable inventory and verified audit.
+
+The virtualized preview and bounded operation log support Home, End, Page Up,
+Page Down, and arrow navigation. Focusing a control or list scrolls it into the
+outer viewport. Private native fixtures exercise the buttons, invalidation,
+unavailable action/monitor/recovery paths, denial, closure, and cancellation.
+Fedora 44 nested-X11 manual checks on 2026-09-06 covered 640x480, 780x580,
+and 1000x740 windows, Tab/Enter decline and confirmation, and all 4096 preview
+rows through Home/End. No host package mutation was performed. Real PackageKit
+execution qualification and installed-runtime parity remain phase requirements.
+Captured evidence shows the [final preview rows](public/images/p6-update-preview-tail.png)
+and [keyboard-focused confirmation controls](public/images/p6-update-confirmation-focus.png)
+inside the compact viewport.
+
+An identity-free snapshot establishes an empty journal when recovery is
+available, or a complete minor 1 snapshot with structurally valid recovery
+contains a validated available native offer. The producer offers native actions
+only after independent journal admission; missing update security or session
+evidence cannot block that independent path. Invalid native owners and missing
+or malformed recovery cannot supply this proof. Update controls still require
+available update recovery. Incomplete journal evidence retains the readable snapshot and takes
+the same bounded recovery path; it cannot silently abandon an unknown owner.
+An exact validated active identity or handoff remains usable when unrelated
+restart or session evidence is partial.
+Snapshots received while acknowledgment is in flight retain any newer active
+identity or handoff. The root resumes observation after that control exits,
+without clearing a different operation's handoff or overlapping live streams.
+Opening or explicitly refreshing Settings during recovery may replace its
+backoff with an immediate read, but that replacement remains required recovery
+work. Closing the pane cannot cancel it and strand the operation.
+The root retains the last 32 successful acknowledgment identities in memory,
+matching the journal's retention bound. A delayed snapshot cannot resurrect
+their active/handoff cards or send an acknowledgment that already succeeded.
+
+`OPERATION_ID` must exactly match the `op-` prefix followed by 32 lowercase
+hexadecimal digits emitted for the currently visible operation. The provider
+generates and reserves it while holding the exclusive journal lock, using the
+kernel CSPRNG. It rejects a collision with the active record, any of the 32
+terminal records, or the restart record's last-applied operation ID, and fails
+closed after four collision attempts. A
+cancel request is accepted only when this ID still equals the active journaled
+refresh or update operation and that exact PackageKit transaction currently
+reports `AllowCancel=true`. A stale, unknown, terminal, or replaced ID, or an
+exact active transaction that no longer reports `AllowCancel=true`, produces a
+command-level rejection: the command emits no operation stream, exits with
+status 3, and writes only the fixed diagnostic `cancel target is unavailable`
+to standard error. The root model maps status 3 directly to a visible
+`conflict`, refreshes current state, and never parses the diagnostic. The active
+operation and any newer operation remain unchanged. Malformed command syntax,
+including an invalid ID shape, exits with status 2 instead. Before matching,
+`watch-operation` takes the exclusive journal lock and completes the bounded,
+idempotent recovery sequence for any terminalized active payload, including its
+terminal-slot, cursor, handoff, and empty-active commits. A terminalized update
+also completes its restart-record commit; no other operation kind reads or
+writes that record. The command then requires that
+the ID match either the current validated nonterminal operation
+payload or, when the active payload is empty, exactly one validated
+terminal record with that ID among the 32 fixed ring slots. Operation IDs are
+collision-checked against every retained slot when created, so more than one
+matching slot is malformed recovery state. The matching terminal record is
+accepted regardless of its position relative to the cursor, but only when its
+validated kind is any operation kind in the closed protocol enum. Active
+service adoption remains limited to PackageKit `refresh` and `update`. Native
+and delegated owners are observed through their journal lease and checkpoints,
+never by reopening a service or program. A retained terminal record is replay-only.
+The command uses only the transaction path bound inside a matching
+active PackageKit record. It may
+recover or replay bounded terminal evidence when the exact transaction finished
+after the snapshot, but never accepts an arbitrary transaction path, an
+unrelated terminal record, or a caller-supplied substitute ID. If terminalized-active
+recovery cannot complete, or a correctly shaped ID does not match either
+permitted validated identity, the command emits no stream, exits with status 3,
+and writes
+only the fixed diagnostic `watch target is unavailable` to standard error. The
+root model maps that status to `conflict` and immediately requests a fresh
+snapshot as the next recovery attempt.
+
+For regional and delegated operations, `watch-operation` establishes an inotify
+watch on the retained `active` inode before its first recovery read. One bounded
+event batch triggers one exact-ID journal recheck; unchanged progress is coalesced.
+The originating process retains the lease and owns all service work. The observer
+never invokes a service, infers a target from current settings, requests native
+cancellation, or repeats an action. Lost/overflowed notifications and changed
+file or operation identities fail observation without claiming a terminal result.
+Recovery compares the original ID and every immutable action field before any
+service access or journal write, including a same-ID replacement or terminal.
+Every journal access still validates the complete retained path chain.
+
+Native observation has a fixed 120-second event-wait budget, followed by one
+final fresh recovery read through the existing bounded journal-lock intervals.
+Events never extend that deadline. The final read matters because Linux can
+deliver a close notification before releasing its file lock; a dying owner
+must not strand a watcher awaiting another event. If ownership is then free,
+normal orphan recovery records `interrupted`; a still-held lease instead ends
+only observation with timeout guidance and leaves the active owner intact.
+There is no recurring idle poller, auxiliary waiter process, or service lookup.
+Closing the observer releases its event descriptor and all associated watches.
+An exact durable terminal record for any valid kind replays without reissuing
+its external action.
+
+Operation controls write fixed formatter bundles through isolated stream
+writers. Each bundle fits Linux `PIPE_BUF`; a full pipe or short write fails the
+observer without a backlog or a shutdown-buffer retry. Failure diagnostics are
+nonblocking and best-effort, including when stderr shares the full output pipe.
+Pipes and character devices are reopened through their retained `/proc/self/fd`
+identity with nonblocking, close-on-exec, and no-controlling-terminal flags.
+These handles have independent open-file descriptions, not `dup`-shared flags;
+packet pipes retain packet mode. Sockets use per-call `MSG_DONTWAIT` output.
+Inherited file-status flags never change, including during observation and after
+forced SIGKILL, so concurrent parent writers retain their behavior. Regular-file
+output retains its shared offset and append semantics; bounded record sizes do
+not impose a hard storage-I/O deadline. Private handles close on normal/error
+exit and handled TERM/INT/HUP, with prior signal handlers restored; the kernel
+closes them after SIGKILL too. Control exit status
+remains authoritative when diagnostics cannot be delivered. Output failure does
+not cancel the operation owner or acknowledge its handoff.
+The public cancel control pins PackageKit's unique D-Bus peer and uses one
+ten-second aggregate deadline for owner lookup, exact-object validation, and
+the `Cancel` request. It checks the transaction's exact role and invoking UID,
+observes cancelability revocation, completion, destruction, and owner changes,
+and revalidates the journal identity before sending. It drains at most 64 queued
+main-context dispatches after the bounded journal lock; excess activity rejects
+the control instead of creating an unbounded watcher. No D-Bus call runs under
+the journal lock. A successful method reply records `cancel-requested` only
+when the same operation is still `running`; pending/authorizing operations do
+not acquire a fabricated running phase. The existing observer alone records
+the eventual terminal result. An uncertain post-dispatch failure exits 1 with
+fixed observation guidance and no stream, preserving the operation for recovery.
+A typed backend stale-target rejection retains the stream-free status 3 above.
+
+Finite snapshots now initialize or validate the fixed journal, recover its
+bounded state, and apply restart satisfaction before publishing active or
+handoff identities. Journal or logind failure preserves readable update
+discovery and reports recovery errors; known restart guidance remains visible
+with `partial` status. Incomplete recovery disables new Settings mutations.
+Snapshot active rows and the cancel action now advertise the exact
+observed cancelability, or remain unavailable when no trustworthy observation
+exists. The public cancel command always revalidates that hint. Live watch
+streams continue to report the exact PackageKit cancelability observation.
+After bounded initial adoption validates the exact object, the live watcher
+keeps those same subscriptions without a silence deadline or polling timer.
+Bus loss, malformed evidence, or a failed output/checkpoint ends observation
+without a terminal success claim or a `Cancel` call. A failure after stream
+output begins exits 1 with fixed interruption guidance, not the stream-free
+stale-target status 3.
+The watcher obtains logind session evidence only after transaction observation
+has captured a terminal result or exact absence, before the unlocked result is
+committed. A current live phase can update displayed authorization state without
+erasing uncertainty about earlier execution; a later authorization phase alone
+cannot prove an earlier unknown phase never changed packages.
+
+The root model calls `ack-operation` only for an exact durable handoff that it
+has received in a snapshot. It first validates either the matching originating
+terminal operation, audit row, and completion already in memory or their exact
+retained-terminal replay. A terminal stream alone never triggers acknowledgment;
+the root requests a snapshot after it completes so the committed handoff remains
+the authority. Pre-handoff failures therefore require no acknowledgment.
+Acknowledgment takes the exclusive journal lock, completes any terminalized
+active commit sequence, and clears the terminal-handoff record only when it
+names the same validated retained terminal slot and operation ID. It emits no
+protocol stream. Success exits 0; a well-formed ID that is stale, unknown,
+inconsistent with the validated journal state, or replaced exits 3 with only
+`ack target is unavailable` on standard error and leaves the handoff unchanged.
+Invalid command or operation-ID syntax exits 2. Acknowledgment never removes or
+rewrites the retained terminal slot and never invokes an external service.
+Journal-only control completion uses the boot evidence but does not invent a
+logind timestamp or open logind for replay/acknowledgment. Same-boot session and
+application guidance is conservatively retained until snapshot recovery obtains
+session evidence and prunes it before publishing `update-restart`. The required
+snapshot before acknowledgment is also the normal display reconciliation point.
+
+The PackageKit service is authoritative for package state. The project provider
+adds only validation, bounded record formatting, a private operation journal,
+and the fixed Settings lifecycle. `UpdatePackages` always uses PackageKit's
+`ONLY_TRUSTED` transaction flag. Before exposing update mutation, the provider
+uses RPM version comparison and requires upstream PackageKit 1.3.5 or newer, or
+the Fedora 44 security-backport floor `1.3.4-3.fc44`; an older or unrecognized
+build leaves discovery readable but reports the install action unavailable.
+This gate protects the transaction flags from local-client reinvocation. The
+provider never runs DNF concurrently, assumes a PackageKit transaction
+succeeded from process exit alone, or reports an update complete before the
+`Finished` result arrives.
+
+`update-last-refresh` comes only from PackageKit's system-bus
+`GetTimeSinceAction(REFRESH_CACHE)` method. A result from 0 through 4294967294 is
+`available` and emitted as canonical unsigned decimal seconds; Settings labels
+it as the age of the latest successful system metadata refresh, including one
+started by another PackageKit client. The reserved `G_MAXUINT` result
+`4294967295` means PackageKit has no usable success history and maps to
+`partial`/`unknown`, never to an elapsed age. The project neither persists,
+updates, nor clears this value, and passive `GetUpdates` does not itself
+substitute a timestamp. Missing PackageKit or a call failure is
+`unavailable`/`unknown`, an absent method is `unsupported`/`unknown`, and a
+malformed reply is `partial`/`unknown`. The call has its own ten-second
+monotonic deadline. On expiry the provider cancels the local D-Bus request,
+discards a late reply, emits `update-last-refresh` as
+`unavailable`/`unknown` with an updates `timeout` error, and completes the rest
+of the bounded snapshot.
+
+### Regional State
+
+`org.freedesktop.timedate1` and `org.freedesktop.locale1` are the stable systemd
+D-Bus owners. Settings reads their properties directly and invokes only the
+fixed `SetTimezone`, `SetNTP`, or `SetLocale` methods after confirmation. The
+interactive-authorization argument remains enabled so systemd and polkit own
+the decision. Arbitrary environment variables, keymaps, NTP servers, RTC mode,
+or manual timestamps are not accepted.
+
+The user-approved 2026-09-06 regional exception in `SPEC.md` applies only to
+these three fixed mutations. Before dispatch, the visible confirmation can be
+canceled without a service call. It must explicitly warn that a sent change
+cannot be canceled. After dispatch, the operation reports `cancelable=no` and
+does not offer a cancellation control; canceling a local D-Bus request never
+means that the service mutation was canceled or undone. Closing Settings must
+not stop the required operation owner or verification. The bounded timeout and
+fresh-state recovery below remain mandatory, and any later corrective mutation
+requires a new confirmation. This exception does not permit arbitrary system
+administration or weaken update cancellation.
+
+The internal read-only regional reader now has three fixed requests: timedate1
+`GetAll`, locale1 `Get(Locale)`, and timedate1 `ListTimezones`. Each single-use
+reader bounds asynchronous bus connection, method reply, and decoding under one
+ten-second monotonic deadline. Timeout cancels local work and discards late
+callbacks without retrying or closing the shared bus connection. Required
+property signatures are checked before publication. The timedate1 property map
+accepts at most 64 unique bounded property names, ignores unknown properties,
+and validates the timezone and three NTP fields. Locale and timezone string
+array counts and serialized field sizes are checked before creating Python
+string copies. These readers enable no new CLI or snapshot minor on their own.
+
+The `Locale` array is parsed only as the allowlisted keys `LANG`, `LANGUAGE`,
+and `LC_CTYPE`, `LC_NUMERIC`, `LC_TIME`, `LC_COLLATE`, `LC_MONETARY`,
+`LC_MESSAGES`, `LC_PAPER`, `LC_NAME`, `LC_ADDRESS`, `LC_TELEPHONE`,
+`LC_MEASUREMENT`, and `LC_IDENTIFICATION`. Duplicate, unknown, malformed, or
+oversized assignments make the locale state `partial`/`unknown`. The array may
+contain at most 14 assignments, each complete `KEY=VALUE` assignment may be at
+most 512 UTF-8 bytes, and the sum of assignment byte lengths plus one separator
+byte per assignment may be at most 8192 bytes. A value exactly at any limit is
+accepted; an entry, count, or aggregate one unit over its limit is oversized.
+Otherwise the `locale` state value is the exact `LANG` value, or `unknown` when
+`LANG` is not set. Its detail is the nonempty `LANGUAGE` and `LC_*` assignments
+in the fixed order above, joined by a comma and one ASCII space, or `none`
+when there are no overrides. If that complete UTF-8 detail exceeds the protocol
+field limit of 512 bytes, the provider never truncates it: locale becomes
+`partial`/`unknown`, `locale-set` becomes unavailable, and the detail reports
+that the override set is too large to confirm safely. Immediately before
+confirmation and again before the D-Bus call,
+`locale-set LANG=LOCALE GENERATION` rereads locale1's complete `Locale` array, validates
+the allowlist and bounds above, replaces only `LANG`, preserves every validated
+`LANGUAGE` and `LC_*` assignment, sorts the complete set in the fixed order
+above, recomputes the complete display detail, and revalidates every bound
+before passing it to `SetLocale`. A malformed or undisplayable set, or a
+monitored state change before the method is sent, produces `conflict` and
+requires fresh confirmation. After the method returns, the provider rereads
+`Locale` and compares effective locale values, not raw array equality: `LANG`
+must equal the requested locale, every preserved `LANGUAGE` value must remain
+equal, and each preserved `LC_*` category must resolve to its prior value after
+applying the normal `LANG` fallback. A notification received after the final
+pre-call read whose complete effective map equals that expected result is the
+notification for this call and is ignored; any non-equivalent notification or
+final effective-value mismatch reports `conflict`, refreshes visible state, and
+warns that a concurrent writer may have won or been overwritten.
+
+locale1 merges omitted keys from its current configuration and simplifies
+redundant values; it does not simply replace the whole assignment array.
+It also applies its own language fallback policy. See the
+[systemd 259 SetLocale implementation](https://github.com/systemd/systemd/blob/v259/src/locale/localed.c).
+The provider still supplies the complete validated preserved set and verifies
+the required effective values. locale1 exposes no lock or compare-and-set
+argument, so no client can make this cross-client read-modify-write fully
+atomic. An external writer in the final read-to-method interval can therefore
+still be overwritten even though the provider detects its notification when
+available. The confirmation states this limitation, shows the preserved
+overrides, and explains that applications require a new login to consume the
+change. This effective-value comparison permits locale1 to omit a redundant
+`LC_*` assignment without producing a false conflict.
+
+A locale selection with an existing explicit `LANGUAGE` that is empty or
+identical to the new `LANG` is rejected before confirmation or dispatch.
+localed's fallback and simplification cannot preserve that assignment exactly.
+Read-only parsing still preserves its presence; the provider neither drops the
+override from its comparison nor sends a known non-preserving change. See the
+[systemd 259 simplification implementation](https://github.com/systemd/systemd/blob/v259/src/basic/locale-util.c).
+
+Mutation preflight also checks the complete prepared array against localed's
+write-value grammar before admission. Every value must be a nonempty locale
+name of fewer than 128 ASCII bytes using letters, digits, underscore, dot,
+hyphen, or `@`, excluding `.` and `..`. This excludes some readable override
+sets, including colon-separated LANGUAGE preference lists and empty LC values.
+They remain readable and generation-bound; the mutation reports `unsupported`
+instead of dropping an override or sending a known-invalid array. This grammar
+check does not normalize preserved aliases or claim they are installed; the
+platform remains responsible for accepting installed values. See the
+[systemd 259.8 SetLocale validation](https://github.com/systemd/systemd/blob/v259.8/src/locale/localed.c).
+
+The internal regional mutation client now validates Fedora identity and fresh
+catalog/configuration evidence, pins the unique platform-service owner, and
+requires acknowledged property and owner subscriptions before its final read.
+It calls only the three fixed methods with both interactive-authorization flags
+enabled. Required caller hooks reserve durable admission/authorization before
+dispatch and a running checkpoint only after a successful reply. The client
+drains at most 64 nonblocking event-loop iterations after synchronous admission
+work; a busy or changed configuration rejects the request. Relevant non-equivalent
+or invalidated notifications remain conflicts even if final state later matches.
+Synchronization-only NTP samples do not invalidate configuration. Completion
+requires a fresh typed read and a final owner check under the same 60-second
+budget as the mutating call. Local cancellation stops observation, not the
+platform action, and late callbacks cannot publish a result.
+
+Unit and private-bus fixtures cover fixed arguments, generation rejection,
+authorization denial, owner replacement, conflict retention, callback floods,
+failed lifecycle hooks, unsupported preserved locale values, cleanup, and a real
+60-second ambiguous timeout after the fixture service has changed state. Cleanup
+removes local subscriptions and acknowledged match rules without closing the shared bus or removing another
+client's rejected/unrequested rule. An unconfirmed rule whose acknowledgment
+cannot be recovered is ultimately removed when that bus connection exits.
+The three fixed regional CLI origins now use a durable native journal owner.
+After fresh service preflight, admission and the active-file lease are acquired
+under one short directory lock; service waits retain the lease, not that lock.
+Every phase is committed before publication, and terminal retention/handoff is
+committed before a complete result is emitted. Native records do not modify the
+update restart aggregate. Locale success includes new-login guidance without
+logging out the user.
+
+Output loss before dispatch aborts the request; after dispatch it suppresses
+further output but keeps verification and durable terminal recording alive.
+Uncertain admission or checkpoint persistence never produces a replacement
+request or fabricated completion. Full, short, or closed CLI output fails
+without changing inherited file-status flags. Pre-admission rejections have a
+typed failed-request stream but create no journal transaction. Journal storage
+operations retain their existing bounded-lock contract, not a hard disk-I/O
+deadline.
+
+Actual CLI/private-bus fixtures cover all three fixed calls, live leases,
+durable handoffs, denial, stale generation, ambiguous replies, output loss after
+dispatch, retained replay, and acknowledgment without repeating the action.
+For an ambiguous sent result other than an explicit local stop, a new
+independent read begins only after durable
+interruption and lease release; it cannot reclassify the terminal result.
+That read uses the same cooperative read boundary as the finite NTP sample;
+a signal during it stops observation without changing the retained terminal.
+Settings still needs its own display refresh and confirmation/origin controls.
+Cumulative minor 1 discovery is described below. These fixtures do not change
+host settings or qualify graphical polkit authorization.
+
+The native CLI handles TERM, INT, and HUP during regional service observation
+without raising through GLib callbacks, where Python exceptions can be swallowed.
+The first signal sets a synchronous stop flag and queues one high-priority
+main-context stop; repeated signals coalesce. Pending work and final dispatch
+checks consult that flag, including after argument and timeout preparation, so
+the current callback cannot ignore a stop while the queued callback waits.
+Queuing prevents a quit just before `MainLoop.run()` from being lost.
+Pending stop sources are removed when observation ends. Cooperative handlers
+remain installed through durable terminalization and native-lease release, then
+are restored; repeated stops cannot interrupt that cleanup. A first stop during
+cleanup also suppresses any optional follow-up read without queuing an unused
+main-loop source. The caller rejects success explicitly if interruption races
+with observer completion. Locale enumeration retains its own subprocess-group
+cleanup and signal coalescing; its handled signal exit is converted into the
+typed regional preflight rejection only after that cleanup returns.
+A pre-admission stop emits the normal typed rejection without creating an
+operation or sending a mutation. After dispatch, the existing durable owner
+records `interrupted`, retains the terminal/handoff, and releases its lease;
+the platform change may still complete. No service-side cancellation or rollback
+is claimed. An explicit local stop does not enter the optional post-terminal
+service read, allowing the command to return after cleanup. Settings must still
+refresh state before another confirmation. Existing journal persistence failures
+remain uncertain recovery, not fabricated terminal completion.
+
+Eighteen private-bus cases run actual CLI children for all three fixed actions,
+with each handled signal before and after dispatch. They require normal exit 1
+within a four-second fixture guard, no traceback, no pre-dispatch mutation,
+durable interrupted post-dispatch handoff, released lease, no automatic retry or
+post-stop read, and no terminal change after a late service reply. Separate
+tests inject the startup gap, locale enumeration stops, repeated signals at
+just-completed reads, and signals during terminal commit and lease release.
+Twenty-seven argument-construction, timer-arming, and final request-preparation
+injections also prove stops after the last preflight event drain prevent all
+three mutating bus calls. Once dispatch handoff has begun, a stop still retains
+the conservative unconfirmed result rather than claiming the platform did nothing.
+
+Each regional mutation uses a 60-second monotonic aggregate deadline beginning
+immediately before the fixed mutating D-Bus method is sent and covering its
+reply plus the required verification read. The operation emits `authorizing`
+before the send and emits `running` only after a successful method reply, before
+verification. If the deadline expires after dispatch, the provider cancels its
+local pending call, discards every late callback, durably terminalizes the
+operation as `interrupted` with a regional `timeout` error, and releases the
+active slot. It then attempts a new independently bounded read-only regional
+snapshot for display, but neither that state nor a late reply changes the
+terminal result because the mutation may already have occurred. An explicit
+authorization denial or method error received within the deadline retains its
+normal typed terminal result. A verification mismatch received within the
+deadline remains `failed`/`conflict`. The provider never retries an ambiguous
+post-dispatch mutation automatically.
+
+Provider-backed regional and delegated actions use this exact command grammar:
+
+```text
+dwm-system-management timezone-set ZONE GENERATION
+dwm-system-management ntp-set enabled|disabled GENERATION
+dwm-system-management locale-set LANG=LOCALE GENERATION
+dwm-system-management accounts-open
+dwm-system-management password-open
+dwm-system-management printers-open
+dwm-system-management sources-open
+```
+
+All seven forms are implemented as fixed CLI origins. Originating Settings
+controls remain disabled until their confirmation and discovery integration.
+
+`ZONE` is at most 255 ASCII bytes, contains no control characters, empty path
+components, `.` or `..` components, and must exactly match a value returned by
+the fixed `org.freedesktop.timedate1.ListTimezones` method. Each enumeration has
+a ten-second monotonic aggregate deadline, accepts at most 2048 unique values
+and 256 KiB of total UTF-8 reply data, and discards any late reply after local
+cancellation. A timeout reports a regional `timeout`; a duplicate, over-limit,
+non-ASCII, or overlong result reports `malformed`. Either error preserves the
+read-only timedate1 properties but leaves `timezone-set` unavailable. The same
+bounded enumeration and exact-match check run before confirmation and again
+immediately before mutation. `LOCALE` is
+at most 128 ASCII bytes, contains no control or whitespace characters, and must
+exactly match a name reported by the bounded `locale -a` fallback because
+locale1 has no locale enumeration method. `LANG` is the only accepted locale
+key. The provider runs a fresh bounded `locale -a` process and exact-match check
+before confirmation, then runs a second fresh enumeration with the same bounds
+immediately before `SetLocale`; it never reuses the first allowlist. Arguments
+are validated at both points. The four no-argument forms reject every positional or
+option argument. No other option, key, D-Bus argument, or trailing argument is
+accepted by any form.
+
+#### Read-only Regional Confirmation Preflight
+
+The separate read-only commands are:
+
+```text
+dwm-system-management regional-choices timezone|locale
+dwm-system-management regional-preview timezone-set ZONE
+dwm-system-management regional-preview ntp-set enabled|disabled
+dwm-system-management regional-preview locale-set LANG=LOCALE
+```
+
+These commands never authorize or mutate system state and do not advertise a
+snapshot action or change the cumulative snapshot minor. Unknown forms or arity
+return usage with exit 2 before I/O. A recognized request with an invalid selected
+value or unavailable read returns a complete typed error stream with exit 1.
+
+Choice streams begin with
+`regional-choices-protocol<TAB>1<TAB>0<TAB>timezone|locale`, contain only
+`choice<TAB>exact-id` rows, and end with `complete<TAB>regional-choices`.
+Success requires exit 0, a valid header, unique ascending ASCII identities, and
+completion. The existing catalog validation limits remain in force; the entire
+encoded stream, including every newline, is additionally limited to 512 KiB for
+timezones or 1 MiB for locales. Failed reads emit no choice rows, only the header,
+one `error<TAB>regional<TAB>code<TAB>detail`, and completion. Results are fully
+buffered and validated before any output; an oversized result is not truncated.
+
+Preview streams begin with `regional-preview-protocol<TAB>1<TAB>0`, contain one
+`preview<TAB>action<TAB>argument<TAB>generation<TAB>current<TAB>target<TAB>detail`,
+and end with `complete<TAB>regional-preview`. Success requires exit 0 and all
+three records. Every text field is at most 512 UTF-8 bytes and the whole stream
+is at most 8 KiB including newlines. A failure replaces the preview with one
+typed regional error and exits 1. Locale detail is the complete preserved
+override description, not a truncated summary. Preflight is not authorization
+or proof that a future mutation is available.
+
+The standalone QML `SystemRegionalPreflightProtocol.js` parser consumes
+cumulative raw bytes with a per-result lifetime. It checks the immutable prefix,
+strict UTF-8, control-free fields, exact record shape and ordering, catalog identity
+and payload limits, selected action/argument/target, and generation syntax.
+Unknown records and trailing fields are not extension space in these separate
+preflight protocols. Parsed choices and preview fields are provisional until
+`finish` verifies completion, a final newline, and normal exit 0; a typed error
+instead requires normal exit 1. A valid empty catalog is distinct from failure.
+The full readable locale detail and current value are preserved, without
+confusing readable aliases with the stricter service mutation grammar. The
+parser itself owns no Process, authorization, operation, or visible control.
+Nested-X11 parser fixtures exercise byte splits, malformed and replaced streams,
+limits, request mismatches, and typed errors without host service calls.
+
+`SystemRegionalPreflightModel.qml` is a separate optional Process owner, now
+wired to internal root preparation but not visible controls. It admits only fixed catalog
+kinds and validated regional preview arguments while active, and rejects overlap
+before publishing any state. Each request gets a fresh parser and an identity
+guard for queued launches and late callbacks. Results are published only after
+process exit; closing clears retained data and suppresses retired completion.
+The 25-second read deadline allows sequential bounded service/catalog reads.
+Timeout and closure request TERM, retain ownership through a
+three-second grace, then request KILL if needed. No replacement starts before
+the old process exits. Failed-to-start handling does not consume retained output.
+Malformed output requests KILL immediately. Byte-cap checks remain active during
+retired or failed cleanup, so a TERM-resistant output flood cannot retain the
+three-second grace period while growing cumulative collectors.
+An empty normal exit 127 reports a missing helper, separately from Qt launch
+failure; a stream emitted before exit 127 still fails protocol validation.
+This component owns no authorization, journal, mutation, or idle polling. Eighteen
+private nested-X11 scenarios exercise exact requests, provisional output, typed
+errors, bounds, deadlines, close/reopen, reentrant callbacks, and missing helpers.
+
+`SystemRegionalSettingsModel.qml` coordinates this owner with the root snapshot
+and operation models. It accepts only timezone/locale catalog requests and the
+three fixed regional previews. Catalog reads remain possible when an action is
+unavailable, but every request requires quiet, monitored owning-domain status and
+idle journal admission. Timezone and locale previews require exact membership in
+a current catalog; NTP accepts only `enabled` or `disabled`. Snapshot generation,
+request identity, and owning provider epoch bind the preparation. The separate
+backend preview generation is the only generation passed to a confirmed origin.
+
+The coordinator retains its request through catalog or prompt publication and
+waits for the preflight Process owner to release before publishing. Reentrant
+callbacks cannot prepare or confirm a competing origin. Confirmation claims
+dispatch before clearing the prompt and rechecks the source context afterward.
+Update and delegated preparations reject regional read/prompt ownership, and
+regional preparation rejects those other workflows. No new Process, IPC entry,
+polling timer, authorization path, or arbitrary command is added here.
+
+An owning event, shared snapshot replacement, or closure retires preparation and
+clears affected catalogs. Required recovery cancels the optional reader and waits
+for actual reaping before launching the shared snapshot. A read's error or stale
+completion cannot become a confirmation. Sent operations remain owned by the
+existing noncancelable native operation lifecycle across Settings closure.
+Forty-two private nested-X11 cases cover all three actions, typed failures,
+uncertainty, stale identity, exact selections, closure during claim/read/catalog/
+preview/dispatch publication, and recovery during read/publication.
+
+`SystemRegionalControls` now exposes this coordinator through fixed Settings
+controls. Timezone and locale catalogs load only on explicit request, filter
+reported identities without accepting free-form mutations, and use virtualized
+viewports capped to 144 pixels or the actual content height, whichever is smaller.
+Selection does not dispatch: Review change first requests a
+new preview. NTP exposes only enabled/disabled selections. All three confirmations
+show the complete plaintext current value, target, and backend detail, plus the
+warning that a sent change cannot be canceled. Cancel dismisses preparation and
+restores keyboard focus; it never rolls back or retries a mutation. Closing the
+pane clears catalogs while the root retains any sent operation. Locale guidance
+explains new-session activation without triggering logout. NTP synchronization is
+explicitly labeled as last-read evidence, not a live sample.
+Read-error explanations receive focus and are revealed after layout unless the
+user has moved focus elsewhere in Settings. Apply retains its origin until the
+operation releases the workflow, then restores focus if the user has not moved
+elsewhere or closed Settings. Read button activation handles mouse and keyboard.
+If a confirmation is larger than the content viewport, keyboard reveal targets
+its focused button rather than oscillating between the card edges. The complete
+preview remains scrollable; neither current values nor override detail is elided.
+
+Sixty-six private UI cases cover three actions at three window sizes with
+success, denial, unsupported results, uncertain output/replay, maximum catalogs,
+denied reads, and malformed reads, plus the NTP disable choice at all sizes.
+`docs/P6-REGIONAL-UI-EVIDENCE.md` records real
+X11 keyboard and screenshot checks. NTP synchronization sampling is qualified
+in `P6-REGIONAL-UI-EVIDENCE.md`; graphical authorization-only and combined
+installed evidence is recorded in `P6-QUALIFICATION.md`.
+
+The panel and System Settings share one `ClockModel` with one native minute-level
+`SystemClock`. Its only timezone input is the provider's published available
+timezone identity, never a selected choice or provisional action target. A new
+identity calls Qt's `Date.timeZoneUpdated()` and explicitly refreshes both display
+strings. A numeric timestamp is captured at native clock ticks: rereading the
+source's cached local wall-clock fields after a timezone change can reinterpret
+them in the new zone and shift the instant. Ordinary ticks refresh the displays;
+unavailable, partial, unknown, or unchanged identities do not trigger timezone
+refresh. No helper, IPC entry, extra timer, or closed-pane discovery is added.
+Private Fedora X11 evidence is recorded in `P6-CLOCK-EVIDENCE.md`; combined
+installed qualification is recorded in `P6-QUALIFICATION.md`.
+
+Each preview makes fresh fixed reads: timezone state and timezone choices, NTP
+state, or locale state and installed locale choices. Service reads retain their
+ten-second aggregate bounds; the locale collector retains its three-second
+collection and bounded cleanup. No PackageKit read, journal access, arbitrary
+command, or user-selected service is involved.
+
+The generation is SHA-256 over the ASCII prefix `dwm-titus-regional-preview-v1`
+followed by action, selected argument, and source fields, each encoded as an
+eight-byte big-endian UTF-8 byte length followed by its bytes. Timezone uses the
+current timezone as its source field. NTP uses `yes|no` for `CanNTP` followed by
+`enabled|disabled` for its current setting; synchronization samples are not
+configuration identity. Locale uses every current validated assignment in the
+fixed locale-key order, including explicit empty values and key presence.
+Unselected catalog entries do not affect this token; exact selected membership
+must still be freshly validated. Before any mutating call, the provider
+must repeat the preflight and compare the confirmed 64-lowercase-hex generation.
+A mismatch requires new confirmation and sends no mutation. Visible confirmation
+and monitored invalidation remain mandatory; the token is a freshness guard,
+not an atomic service transaction or proof of human approval. The three fixed
+regional CLI forms now enforce this preflight and their durable lifecycle.
+Visible Settings origins use the confirmed coordinator and shared clock described
+above. NTP sampling is recorded in `P6-REGIONAL-UI-EVIDENCE.md`; combined installed
+qualification is recorded in `P6-QUALIFICATION.md`.
+
+Required `snapshot-core` failures, including malformed output, invalidate
+mutation offers and configuration generations while preserving prior optional
+information, filesystem rows and read-only Health navigation. A successful core
+retry keeps that projection until a monitored information read replaces it.
+
+`health-open` is the sole action with no provider command: the root-scoped QML
+model invokes the fixed in-process `SystemHealthModel.openOnScreen` method with
+the current screen and accepts no caller-selected target or argument. It is UI
+navigation, starts no operation stream, and is not journaled. Every other
+advertised action maps one-to-one to an exact command line in this section or
+the update command grammar above.
+
+The provider starts `locale -a` in a dedicated process group with a three-second
+deadline, sends `TERM` to the group and then `KILL` after one second, caps output
+at 2 MiB, and accepts at most 4096 unique nonempty locale names of at most 128
+ASCII bytes each. Timeout or termination failure makes `locale-set` unavailable
+with a `timeout` error; missing command, nonzero exit, excess output or records,
+and malformed names make it unavailable with the corresponding
+`missing-provider`, `internal`, or `malformed` error. Readable locale1 state
+remains visible and the rest of the regional provider continues to work.
+
+The internal locale collector now executes only `/usr/bin/locale -a`, guarded
+by the existing Fedora coreutils `/usr/bin/timeout` supervisor. Its environment
+contains only a fixed system `PATH`, `LANG=C`, and `LC_ALL=C`; it does not inherit
+`LOCPATH`, loader overrides, or caller-selected commands. Stdout and stderr share
+the 2 MiB byte budget, and diagnostics are counted but never published. Every
+call starts a new process, requires complete stdout and successful exit, and
+validates the catalog before the three-second aggregate deadline. The independent
+supervisor also bounds the command if the collector is killed abruptly.
+Graceful `TERM`, `INT`, or `HUP` requests retain cleanup ownership before exit.
+The collector leaves its child waitable until the final group signal to prevent
+PID reuse, closes both pipes, and bounds reaping after `KILL` to one additional
+second. Cleanup failure cannot publish a successful catalog. This synchronous
+collector runs only on the provider's main thread with normal child-reaping
+semantics. It adds no CLI command, mutation, or snapshot minor by itself.
+
+### Accounts, Printers, and Sources
+
+AccountsService supplies read-only account objects and properties. The provider
+uses `org.freedesktop.Accounts.ListCachedUsers` for enumeration, then performs
+one bounded `FindUserById(os.getuid())` lookup for the invoking user. It adds
+that object when absent from the enumeration and de-duplicates the resulting
+paths. It reserves one of the 256 record slots for that valid current-user
+object, then sorts and accepts at most 255 other objects. It reads only
+`UserName`, `RealName`, `SystemAccount`, and `LocalAccount` from
+`org.freedesktop.Accounts.User`.
+Other objects with `SystemAccount=true`, and any object with a malformed path or
+missing `UserName`, are excluded. The current scope is assigned only when the
+object returned by `FindUserById(os.getuid())` matches; all other emitted
+objects are `other`.
+`accounts-count` is the emitted row count. More than 256 candidate paths or an
+invalid object makes the accounts provider `partial` while preserving the valid
+bounded subset. One aggregate three-second deadline starts before
+`ListCachedUsers`; at most eight user-property calls are outstanding at once.
+On expiry the provider cancels its outstanding D-Bus cancellables, ignores late
+replies, preserves records already validated, and reports `partial` with a
+`timeout` error. Signal-coalesced refreshes never overlap this bounded read.
+Account creation, deletion, group membership, and administrator changes remain
+in the Fedora-packaged `lxqt-admin-user` tool. The current user's password
+action opens the fixed `passwd` program in the configured terminal without
+transporting a password through QML.
+
+CUPS remains the printer service. Phase 6 reads only the fixed
+`cups.service` and `cups.socket` systemd units. `cups-service` is
+`available`/`running` whenever the loaded service is active; socket state does
+not downgrade that result. When the loaded service is inactive, an
+active/listening loaded socket is
+`available`/`socket-ready`, while an absent or inactive loaded socket is
+`available`/`stopped`. If neither unit exists it is `unsupported`/`unknown`;
+bus or property failure is `unavailable`/`unknown`. Every other combination,
+including a present socket with an absent service, malformed or transitional
+state, a failed service, or a failed socket when the service is not running, is
+`partial`/`unknown`. This distinguishes Fedora's healthy idle socket-activated
+scheduler and valid service-only configurations from a missing scheduler.
+One ten-second monotonic aggregate deadline covers bus connection, both fixed
+unit-state requests, and reply decoding. On expiry the provider cancels
+each unfinished local D-Bus request and discards late replies. If the service
+was already validated active, `cups-service` remains `available`/`running`
+because socket state cannot affect that result; the provider may still emit the
+printers `timeout` error for the incomplete probe. Otherwise unresolved required
+state emits `cups-service` as `unavailable`/`unknown` with that error. The finite
+snapshot continues without degrading unrelated providers. A validated systemd
+no-such-unit reply remains absence evidence under the status mapping above
+rather than a timeout.
+The internal reader uses one fixed `ListUnitsByNames` request per unit, with
+D-Bus auto-start disabled. Each typed reply supplies the resolved object and
+load/active/substate together; it does not start CUPS or rely on a later property
+read of an unloaded object. Replies are bounded to one row and 64 KiB before
+decoding. Canonical aliases returned by systemd do not change the fixed requested
+unit's identity. Private-bus fixtures stall each unit reply under the shared
+deadline and verify both late-reply rejection and the running-service exception.
+Phase 6 reports service/tool availability and opens Fedora's
+`system-config-printer`; it does not reproduce printer discovery, driver,
+queue, job, or authentication policy.
+
+PackageKit supplies read-only repository records through `GetRepoList` with the
+fixed `NONE` filter, including enabled and disabled repositories. Its aggregate
+deadline is 30 monotonic seconds and it accepts at most 512 unique repository
+rows; timeout or excess results are provider-scoped errors. Repository changes
+remain in the Fedora-packaged `dnfdragora` tool when present. Missing optional
+delegated tools are reported individually and never hide readable service
+state.
+
+The four no-argument administration CLI origins are now implemented. Accounts,
+printers, and sources resolve only `/usr/bin/lxqt-admin-user`,
+`/usr/bin/system-config-printer`, and `/usr/bin/dnfdragora`, respectively.
+Resolution uses the canonical executable path and requires the file and every
+resolved parent directory to be root-owned and not group/other-writable. A
+missing, non-executable, or unsupported target fails only that launch. These
+checks select trusted unprivileged launch targets; they do not elevate a
+repository helper or authorize changes inside the tools.
+
+The password entry uses the existing managed `dwm-terminal --print-command`
+selection contract, including the invoking user's configured terminal and
+fallback order. The selected helper must be root-controlled. A fixed
+`/usr/bin/bash` interpreter prevents the helper's env shebang from resolving a
+user-supplied Bash. Only PATH, HOME, XDG_CONFIG_HOME, DWM_TERMINAL, and fixed C
+locale values enter this read-only selector; shell startup and loader overrides
+are excluded. A separate timeout supervisor bounds collection to three seconds,
+stdout and stderr share a 4096-byte budget, and complete UTF-8 output must contain
+exactly one nonempty printable command identity and one final newline. Cleanup
+retains the owned process group through TERM, KILL, and bounded reaping, including
+signal interruption; incomplete cleanup cannot produce a usable selection.
+
+Password launch supports Alacritty, st, and xterm with the fixed `-e` argument,
+and Kitty with its positional-program form. The sole program argument is the
+root-controlled `/usr/bin/passwd`; no username or password is accepted by QML or
+the provider. Other terminal forms, including Warp, leave the password entry
+unsupported with guidance to run `passwd` directly. The provider does not change
+the terminal preference or substitute another command for an unsupported form.
+
+Every delegated launch uses the shared durable native owner: admission and its
+active-file lease precede output, `running` is committed before the single exec,
+and terminal retention/handoff is committed before completion. The child starts
+in its own session with stdin/stdout/stderr on `/dev/null` and every descriptor
+above 2 closed, so an open tool cannot retain the journal lease or operation
+stream. This isolated launch requires Python 3.13 or newer with
+[`os.POSIX_SPAWN_CLOSEFROM`](https://docs.python.org/3/library/os.html#os.POSIX_SPAWN_CLOSEFROM)
+support in `/usr/bin/python3`; the supported Fedora 44 runtime supplies it.
+The launcher returns a scoped `unsupported` result when that primitive is
+unavailable, without an unsafe fallback. No shell
+interprets the launch argv. A successful exec is only an
+accepted launch; the tool owns its subsequent UI, authorization, changes, and
+cancellation. The provider neither waits for that internal work nor reports it
+as completed. Output loss before launch prevents exec; loss after accepted exec
+preserves the durable launch result. Ambiguous launch observation is interrupted
+without retry, and replay/acknowledgment never launches another tool. Local
+filesystem/exec operations do not claim a hard kernel-I/O deadline.
+
+Unit and real private-child fixtures cover fixed argv, trust failures, bounded
+selection, launch errors, lost output, descriptor/session isolation, handoff
+replay, and a tool exiting unsuccessfully after its launch was accepted.
+Originating Settings controls now require the delegated confirmation described
+below. The cumulative snapshot implements minor 1; discovery alone does not
+dispatch those actions. Combined installed qualification is recorded in `P6-QUALIFICATION.md`.
+
+The internal repository reader now bounds connection setup, optional activation
+of an absent PackageKit daemon, transaction setup, signals, and decoding under
+that one deadline. It pins the daemon's unique bus identity and new transaction,
+acknowledges its exact signal match before calling `GetRepoList`, uses fixed
+noninteractive background/cache hints, and requires both the method acknowledgment
+and successful `Finished` signal. A final owner lookup rejects daemon replacement.
+Each text field is limited to 512 UTF-8 bytes before copying; the complete result
+is limited to 512 unique rows and 384 KiB of canonical encoded rows including
+newlines. Any failure discards all rows; no partial list is presented as complete.
+Timeout cancels local requests and ignores late replies. On failure before
+`Finished`, it queues a best-effort noninteractive `Cancel` only for its own exact
+read transaction, without extending the deadline or claiming daemon cancellation.
+It removes its subscriptions and match rule without closing the shared bus.
+Private-bus fixtures exercise the real 30-second timeout and late completion.
+This reader adds no command, mutation, Settings control, or protocol minor.
+
+### System Information and Filesystems
+
+The internal record assembler combines the fixed readers into the complete
+information, storage, security, and diagnostics record set. It preserves exact
+decimal counters, emits missing observations explicitly, isolates source
+failures, and discards an entire filesystem list if its encoded reservation is
+exceeded. Health navigation requires no journal admission. This formatter is
+called only for cumulative minor 2 information reads. Startup and mandatory
+recovery use the fixed `snapshot-core` command, which emits minor 1 without
+constructing information readers. Visible-pane monitor readiness gates storage
+reads as described below.
+
+The information snapshot uses only these fixed sources:
+
+- `/etc/os-release` is capped at 64 KiB and contributes only `PRETTY_NAME` and
+  `VERSION_ID` to the `os-name` and `os-version` states.
+- The Python `os.uname()` binding to `uname(2)` contributes `kernel-release` and
+  `architecture`. The fixed `HardwareVendor` and `HardwareModel` properties on
+  `org.freedesktop.hostname1` contribute the corresponding states when present.
+  One ten-second monotonic aggregate deadline covers both hostname1 property
+  reads. On expiry the provider cancels each unfinished local D-Bus request,
+  discards every late reply, and emits only the unfinished corresponding states
+  as `unavailable`/`unknown` with an `information` `timeout` error; a property
+  already validated within the deadline remains available. Missing properties
+  and malformed replies remain capability-scoped and do not prevent the other
+  fixed information sources from completing the snapshot.
+- `/proc/cpuinfo` is capped at 4 MiB. On the supported x86_64 architecture, the
+  first `model name` field contributes `cpu-model`; logical processor count
+  comes from `os.cpu_count()` and is emitted as `available` with a decimal
+  integer. A `None` result is emitted as `partial`/`unknown`.
+- `/proc/meminfo` is capped at 1 MiB and accepts only a decimal integer followed
+  by the kernel `kB` unit for `MemTotal`, `MemAvailable`, `SwapTotal`, and
+  `SwapFree`. Each value is multiplied by exactly 1024 with overflow checking
+  and emitted as a decimal byte count. Uptime is a checked whole-second reading
+  from `clock_gettime(CLOCK_BOOTTIME)`.
+- Mounted real filesystems come from the fixed
+  `findmnt --json --bytes --real --uniq --output ID,SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL`
+  interface. `--uniq` selects one record for an effective over-mounted target
+  and the kernel mount ID supplies a collision-free record key even when target
+  text requires protocol sanitization. The provider starts it in a dedicated
+  process group with a three-second monotonic deadline; on expiry it sends
+  `SIGTERM`, waits a bounded grace period, then sends `SIGKILL` to the process
+  group and emits `filesystem-summary` as `unavailable`/`unknown`. Output is
+  capped at 2 MiB and 256 unique mount-ID records. Source and target are
+  display-only values and are never accepted by an action. Every snapshot emits
+  exactly one `filesystem-summary` state: `available` carries the number of
+  emitted filesystem rows, `partial`/`unknown` accompanies any usable subset,
+  and `restricted`, `unavailable`, or `unsupported` carries `unknown` and no
+  filesystem rows.
+
+Each failed or malformed source degrades only the states or filesystem records
+it owns. A missing hostname1 property does not invalidate OS, kernel, processor,
+memory, or filesystem state.
+
+The internal local-reader boundary implements the eleven OS, kernel, CPU,
+memory, swap, and uptime states without activating cumulative minor 2. It reads
+each fixed file once with its byte limit plus one overflow-detection byte, closes
+the source before parsing, and retains valid peer fields when an allowlisted
+field is missing, duplicated, or malformed. Display fields must be printable
+UTF-8 within 512 bytes; counters use exact unsigned 64-bit decimal values, and
+the first CPU model field is authoritative. Read denial is scoped `restricted`
+state, absent files are `unsupported`, other I/O failures are `unavailable`, and
+malformed data is `partial`; failed values are always `unknown`. It starts no
+service, subprocess, journal access, or polling loop.
+
+The internal hostname1 reader separately implements the two fixed hardware
+properties through the shared asynchronous service-reader lifetime. It accepts
+only bounded `(v)` replies containing printable UTF-8 strings of at most 512
+bytes, isolates missing, denied, or malformed properties, and preserves a
+validated peer when the aggregate deadline expires. Cancellation discards late
+replies without closing the shared bus. Private-bus tests exercise both property
+timeouts before and after the peer can be validated, including four real
+ten-second deadlines and successful reuse of the shared connection. These
+readers add no CLI command, protocol minor, Settings control, journal operation,
+or polling loop.
+
+The internal filesystem reader implements the fixed `findmnt` inventory without
+activating cumulative minor 2. Its independent timeout supervisor and collector
+use a three-second monotonic deadline; stdout and discarded stderr share one
+2 MiB budget. Cleanup retains the process-group identity until TERM/KILL and
+bounded reaping complete. Failed cleanup or nonzero exit cannot publish rows,
+and interruption remains terminal after cleanup and signal-handler restoration.
+Strict JSON rejects duplicate object keys and non-finite numbers. Missing or
+malformed rows leave a partial usable subset; duplicate mount IDs are removed,
+including duplicates encountered beyond the 256-record limit. Display paths
+are sanitized and bounded without merging distinct mount identities. Missing
+or invalid byte counts remain `unknown`, never zero. Private-process fixtures
+cover overflow, EOF without exit, TERM-resistant descendants, simulated wall
+clock reversal, and cleanup failure. Security, protocol, and Settings integration
+remain separate boundaries.
+
+### Security Status
+
+The internal screen-lock reader invokes only its sibling
+`dwm-quickshell-controlcenter power-lock-snapshot`. That fixed no-argument
+command reuses the existing power status collection and `power-lock` formatter;
+it does not query UPower, profiles, suspend, or lid state. The Python reader
+adds no independent locker or GSettings probe. Lock-only nested timeouts use
+foreground mode so every probe remains in the encompassing owned process group
+on interruption. Its owned process group has a ten-second monotonic deadline, independent timeout supervisor, and 8 KiB
+combined stdout/stderr budget. It preserves the session environment for X11 and
+user settings while fixing the command search path and locale. Missing,
+duplicate, malformed, incomplete, or unsuccessful output cannot claim enabled
+or disabled state. Unknown records and appended fields remain forward-compatible.
+The reader now contributes to cumulative minor 2. Visible information and
+security cards are a separate presentation boundary.
+The shared power probe now rejects malformed successful live values as partial,
+and locker readiness requires the same UID and exact current DISPLAY. A locker
+on another X display cannot certify automatic locking for this session.
+
+Each probe has a fixed source and emits its own state instead of making the
+combined security summary fail. Status describes whether the probe can produce
+authoritative data: `available` for a known value, `partial` for accessible but
+incomplete or malformed evidence, `restricted` for read denial, `unavailable`
+when an expected command or service cannot be reached, and `unsupported` when
+the capability or its platform source does not exist. Semantic values are
+separate: SELinux uses `enforcing`, `permissive`, `disabled`, or `unknown`;
+Secure Boot, firewalld, and screen lock use `enabled`, `disabled`, or `unknown`;
+root encryption uses `encrypted`, `unencrypted`, or `unknown`. Every status
+other than `available` uses value `unknown`.
+
+The individual mappings are:
+
+- SELinux runtime enforcement comes from the single-byte
+  `/sys/fs/selinux/enforce` kernel interface. `1` is enforcing and `0` is
+  permissive. When that interface is absent, the provider parses only the
+  allowlisted `SELINUX` key in `/etc/selinux/config`. That fixed-path read is
+  capped at 64 KiB; a larger file is `partial`/`unknown` and is not parsed. The
+  exact value `disabled` is `available`/`disabled`, while `enforcing` or
+  `permissive` without the runtime interface is inconsistent and therefore
+  `partial`/`unknown`. If neither source establishes state, the result is
+  `unsupported`/`unknown`. Read denial is `restricted`/`unknown`; malformed
+  accessible data is `partial`/`unknown`. Neither is silently treated as
+  disabled.
+- Secure Boot comes only from the EFI global-variable path
+  `/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c`;
+  the provider never enumerates or glob-matches the directory. Its attributes
+  prefix is skipped and the one-byte payload must be `0` or `1`; `1` is
+  `available`/`enabled` and `0` is `available`/`disabled`. An absent EFI
+  variables filesystem is
+  `unsupported`/`unknown`; a missing variable or malformed payload on EFI is
+  `partial`/`unknown`; read denial is `restricted`/`unknown`.
+- Firewalld state comes from the `ActiveState` property for
+  `firewalld.service` on `org.freedesktop.systemd1`. An absent unit is
+  `unsupported`/`unknown`, a bus or property failure is
+  `unavailable`/`unknown`, `active` is `available`/`enabled`, and `inactive` is
+  `available`/`disabled`. Failed or transitional active states are
+  `partial`/`unknown`. This state describes the firewalld service only; it does
+  not claim that direct nftables rules or another firewall manager are absent.
+- Root-storage encryption evidence comes from bounded `lsblk --json` output
+  with the fixed `NAME,TYPE,FSTYPE,MOUNTPOINTS,PKNAME` columns. A root mount
+  backed by a `crypt`/`crypto_LUKS` ancestry is encrypted; a fully resolved root
+  ancestry without either is unencrypted. Missing, inaccessible, truncated, or
+  internally inconsistent topology is `partial`/`unknown`; an unavailable
+  command is `unavailable`/`unknown`, and read denial is
+  `restricted`/`unknown`. The provider starts `lsblk` in a dedicated process
+  group with the same three-second deadline, bounded termination sequence, and
+  2 MiB output cap as `findmnt`, and accepts at most 1024 unique block-device
+  records. Timeout or termination failure is `unavailable`/`unknown`; output or
+  record truncation is `partial`/`unknown` and can never establish encryption.
+- Screen-lock state reuses the `power-lock` record from the versioned power
+  protocol documented in `POWER-PROTOCOL.md`; it describes automatic screen
+  locking and does not launch a second GSettings or locker probe. An
+  `available` record with `ENABLED=no` maps to `available`/`disabled`. An
+  `available` record with `ENABLED=yes` and `RUNNING=yes` maps to
+  `available`/`enabled`; `ENABLED=yes` with `RUNNING=no`, or malformed boolean
+  fields, maps to `partial`/`unknown`. A `partial`, `restricted`, or
+  `unavailable` power-lock state retains that status with value `unknown`.
+- Update state reuses the PackageKit snapshot from this provider. It never
+  starts a refresh merely to populate the security summary.
+
+The internal security-reader boundary implements SELinux, Secure Boot, and
+firewalld status without activating cumulative minor 2. File reads use their
+fixed byte limit plus one detection byte, close before parsing, and never
+enumerate EFI variables. SELinux fallback accepts only the allowlisted key and
+never treats denied or malformed runtime evidence as disabled. The fixed
+systemd `ListUnitsByNames(["firewalld.service"])` query supplies its `ActiveState`
+field under one ten-second connection-to-decoding deadline, with no service
+activation or interactive authorization. Call failures remain unavailable,
+malformed replies remain partial, and late replies cannot publish state or
+close the shared bus. Fifteen focused tests include a private-bus deadline and
+connection reuse; real read-only Fedora 44 probes reported all three sources
+available. Shared screen-lock reader integration is described below.
+No new command, protocol record, Settings control, mutation, or polling loop is
+activated by this boundary.
+
+The internal root-encryption reader now uses the fixed lsblk columns above and
+shares the filesystem reader's closed command selector, three-second monotonic
+deadline, two-second cleanup bound, and combined stdout/stderr byte cap. Both
+parsers reject duplicate JSON keys and invalid JSON numbers before accepting
+evidence. Topology validation retains at most 1024 unique names, checks repeated
+device metadata, and walks parent relationships without recursive graph calls or
+exponential path enumeration. The nested tree establishes parent edges because
+lsblk reports mapper aliases in `NAME` but kernel names in `PKNAME`; observed
+kernel aliases must remain consistent and unambiguous, including kpartx mapper
+partitions. Every resolved root backing path must agree about encryption.
+Missing root filesystem metadata, unresolved backing dependencies, cycles,
+conflicting identities, and mixed paths remain `partial`/`unknown`. An unrelated
+unmounted loop device does not invalidate otherwise resolved root evidence.
+This reports block-device ancestry only, not file-level or hardware encryption.
+Twenty focused tests cover topology, byte/record caps, process failures,
+monotonic timeouts, interruption, and cleanup; seventeen filesystem regressions
+also passed. A read-only Fedora 44 probe returned available evidence within the
+deadline. No command, cumulative minor, UI, journal, mutation, or poller is
+activated by this preparation.
+
+No status probe accepts a path, unit, property, command, device, or service name
+from QML.
+
+## Provider Protocol
+
+`dwm-system-management` owns one append-only, tab-separated protocol. Phase 6
+starts at minor version `0`:
+
+This inventory is the preimplementation definition of version 1.0; no earlier
+producer or consumer exists. The record field order becomes append-only when
+the first implementation boundary lands.
+
+```text
+system-management-protocol<TAB>1<TAB>0
+snapshot-generation<TAB>lowercase-sha256
+provider<TAB>id<TAB>status<TAB>class<TAB>owner<TAB>detail
+state<TAB>id<TAB>status<TAB>value<TAB>detail
+update<TAB>package-id<TAB>severity<TAB>installable|blocked<TAB>name<TAB>version<TAB>summary
+package-change<TAB>package-id<TAB>install|update|remove|obsolete|reinstall|downgrade<TAB>name<TAB>version<TAB>summary
+repository<TAB>id<TAB>enabled|disabled<TAB>description
+account<TAB>object-path<TAB>current|other<TAB>display-name<TAB>login-name
+filesystem<TAB>mount-id<TAB>status<TAB>source<TAB>target<TAB>fstype<TAB>size-bytes<TAB>used-bytes<TAB>available-bytes<TAB>detail
+action<TAB>id<TAB>available|unavailable<TAB>class<TAB>owner<TAB>label<TAB>detail
+active-operation<TAB>id<TAB>action-id<TAB>kind<TAB>state<TAB>percent<TAB>cancelable<TAB>detail
+terminal-handoff<TAB>id<TAB>action-id<TAB>kind
+operation<TAB>id<TAB>action-id<TAB>kind<TAB>state<TAB>percent<TAB>cancelable<TAB>detail
+audit<TAB>id<TAB>action-id<TAB>kind<TAB>result<TAB>started<TAB>finished<TAB>detail
+error<TAB>capability<TAB>code<TAB>detail
+complete<TAB>snapshot|operation
+```
+
+The protocol minor selects a cumulative active-ID set so each small Phase 6
+implementation boundary can produce a truthful complete snapshot:
+
+| Minor | Providers added | States added | Actions added | Lists enabled |
+| --- | --- | --- | --- | --- |
+| `0` | `updates`, `recovery` | `update-summary`, `update-last-refresh`, `update-restart` | `updates-refresh`, `updates-install-all`, `updates-cancel` | `update`, `package-change` |
+| `1` | `regional`, `accounts`, `printers`, `sources` | `timezone`, `ntp-enabled`, `ntp-synchronized`, `locale`, `accounts-count`, `cups-service` | `timezone-set`, `ntp-set`, `locale-set`, `accounts-open`, `password-open`, `printers-open`, `sources-open` | `account`, `repository` |
+| `2` | `information`, `storage`, `security`, `diagnostics` | all information states, `filesystem-summary`, `selinux`, `secure-boot`, `firewalld`, `root-encryption`, `screen-lock` | `health-open` | `filesystem` |
+
+The final column contains list-record types, not operation kinds;
+`package-change` remains a preview list record owned by updates and never enters
+an operation stream.
+The `recovery` provider is intentionally status-only and client-facing from
+minor 0: it owns journal-integrity errors that have no trustworthy operation
+kind, while exposing no section, state, list, or action of its own. Removing it
+would leave a malformed whole-journal error without a valid protocol owner.
+
+A producer emits the highest minor whose complete active set it implements and
+never emits a later planned ID as `unsupported`. Within that minor, every
+active provider, state, and action is mandatory even when its platform source
+is absent. A consumer that supports a later minor accepts earlier cumulative
+sets; a producer bumps the minor only when the entire next row is implemented.
+
+The managed `snapshot` command now emits the complete minor 2 set. The fixed
+no-argument `snapshot-core` command retains the complete minor 1 set for required
+recovery without optional information probes. The fixed no-argument
+`snapshot-without-storage` command emits minor 2 with `filesystem-summary` as
+`partial`/`unknown` and no filesystem rows or filesystem subprocess; all other
+information sources remain independently readable. Settings selects that mode
+when the mount monitor fails, and selects ordinary `snapshot` only after mount
+readiness. Neither mode accepts a caller-selected source or command.
+
+Time and locale are read independently, with every cumulative state and action
+row present even when its source is absent. Missing administration tools
+disable only their own actions, without hiding readable account rows, CUPS
+status, or repository records. Partial account enumeration retains the validated
+subset and uses an unknown count; an available count exactly equals its emitted
+rows. Every repository result is complete or discarded. The producer enforces
+the complete stream and separate non-list byte reservations before publication.
+
+Native offers require a validated empty recovery state and a separate Fedora
+identity and bounded, locked journal-admission check. The check verifies current
+ownership, handoff, commit headroom, and a reusable terminal slot; it neither
+commits an operation nor retains a lease. It has no PackageKit security-floor or
+logind dependency. Failure to read update/session restart evidence therefore
+does not hide independently admissible native actions, while missing journal
+state, an active owner, or an unacknowledged result still blocks them. All offers
+are advisory: originating commands repeat their own admission and fresh-state
+checks. Delegated discovery resolves fixed trusted arguments but never launches
+the tool. Unsupported preserved locale overrides disable the language action
+without discarding readable locale state; choices and complete previews remain
+separate fresh reads.
+
+The Settings parser accepts complete minor 0, 1, and 2 snapshots, isolates
+known-owner failures, checks mandatory records and list identity/count/byte
+limits, and removes every action from an invalid owner. Information and
+filesystem uint64 counters stay exact canonical strings; security values use
+fixed per-state enums, and every non-available security state remains unknown.
+Ordinary older-minor snapshots clear newer projections. Explicit core recovery
+reads preserve the prior optional observations and health navigation without
+certifying their freshness. When storage monitoring is unavailable, a prior
+filesystem list can be retained only with an explicit stale-data marker and
+refresh guidance; the newly parsed summary remains unknown.
+
+The `health-open` offer never contributes to native journal admission and is
+available independently of blocked recovery. It invokes the existing fixed
+health model on the current screen; that model owns its read-only scan and
+separately confirmed repairs. It creates no system-management operation stream.
+Reload status invalidates pending confirmations before waiting for replacement
+subscriptions. The root operation owner now
+accepts three fixed regional and four fixed delegated origins internally, with
+strict action, value, and generation validation before command construction.
+Timezone and NTP values match the CLI identity grammar. Originating locale
+selections additionally require the service's conservative 1-127 character
+`[A-Za-z0-9_.@-]+` grammar, excluding `.` and `..`; broader readable locale
+state remains unchanged. Actual catalog membership and fresh confirmation
+generations are rechecked by the backend. Shared admission
+rejects every occupied or uncertain owner state, including before first output.
+Origin, adopted active identity, completion (including uncertain exit), and
+successful acknowledgment invalidate only the action's fixed discovery domain.
+Native streams and active snapshots cannot advertise cancellation or a
+`cancel-requested` state; a valid pre-dispatch canceled terminal remains readable.
+Native action rows are published only after journal admission is established;
+rejected recovery still preserves read-only native state. These entry points are
+not exposed by IPC. Visible native controls now require fresh confirmation as
+described above; NTP sampling is recorded in `P6-REGIONAL-UI-EVIDENCE.md`; combined installed
+qualification is recorded in `P6-QUALIFICATION.md`.
+The update-only compatibility formatter and operation streams retain minor 0;
+the snapshot minor selects capability advertisement, not a new operation format.
+Provider tests and 334 native Quickshell assertions qualify cumulative sets,
+failure isolation, missing tools, partial inventories, encoded bounds, and
+backward compatibility without changing host settings or launching tools.
+The private native-origin fixture covers 42 action/scenario combinations:
+all seven fixed actions with success, denial, rejection, unsupported capability,
+uncertain output, and mismatched originating exit status. Exact counters require
+one origin and acknowledgment, with one replay only for uncertain results and
+no cancellation. Reentrant invalidation and pre-output ownership reject overlaps.
+These fixtures do not qualify real graphical authorization or tool workflows.
+An explicit empty `LANG=` remains readable and does not hide timezone or NTP
+state; replacing it still requires a fresh locale choice and confirmation.
+Duplicate list identities remain stream-fatal even after that provider's count
+or byte limit is exceeded. The overall 9216-list-record reservation separately
+bounds duplicate tracking; exceeding it rejects the whole snapshot.
+A read-only Fedora 44 managed snapshot completed in 2.70 seconds with one
+account, 28 repositories, 31 updates, and 37 package-change rows. Missing account
+and source tools disabled only their own launch offers; password and printer
+tool resolution remained available. This agent's missing logind session kept
+update recovery partial while regional status and native admission remained
+independently available. Its journal was isolated in the managed test workspace
+and removed afterward. No system setting, package, or service configuration was
+changed, and no administration tool was opened.
+
+Required fields are single-line UTF-8 with tabs and line breaks replaced by
+spaces. Unknown records and trailing fields are ignored. Consumers reject a
+missing header, another major version, duplicate completion, or a known record
+with missing required fields. Package IDs and object paths are opaque display
+data unless an action contract explicitly validates and owns them.
+
+The initial vocabulary is closed for known record fields:
+
+- Provider IDs are `updates`, `regional`, `accounts`, `printers`, `sources`,
+  `information`, `storage`, `security`, `diagnostics`, and `recovery`. Provider
+  status is `available`, `partial`, `restricted`, `unavailable`, or
+  `unsupported`; class is `read-only`, `user-session`, `privileged`, or
+  `delegated`. Capabilities without a provider retain their applicable class and
+  use the `unsupported` status. Provider class is fixed: `updates`, `regional`,
+  `accounts`, `printers`, and `sources` are `delegated`; `information`,
+  `storage`, and `security` are `read-only`; `diagnostics` and `recovery` are
+  `user-session`. This field describes the strongest Phase 6 execution boundary
+  owned by that provider; individual action rows retain their fixed classes
+  below. A producer or consumer rejects a provider row with another class.
+- State IDs are `update-summary`, `update-last-refresh`, `update-restart`,
+  `timezone`, `ntp-enabled`, `ntp-synchronized`, `locale`, `accounts-count`,
+  `cups-service`, `selinux`, `secure-boot`, `firewalld`, `root-encryption`, and
+  `screen-lock`, plus information IDs `os-name`, `os-version`,
+  `kernel-release`, `architecture`, `hardware-vendor`, `hardware-model`,
+  `cpu-model`, `logical-cpus`, `memory-total-bytes`, `memory-available-bytes`,
+  `swap-total-bytes`, `swap-free-bytes`, `uptime-seconds`, and
+  `filesystem-summary`. State status uses the provider-status enum. Booleans are
+  `yes`, `no`, or `unknown`; restart values are `none`, `application`,
+  `session`, `system`, `security-session`, `security-system`, or `unknown`.
+  Count, byte, uptime, and filesystem-summary values are unsigned decimal
+  integers when status is `available` and `unknown` for any other status. Other
+  values are bounded display text owned by the named state. Security-state
+  values use the exact per-ID enums and status/value mapping defined in
+  Security Status. `cups-service` uses only `running`, `socket-ready`,
+  `stopped`, or `unknown` with the status mapping defined above. PackageKit
+  `RestartEnum.APPLICATION` maps to `application`.
+  Repeated PackageKit restart requirements are aggregated across two
+  dimensions: maximum scope (`none < application < session < system`) and
+  whether any requirement is security-related. `security-session` contributes
+  session scope plus the security flag, and `security-system` contributes
+  system scope plus that flag. The aggregate maps back to the closed enum, so
+  `system` plus `security-session` becomes `security-system`; any unrecognized
+  value makes the aggregate `unknown`. The result therefore cannot discard
+  either restart scope or security urgency.
+- Update severity is `critical`, `security`, `important`, `bugfix`,
+  `enhancement`, `normal`, `low`, or `unknown`. Update installability is
+  `installable` or `blocked`; blocked package IDs are never passed to
+  `UpdatePackages`. The accepted `GetUpdates` `InfoEnum` mapping is closed and
+  sets both fields: `CRITICAL` maps to `critical/installable`, `SECURITY` to
+  `security/installable`, `IMPORTANT` to `important/installable`, `BUGFIX` to
+  `bugfix/installable`, `ENHANCEMENT` to `enhancement/installable`, `NORMAL` to
+  `normal/installable`, `LOW` to `low/installable`, `UNKNOWN` and `AVAILABLE`
+  to `unknown/installable`, and `BLOCKED` to `unknown/blocked`. Any other info
+  value makes the `updates` provider `malformed`, discards every update and plan
+  row from that discovery, and makes update actions unavailable; it is never
+  guessed from display text. An available `update-summary` value equals the
+  total number of unique emitted `update` rows, including blocked rows; the
+  install-all action is available only when at least one row is installable and
+  all other update mutation gates pass. Repository state is `enabled` or `disabled`.
+  A `package-change` row is one member of the complete dependency-resolved
+  simulation result for those installable update IDs at snapshot time. Its
+  action maps PackageKit simulation
+  `InfoEnum` values `INSTALLING` to `install`, `UPDATING` to `update`,
+  `REMOVING` to `remove`, `OBSOLETING` to `obsolete`, `REINSTALLING` to
+  `reinstall`, and `DOWNGRADING` to `downgrade`; another info value makes the
+  plan malformed and the install action unavailable. Package IDs are unique
+  within the result, and every requested installable update ID must appear
+  exactly once with action `install` or `update`; another action for a requested
+  ID makes the plan malformed. Preserve the reported action rather than
+  relabeling a requested install as an update. PackageKit's
+  [DNF5 backend at v1.3.6](https://github.com/PackageKit/PackageKit/blob/v1.3.6/backends/dnf5/dnf5-backend-thread.cpp)
+  includes both install and upgrade actions in `GetUpdates`, and reports them
+  as `INSTALLING` and `UPDATING` during simulation. An `update` action for an
+  unrequested ID remains malformed; dependency installs remain visible.
+  A result containing dependency `reinstall` or `downgrade` remains
+  visible but makes `updates-install-all` unavailable with an `unsupported`
+  error; Phase 6 never adds PackageKit's `ALLOW_REINSTALL` or
+  `ALLOW_DOWNGRADE` flags implicitly.
+  Dependency additions, removals, obsoletes, reinstalls, and downgrades are
+  therefore visible before confirmation rather than inferred from `GetUpdates`.
+  Account scope is `current` or `other`. Filesystem status uses the
+  provider-status enum; mount ID is an unsigned decimal integer and the unique
+  record ID within the snapshot, while source and target remain display-only
+  text. `available`
+  requires all three byte fields to be unsigned decimal integers; `partial`
+  permits a mix of integers and `unknown`; `restricted`, `unavailable`, or
+  `unsupported` requires all three byte fields to be `unknown`.
+- Operation kind is `refresh`, `update`, `timezone`, `ntp`, `locale`, or
+  `delegate`. Operation state is `pending`, `authorizing`, `running`,
+  `cancel-requested`, `permission-denied`, `canceled`, `failed`, `interrupted`,
+  or `succeeded`. Percent is `unknown` or an integer from 0 through 100;
+  PackageKit's documented unknown sentinel `Percentage=101` maps to `unknown`
+  and is never clamped to 100. Any other out-of-range value also maps to
+  `unknown` with bounded malformed-progress detail so an otherwise active
+  transaction remains observable. Cancelable is `yes` or `no`. Every terminal
+  operation record must use `cancelable=no`. Audit result uses only the
+  terminal operation states.
+- An `active-operation` row is snapshot-only and has the same closed fields as
+  an operation row. It represents the one validated nonterminal
+  journal record after recovery. Its ID must have the
+  required `op-` shape, its action and kind must match the fixed mapping, and
+  its state must be nonterminal. A snapshot contains at most one such row. The
+  row is omitted when no operation remains active; it is never
+  synthesized from an unsafe or malformed journal record. `cancelable=yes` is
+  emitted only while the exact adopted transaction reports `AllowCancel=true`.
+  This bounded row lets the root model restore the visible operation identity
+  and pass that exact ID to `watch-operation` after Settings or the provider
+  restarts. Only PackageKit actions may advertise cancellation or use
+  `updates-cancel`. Regional and delegated rows always use `cancelable=no`;
+  their live lease and durable checkpoints, not service-value inference, govern
+  recovery. The 1.0 snapshot can identify these existing journal owners without
+  advertising native mutation actions or advancing the cumulative minor.
+- A `terminal-handoff` row is snapshot-only and identifies exactly one durable
+  terminal result not yet acknowledged by the root model. Its ID, action, and
+  kind must exactly match the validated terminal slot named by the handoff
+  journal record. A snapshot contains at most one handoff row, and it is
+  mutually exclusive with `active-operation`; a malformed handoff is a recovery
+  error and is never emitted. When the root model still holds the exact matching
+  validated operation, audit row, and completion, it invokes `ack-operation`
+  directly. If any of those records is unavailable, it first passes the exact
+  ID to `watch-operation` and validates their retained-terminal replay. If the
+  root model exits before acknowledgment, the same handoff is replayed after
+  restart; duplicate presentation is safer than silently losing the terminal
+  result. No new system-management operation starts while a handoff is
+  nonempty.
+- Every operation and audit row carries the action ID that originated the
+  operation. The fixed action-to-kind mapping is `updates-refresh` to
+  `refresh`, `updates-install-all` to `update`, `timezone-set` to `timezone`,
+  `ntp-set` to `ntp`, `locale-set` to `locale`, and `accounts-open`,
+  `password-open`, `printers-open`, and `sources-open` to `delegate`. As defined
+  above, `health-open` is fixed in-process navigation and never appears in an
+  operation or audit row.
+  `updates-cancel` controls the current update or refresh operation and never
+  starts an operation of its own; every record for that operation retains its
+  original action ID. Action ownership is also fixed:
+  `updates-refresh`, `updates-install-all`, and `updates-cancel` belong to
+  `updates`; `timezone-set`, `ntp-set`, and `locale-set` to `regional`;
+  `accounts-open` and `password-open` to `accounts`; `printers-open` to
+  `printers`; `sources-open` to `sources`; and `health-open` to `diagnostics`.
+  The recovery provider owns no action. Every action row must name its fixed
+  owner. Action class is fixed as well: every action is `delegated` except
+  `health-open`, which is `user-session`. A producer or consumer rejects an
+  action row whose class does not match this mapping.
+- Action availability is `available` or `unavailable` and action class uses the
+  provider class enum. The error capability field is exactly one provider ID,
+  which is also its owner. Error codes are the closed normalized enum
+  `network`, `repository`, `conflict`, `signature`, `package`, `unsupported`,
+  `malformed`, `missing-provider`, `permission-denied`, `canceled`, `timeout`,
+  `interrupted`, or `internal`. PackageKit `NO_NETWORK` maps to `network`;
+  repository fetch/configuration/not-found and no-cache errors map to
+  `repository`; dependency, file, database-lock, and package-conflict errors map
+  to `conflict`; GPG, signature, key, and unsigned-repository errors map to
+  `signature`; other package download/install/remove/update errors map to
+  `package`; `NOT_AUTHORIZED`, `NOT_SUPPORTED`, and transaction cancellation
+  map to `permission-denied`, `unsupported`, and `canceled`, respectively.
+  systemd `AccessDenied`, missing service/object/unit, invalid-argument,
+  timeout, and busy/conflict D-Bus errors map to `permission-denied`,
+  `missing-provider`, `malformed`, `timeout`, and `conflict`; every unlisted
+  upstream error maps to `internal`. Raw numeric enums, D-Bus error names, and
+  localized messages never occupy the code field and may appear only as bounded
+  sanitized detail.
+
+A snapshot emits exactly one `snapshot-generation` row, one provider row for
+every provider ID active in its header minor, one row for every active action
+ID, one state row for every active state ID, all list records enabled by that
+minor, either zero or one validated `active-operation` row or zero or one
+validated `terminal-handoff` row, then one
+`complete<TAB>snapshot`. An unavailable, restricted, or unsupported capability
+therefore retains an explicit status-bearing state row instead of omitting its
+value. The generation is 64 lowercase hexadecimal characters. It is the SHA-256
+digest of the ASCII prefix `dwm-titus-update-plan-v1`, followed first by the
+exact installable update IDs sorted by unsigned UTF-8 bytes and then by the
+complete `package-change` rows sorted by the unsigned UTF-8 tuple
+`(action, package-id, name, version, summary)`. Each update ID is encoded as the
+ASCII byte `U`, an eight-byte big-endian byte length, and its raw bytes. Each
+plan row is encoded as the ASCII byte `P` followed by all five tuple fields in
+order, each as an eight-byte big-endian byte length and its raw bytes. Empty
+sets therefore have a deterministic generation, while any dependency-resolved
+action, identity, version, or displayed plan change invalidates confirmation.
+List record IDs (`update`, `package-change`, `repository`, `account`, and
+`filesystem`) must be unique within their record type. State and list-record
+ownership is fixed as follows:
+
+- `updates` owns `update-summary`, `update-last-refresh`, `update-restart`, and
+  every `update` and `package-change` row.
+- `regional` owns `timezone`, `ntp-enabled`, `ntp-synchronized`, and `locale`.
+- `accounts` owns `accounts-count` and every `account` row; `printers` owns
+  `cups-service`; `sources` owns every `repository` row.
+- `information` owns the OS, kernel, architecture, hardware, CPU, memory, swap,
+  and uptime states. `storage` owns `filesystem-summary` and every `filesystem`
+  row.
+- `security` owns `selinux`, `secure-boot`, `firewalld`, `root-encryption`, and
+  `screen-lock`. `diagnostics` and `recovery` own no state or list rows.
+
+An operation stream emits exactly one operation ID and originating action ID,
+exactly one audit row after the terminal operation record, and then one
+`complete<TAB>operation`. The action must have the fixed kind defined above.
+The audit ID, action ID, and kind must match the operation, its result must
+match the terminal state, and no duplicate audit row is accepted.
+
+The append-only optional `package-progress` row carries operation ID, display
+name, phase (`working`, `downloading`, `installing`, `updating`, `removing`, or
+`cleaning`), and item percent (`unknown` or an integer from 0 to 100). It is
+accepted only for running or cancel-requested update/refresh operations with
+the same identity. It updates only the latest UI item, not the operation log,
+overall percentage, durable journal, or audit comparison. Older consumers ignore
+this extension. `ItemProgress` never advances the durable lifecycle: early item
+signals are ignored until existing status/package evidence establishes running.
+Names retain the 512-byte canonical text bound. Identical rows
+are coalesced; after 4096 item rows the helper emits one empty-name/unknown row
+and stops item output so the UI cannot retain a misleading frozen package.
+The parser accepts at most 4097 such rows within its existing stream byte bound.
+
+An operation stream accepts at most one error row. A `failed` terminal operation
+requires exactly one preceding error row whose capability is the provider that
+owns the operation: `updates` for `refresh` and `update`, `regional` for
+`timezone`, `ntp`, and `locale`, and the action's declared provider for
+`delegate`. A `succeeded` terminal result forbids an error row, matching the
+durable journal contract. Other terminal results do not require an error row.
+The first operation record must be `pending`; consumers reject any other
+initial state. Audit timestamps are canonical UTC RFC 3339 whole seconds in the
+exact `YYYY-MM-DDTHH:MM:SSZ` form and both are required on the terminal audit
+row. Consumers do not compare their wall-clock order: `finished` may precede
+`started` when NTP or an administrator moves the system clock backward. Record
+order and the validated operation transition sequence remain
+authoritative for lifecycle ordering.
+
+The standalone `SystemOperationProtocol.js` consumer accepts cumulative raw
+`StdioCollector.data` buffers and validates complete newline-delimited records
+incrementally. It never decodes arbitrary pipe chunks as independent strings,
+so split UTF-8 remains intact. Its caller must stop accepting a faulted stream,
+call `finish` after normal or abnormal process exit, and accept a result only
+when that call succeeds. Originating streams require exit 0 for success or 1
+for another terminal result; retained-result watchers require exit 0 regardless
+of the terminal result. Protocol completion alone never proves process success
+or authorizes handoff acknowledgment. This parser does not start processes,
+own a journal, or enable Settings mutation controls.
+The minor's active-ID table governs snapshot capability advertisement, not the
+closed journal action-to-kind mapping: as specified for `watch-operation`, a
+1.0 stream can observe an exact regional or delegated journal owner and replay
+its retained result without advertising or invoking that action.
+
+Allowed operation transitions are:
+
+| From | Allowed next state |
+| --- | --- |
+| `pending` | `authorizing`, `running`, `canceled`, `failed`, or `interrupted` |
+| `authorizing` | `running`, `permission-denied`, `canceled`, `failed`, or `interrupted` |
+| `running` | `running`, `cancel-requested`, `succeeded`, `failed`, or `interrupted` |
+| `cancel-requested` | `cancel-requested`, `canceled`, `succeeded`, `failed`, or `interrupted` |
+| Any terminal state | None |
+
+Repeated nonterminal records (`pending`, `authorizing`, `running`, and
+`cancel-requested`) carry progress or cancelability updates without changing
+the lifecycle state. `succeeded` after `cancel-requested` is valid because completion can
+race cancellation. `permission-denied`, `canceled`, `failed`, `interrupted`,
+and `succeeded` are terminal and appear exactly once.
+
+Snapshot record failures are provider-scoped only when a valid known provider,
+state, action, or list-record ID still identifies the owner; the consumer marks
+that provider invalid and continues parsing unrelated providers. A malformed
+header or completion, a missing or unknown owner ID, duplicate ID,
+duplicate `active-operation`, duplicate `terminal-handoff`, both snapshot-only
+operation records in one snapshot, operation-ID, action-ID, or action-kind mismatch,
+a terminal `active-operation`, transition outside the table,
+an operation record after a terminal state, any record after the required
+completion, or missing completion rejects the entire stream. Operation and
+audit record failures always reject the operation stream. An illegal enum in a
+snapshot record with a known fixed owner invalidates that owner, just like its
+other malformed fields; illegal header or operation enums remain stream-fatal.
+Text fields are
+capped at 512 bytes. Fixed per-type count and encoded-byte budgets are 4096 and
+3 MiB for `update`, 4096 and 3 MiB for `package-change`, 512 and 384 KiB for
+`repository`, 256 and 256 KiB for `account`, and 256 and 384 KiB for
+`filesystem`. The encoded-byte budget includes the complete canonical record
+and its terminating newline. The producer buffers each complete list result and
+rejects that owning result before emission if either limit would be exceeded;
+it never truncates a valid result into an apparently complete list. An
+oversized update inventory discards all update rows, reports updates
+`partial`/`malformed`, and does not simulate. An oversized package-change plan
+discards only the plan, preserves the readable update rows, and leaves install
+unavailable with an updates `malformed` error. The other oversized list types
+discard their rows and mark their owning provider or summary state
+`partial`/`malformed` as applicable. Thus a snapshot contains at most 9216 list
+records and at most 7 MiB of list records. The producer separately reserves and
+enforces 1 MiB for the header, snapshot-generation, providers, states, actions,
+errors, audit, active-operation, terminal-handoff, and completion records, and rejects the entire
+stream if that non-list reservation is exceeded. Exact encoded accounting
+therefore keeps the complete stream at or below 8 MiB.
+
+The initial actions are a closed enum: `updates-refresh`, `updates-install-all`,
+`updates-cancel`, `timezone-set`, `ntp-set`, `locale-set`, `accounts-open`,
+`password-open`, `printers-open`, `sources-open`, and `health-open`. QML cannot
+select an executable, D-Bus
+destination, interface, method, repository ID, package ID, user, unit, device,
+path, or elevation mechanism.
+
+## Operation Lifecycle and Audit
+
+- Managed snapshots offer update origins only after complete durable recovery,
+  no active operation or unacknowledged handoff, and the existing PackageKit
+  security-floor/running-daemon check. Installation additionally requires a
+  nonempty, complete supported dependency preview. Explicit metadata refresh
+  can remain available for non-malformed discovery failures or failed simulation, since it is a
+  separately confirmed recovery action. Malformed update inventory blocks both
+  origins. An unavailable security check does not
+  hide readable inventory. Availability is advisory: admission repeats journal,
+  session, backend security, and confirmed-generation checks at dispatch.
+- Passive discovery uses the fixed maximum cache-age hint and never calls
+  `RefreshCache` or starts a mutable update; after discovery it may invoke only
+  the unjournaled `SIMULATE|ONLY_TRUSTED` read-only transaction defined below.
+  PackageKit may otherwise perform only backend work required to return
+  discovery results as described above.
+- Every mutation begins from a visible confirmation describing owner, impact,
+  authorization, cancellation limit, and recovery.
+- When a bounded `GetUpdates(NONE)` result contains at least one installable
+  update ID, discovery creates a separate read-only PackageKit transaction and
+  calls `UpdatePackages` with the bitwise `SIMULATE|ONLY_TRUSTED` flags and
+  exactly those installable update IDs. Only a successful `Finished` result
+  with a complete, valid `Package` signal set
+  produces `package-change` rows. This simulation never authorizes or mutates
+  packages. One 120-second monotonic aggregate deadline covers its
+  `CreateTransaction`, `SetHints`, `UpdatePackages`, and wait for `Finished`.
+  On expiry the provider requests `Cancel` only when `AllowCancel=true`, waits
+  no more than five additional seconds for `Finished`, then detaches from the
+  read-only transaction and completes the snapshot with an `updates` `timeout`
+  error and no plan rows. The simulation is never journaled or recovered. It
+  accepts at most 4096 unique `Package` results; an additional result follows
+  the same bounded cancellation sequence and is a `malformed` error. An empty
+  installable update set emits no plan rows and does not call `UpdatePackages`.
+  A missing simulation capability, denial, error, malformed or duplicate
+  package result, or unrepresented requested update preserves the readable
+  `update` rows but leaves `updates-install-all` unavailable with the owning
+  typed error.
+- An install-all confirmation captures the snapshot generation and displays
+  every resolved `package-change` action, including dependency additions and
+  removals. `UpdatesChanged` or any accepted replacement snapshot invalidates
+  an open confirmation. After the user accepts, the provider performs a fresh
+  bounded `GetUpdates(NONE)` and a fresh `SIMULATE|ONLY_TRUSTED` transaction
+  using the same fixed rules, then recomputes the generation before creating a
+  mutable transaction. A mismatch terminates as `failed`/`conflict`, publishes
+  the new snapshot, and requires a new confirmation. Only the revalidated exact
+  installable update IDs are passed to the real
+  `UpdatePackages(ONLY_TRUSTED, ...)`; PackageKit remains the dependency owner,
+  while the immediately preceding simulation is the confirmation's current
+  resolved preview.
+
+  PackageKit exposes no transaction-scoped prepare/commit token that can bind a
+  completed simulation to a later `UpdatePackages` transaction. A package or
+  repository change in that final interval can therefore make PackageKit
+  resolve a different dependency set even after the generation check. The
+  confirmation states this platform limitation and promises a current preview,
+  not an atomic frozen plan. Actual PackageKit `Package` signals update bounded
+  in-memory action counts, a SHA-256 digest, and at most 128 distinct mismatch
+  samples against the preview; they are never emitted one-for-one. The digest
+  begins with the ASCII prefix `dwm-titus-update-observed-v1` and then encodes
+  each accepted signal in arrival order as the normalized action and package
+  ID, each with an eight-byte big-endian byte length followed by its raw bytes.
+  `DOWNLOADING` is phase-only and does not enter the observed set or digest.
+  Actual `INSTALLING`, `UPDATING`, `REMOVING`, and `OBSOLETING` values map to
+  `install`, `update`, `remove`, and `obsolete`. A `CLEANUP` whose package name
+  and architecture match an inbound `update` row is the old half of that
+  ordinary replacement and is also ignored. Another `CLEANUP` maps to
+  `obsolete` only when its exact package ID appears as `obsolete` in the
+  preview; otherwise it and every other info value map to `unknown`, mark
+  comparison `unknown`, and are digested as the literal `unknown`. These rules
+  prevent download and replacement phases from becoming false plan differences
+  while failing closed on unexplained actions.
+
+  Operation output always emits each reached lifecycle state once: `pending`,
+  `authorizing` when required, initial `running`, and the first
+  `cancel-requested` when that transition is valid. Those at most four records
+  cannot be displaced by progress. Integer-percentage, cancelability, and
+  mismatch-summary changes share a separate cap of 252 coalesced nonterminal
+  records. Once that cap is reached, later progress changes update only the
+  in-memory aggregate; a later required lifecycle transition is still emitted.
+  The required terminal record reports the final bounded counts, digest, and
+  `different=yes|no|unknown` summary in its detail. Thus the complete stream
+  stays below the 8 MiB limit and the root model retains at most 256
+  nonterminal records plus the terminal record. These observed summaries are
+  deliberately not journaled; recovery labels them unavailable instead of
+  reconstructing or promising per-package detail. The UI never labels the
+  preview as the completed set. A simulated `reinstall` or `downgrade` is
+  rejected before confirmation, so the real call never requires or silently
+  adds `ALLOW_REINSTALL` or `ALLOW_DOWNGRADE`.
+- One root-scoped model owns every journaled operation. Refresh, update,
+  regional, and delegated operations are mutually exclusive; a
+  request to start another operation while one is nonterminal or its terminal
+  handoff remains unacknowledged is rejected as `failed`/`conflict` before it
+  can write the active record. The fixed `updates-cancel`, `watch-operation`,
+  and `ack-operation` controls do not start an operation and retain their
+  exact-ID behavior above.
+- Closing Settings stops pane-only discovery but neither kills an active
+  PackageKit transaction nor the root-scoped `watch-operation` process. While a
+  regional or delegated originating stream is nonterminal, the root model
+  defers finite snapshot requests until that stream terminates; event-driven
+  read-state refreshes remain coalesced. Snapshot recovery distinguishes a live
+  native owner from an orphan through its exact file lease. A held lease
+  preserves the validated regional or delegated record as `active-operation`;
+  an unheld lease permits conservative interrupted recovery under the
+  kind-specific rules below. Under the short exclusive-lock path, recovery also
+  completes any already terminalized active payload before selecting snapshot
+  records. This is journal-only completion of an already durable result; it
+  performs no service lookup, history query, or signal wait while holding the
+  lock. Recovery errors never synthesize a row from unsafe or malformed state.
+  A finite `snapshot` always ends at `complete<TAB>snapshot`; its optional
+  `active-operation` can have any supported closed operation kind.
+  The root model first compares its ID with the one live provider stream it
+  already owns. A matching live operation stream remains the
+  sole observer and no watcher is started. Otherwise the root model immediately
+  starts exactly one
+  `dwm-system-management watch-operation OPERATION_ID` process, and records it
+  as that operation's sole live stream before accepting another snapshot. That
+  process revalidates one of the two permitted journal identities above. For a
+  nonterminal PackageKit record it adopts only its exact recorded object. For a
+  native record it observes only the retained inode and durable checkpoints,
+  with the bounded event wait and final lease probe described above. Both paths
+  emit `pending` and subsequently observed lifecycle states only when supported
+  by the journal or, for PackageKit, exact adopted transaction evidence. An
+  observed authorization remains `authorizing` and may terminate directly as
+  `permission-denied`; only PackageKit offers cancellation. A verified durable
+  result emits the terminal operation, audit, and `complete<TAB>operation`
+  records. Lost or expired observation retains recovery guidance, not success.
+
+  When a snapshot instead contains `terminal-handoff`, the root model first
+  compares it with the one validated terminal stream it already owns. An exact
+  in-memory operation, audit row, and completion permit immediate
+  acknowledgment; otherwise the root starts the same exact-ID watcher in
+  replay-only mode and acknowledges only after accepting its terminal operation,
+  audit, and completion. It does not clear the visible result until
+  acknowledgment succeeds. A failed acknowledgment retains recovery guidance
+  and the provider continues to reject replacement mutations.
+
+  If the active payload was cleared in the snapshot-to-watch race, the permitted
+  exact retained-terminal match is replay-only and opens no PackageKit object.
+  A later terminal operation in another ring slot does not hide the requested
+  retained ID. The watcher emits
+  `pending`, the minimum transition implied by the durable terminal result
+  (`authorizing` before `permission-denied`, or `running` before `succeeded`),
+  then that exact terminal operation, its audit, and
+  `complete<TAB>operation`. The other terminal states are valid directly from
+  `pending`. No newer ring record can be consumed as the requested operation.
+
+  Unexpected watcher exit triggers up to three non-overlapping
+  snapshot-and-watch recovery attempts in the root model after delays of one,
+  two, and four seconds. If the third retry fails, it retains the journaled
+  operation and actionable recovery guidance until explicit refresh; it never
+  reports success or starts a replacement mutation. Quickshell restart uses the
+  same finite snapshot followed by live watch sequence, so Settings closure and
+  provider interruption cannot leave an adopted transaction permanently
+  unwatched.
+- Update cancellation is exposed exactly while PackageKit reports `AllowCancel`.
+  Once cancellation becomes unsafe, Settings explains that the RPM transaction
+  must finish.
+- The journal lives under
+  `${XDG_STATE_HOME:-$HOME/.local/state}/dwm-titus/system-management/`, is mode
+  0700, and defines exactly 36 provider-owned paths: fixed `active`, `cursor`,
+  `restart`, and `handoff` paths plus 32 fixed terminal paths named
+  `terminal-00` through `terminal-31`. It never enumerates the directory and
+  ignores unrelated
+  entries. Protocol 1.0 is the first shipped provider and has no released
+  predecessor to migrate. If a fixed path contains an earlier plain-text
+  development record rather than a valid frame file, the provider reports the
+  recovery provider `partial` with a `malformed` error and blocks every
+  system-management mutation; it never guesses or converts active, restart,
+  cursor, or terminal semantics. Guidance requires a reboot first, so any
+  unobserved PackageKit work and restart requirement crosses a safe boot
+  boundary, and then moving the entire legacy journal directory aside before
+  refresh. Journal creation opens the new directory with
+  no-replace semantics, creates each path relative to that descriptor with
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, and initializes it before the journal
+  becomes usable. It creates and syncs every other file, syncs the directory,
+  then creates and syncs `cursor` last as the initialization commit marker and
+  syncs the directory again. A crash during first initialization leaves a safe
+  partial journal that recovery may finish only when the cursor marker is absent
+  (the path is missing or is a safe short or torn initial file), every existing
+  fixed path passes the owner, type, mode, link-count,
+  and at-most-16-KiB checks, and no frame contains a valid advanced or
+  noninitial payload. Under the exclusive directory lock, recovery rewrites a
+  short or torn initial file through its held descriptor to the exact 16 KiB
+  sequence-1 image, syncs and verifies it, and creates missing paths with the
+  same exclusive rules. It then commits `cursor` last and syncs the directory.
+  This descriptor-bound rewrite is permitted only before the cursor marker;
+  normal journal commits never truncate a file. A missing path after that
+  marker exists, or beside any advanced or noninitial frame, is malformed and
+  is never silently recreated.
+
+  Each persistent path is one fixed 16 KiB file containing frames at byte
+  offsets 0 and 8192. Every frame is exactly 8192 bytes and has this canonical
+  byte layout:
+
+  | Offset | Size | Encoding |
+  | --- | --- | --- |
+  | 0 | 8 | Magic bytes `44 57 4d 4a 4e 4c 31 00` (`DWMJNL1` plus NUL) |
+  | 8 | 2 | Unsigned little-endian frame major, exactly 1 |
+  | 10 | 2 | Unsigned little-endian frame minor, exactly 0 |
+  | 12 | 4 | Unsigned little-endian payload length, 0 through 8128 |
+  | 16 | 8 | Unsigned little-endian sequence, 1 through 18446744073709551615 |
+  | 24 | 8 | Reserved zero bytes |
+  | 32 | 32 | SHA-256 digest |
+  | 64 | 8128 | Payload followed by zero bytes through the frame end |
+
+  The digest input is exactly header bytes 0 through 31 followed by exactly
+  `payload length` bytes from offset 64; it excludes the digest and zero
+  padding. A nonempty payload is the exact UTF-8 journal record with no NUL,
+  carriage return, or line feed; empty active and terminal payloads have length
+  zero. Integers have no native-endian interpretation. Initialization zeroes
+  the entire 16 KiB file, writes sequence 1 into frame zero, and syncs the file;
+  the all-zero second frame is invalid until its first commit. A reader
+  uses bounded `pread` on a held descriptor, validates both complete frames,
+  and selects the valid frame with the greater sequence. Equal sequences with
+  different bytes, two invalid frames, a nonzero unused region, or sequence
+  exhaustion is a recovery error. To commit, the provider writes the complete
+  next sequence into the inactive frame through that same held descriptor,
+  syncs the file, reads the frame back, and accepts it only if every byte and
+  digest match. A provably invalid torn inactive frame leaves the previous frame
+  authoritative. A short-write, write, sync, or readback error makes the commit
+  indeterminate because either frame may be durable; the live provider stops
+  before external mutation or marks an already running operation
+  persistence-faulted, and recovery later selects the highest valid sequence and
+  applies its operation identity idempotently. Existing journal files and inodes
+  are never replaced, renamed, truncated, or unlinked after initialization.
+  Logical terminal records are reused after ring wrap by committing their next
+  inactive frame, and clearing `active` or `handoff` likewise commits a
+  validated empty payload in its inactive frame.
+
+  The provider opens all 36 paths through the held directory descriptor without
+  following symlinks and validates device, inode, owner, regular-file type,
+  mode, link count, and exact size. A newly initialized cursor payload is `00`,
+  `restart` is the validated all-clear record defined below, `active` and
+  `handoff` are empty, and terminal payloads are empty. Before accepting an
+  operation it requires a safe writable active, cursor, restart, and handoff
+  file, an empty handoff, and at least one safe writable
+  terminal slot. Starting at the cursor index, it selects the first qualifying
+  slot in ring order and persists that two-digit slot in `active` before the
+  external mutation. Terminalization commits that slot, commits the following
+  cursor index, commits the operation ID and selected two-digit slot to
+  `handoff`, then commits an empty active payload. If any step fails, recovery
+  completes the same idempotent sequence before output or another mutation.
+  A nonempty handoff payload is exactly the operation ID, one tab, and the
+  selected two-digit terminal slot. Both fields must match that slot's validated
+  terminal record; any extra field, mismatch, or empty selected slot is
+  malformed. `ack-operation` clears only this payload.
+  Thus safe fixed slots
+  retain the newest terminal records by durable ring position, never by the
+  rollback-prone `finished` wall clock.
+
+  Every provider process takes a shared `flock` on the held journal directory
+  descriptor for a read and an exclusive lock for one validation-and-commit
+  critical section. A writer holds the exclusive lock only until that frame is
+  synced, read back, and identity-checked; it never holds the lock while waiting
+  for authorization, PackageKit work, or a later signal. Before every later
+  state commit it reacquires the exclusive lock and revalidates the complete
+  journal plus the expected active operation identity. It retries nonblocking
+  acquisition only until a five-second monotonic deadline; timeout returns a
+  typed `conflict` before an external mutation starts, or marks an already
+  running operation persistence-faulted. A snapshot that must prune restart
+  guidance releases its shared lock, acquires the exclusive lock under the same
+  bound, and revalidates the complete journal before pruning. Every journal
+  writer in this project follows this protocol. The lock serializes cooperating
+  providers while allowing snapshots and a replacement watcher to observe a
+  long-running operation; descriptor checks remain mandatory because another
+  same-user process can ignore advisory locks.
+
+  Regional and delegated-launch owners additionally retain an exclusive
+  `flock` lease on the existing `active` file. They admit the exact operation
+  and acquire this lease in the same short exclusive directory interval, before
+  dispatch. Lease acquisition and recovery probes are nonblocking; contention
+  never waits while holding the directory lock. The lease uses a separately
+  opened, validated, no-symlink, nonblocking, close-on-exec file description,
+  not `dup(active)`, so even a probe through the originating journal's retained
+  descriptor cannot release its own owner lock. The directory lock is then
+  released for bounded service work while the file lease remains held. Lease
+  release and descriptor closure run on every exit; process death also releases
+  the lease. A failed recovery probe preserves the active record as unresolved,
+  never as evidence that no owner exists. This adds no persistent path, journal
+  field, or authorization mechanism. A lease is liveness evidence only; it does
+  not authorize a new caller to repeat an existing operation.
+
+  The absolute state path is opened component-by-component from a held root
+  directory descriptor with directory-only, no-symlink semantics; a symlink or
+  non-directory component fails closed. The provider retains each parent and
+  child descriptor in this bounded chain. Before and after every journal frame
+  commit and external mutating D-Bus call, `fstatat` without symlink following
+  must resolve each child name from its held parent to the held child device and
+  inode, including the `system-management` entry itself. A renamed whole
+  journal or ancestor directory therefore fails identity validation instead of
+  leaving the provider writing into a detached tree.
+
+  Every read and frame commit remains bound to those locked, validated file
+  descriptors. Immediately before and after each descriptor write, and again
+  before invoking an external mutating method, `fstatat` with no symlink
+  following must still resolve the fixed path to the held descriptor's device
+  and inode and must repeat all metadata checks. A mismatch rejects or strands
+  the operation without ever writing, truncating, renaming, or unlinking the
+  raced replacement. This post-write identity check catches a replacement made
+  after the pre-write check: the descriptor commit affected only the originally
+  validated inode, and no external mutation starts from a journal that is no
+  longer reachable at its fixed path at that check. The provider repeats all 36
+  identity checks immediately after sending an external mutating D-Bus call,
+  whether or not a reply arrives. A replacement in the irreducible interval
+  between the last pre-call check and that send is therefore treated as an
+  integrity failure, not as a safely journaled operation. The live provider
+  retains the detached descriptors and exact transaction identity, marks the
+  operation persistence-faulted, continues observing only that transaction to
+  its terminal signal, and never reports durable success.
+
+  If that provider exits, recovery deliberately cannot rediscover a detached
+  inode by pathname. An unsafe or malformed replacement is rejected with a
+  path-specific recovery error, bounded PackageKit diagnostics, and all mutation
+  disabled; recovery never adopts a transaction without a durable exact path and
+  identity. A fully well-formed journal forged by another process with the same
+  UID is indistinguishable from project-written user state and is outside this
+  contract's integrity boundary. The journal provides crash consistency and
+  safe path handling, not authentication against its owner. This limitation
+  grants no additional authority because the same user can invoke the delegated
+  PackageKit interface directly. During a live operation, the retained
+  descriptors and path-chain checks still ensure interference cannot redirect a
+  descriptor write into the replacement or turn a detected ambiguous outcome
+  into success.
+
+  If interruption occurs after the terminal slot commit but before cursor,
+  handoff, or active clearing, recovery accepts only the exact matching
+  operation and selected slot, completes the idempotent cursor and handoff
+  commits, and then commits the empty active payload. It never advances the cursor from an
+  unmatched record. Unrelated directory entries are never read or followed and
+  cannot increase recovery work. Journal records contain common IDs,
+  originating action IDs, timestamps, operation kinds, terminal results, the
+  closed normalized error code or literal `-`, and sanitized diagnostics, plus
+  eight fixed typed fields: update snapshot generation, PackageKit transaction object path,
+  system restart contribution, session restart contribution, application
+  restart contribution, boot identity, terminal-monotonic timestamp, and the
+  required two-digit terminal slot. An `update` record requires a valid
+  generation, the exact PackageKit path, a
+  `none|system|security-system|unknown` system contribution, a
+  `none|session|security-session` session contribution, a `yes|no` application
+  contribution, and the lowercase UUID read from the fixed
+  `/proc/sys/kernel/random/boot_id` file. The boot file read is capped at 37
+  bytes. A nonterminal update or refresh uses the literal `pending` for its
+  terminal timestamp. Every update or refresh terminalization commits unsigned decimal
+  `CLOCK_MONOTONIC` microseconds: immediately when `Finished` is consumed, or at
+  the conservative local decision point when bounded recovery instead obtains a
+  history result or records `interrupted`. A `refresh` record requires the exact
+  PackageKit path and uses the literal `-` for generation, all three restart
+  contributions, and boot; its terminal timestamp follows the rule above.
+  `timezone`, `ntp`, `locale`, and
+  `delegate` records require literal `-` in the first seven typed fields.
+  Every journaled kind requires its selected terminal slot. A consumer rejects
+  any missing field or value that does not match the operation kind. A
+  nonterminal record and a successful terminal record require `-` as the error
+  code. A failed terminal record requires exactly one normalized code from the
+  protocol error enum. Other terminal states store that normalized code exactly
+  when their operation stream emits an error row and otherwise use `-`.
+  The canonical operation payload has exactly this fixed field order:
+
+  ```text
+  operation-id<TAB>action-id<TAB>started<TAB>finished-or-pending<TAB>kind<TAB>state<TAB>error-or--<TAB>detail<TAB>generation-or--<TAB>transaction-path-or--<TAB>system-restart-or--<TAB>session-restart-or--<TAB>application-restart-or--<TAB>boot-id-or--<TAB>terminal-monotonic-or-pending-or--<TAB>terminal-slot
+  ```
+
+  `started` and a terminal `finished` use the protocol's canonical UTC
+  timestamp form. Nonterminal records use `pending` for `finished`.
+  Retained-terminal replay emits the persisted error row immediately before the
+  terminal operation record and never derives a code from diagnostic text. Each
+  accepted `RequireRestart` signal durably commits the updated active payload
+  through its held descriptor before any later `Finished` signal is consumed;
+  PackageKit application, session, security-session, system, and
+  security-system values merge into their corresponding contribution without
+  collapsing scope or security. `NONE` changes no contribution; an unrecognized
+  value sets only the system contribution to `unknown`. The terminal record
+  carries that same three-part tuple, its boot identity, and its exact
+  terminal-monotonic timestamp. If committing or syncing `active` fails, the
+  provider records an in-memory persistence fault, requests cancellation only
+  when PackageKit permits it, and consumes later signals only to stop observing
+  the backend. It neither emits a terminal record nor accepts a later `Finished`
+  as durable success while the active journal omits the requirement. The
+  stranded active record and recovery error remain visible and block new
+  mutation until journal persistence is repaired; subsequent bounded recovery
+  treats any otherwise successful result as having restart requirement
+  `unknown`.
+
+  The fixed `restart` record is the authority for outstanding guidance. Its
+  closed fields are the boot UUID; the last-applied update operation ID or `-`; a
+  `none|system|security-system|unknown` system bucket; a
+  `none|session|security-session` session bucket and unsigned
+  terminal-monotonic cutoff; and a `yes|no` application bucket and unsigned
+  terminal-monotonic cutoff. A newly initialized all-clear record uses `-`,
+  `none`, `none`, `0`, `no`, and `0` after the UUID. Satisfaction pruning keeps
+  the last-applied operation ID unchanged on the same boot. Keeping the two
+  lower-scope cutoffs independent lets a login clear an older session
+  requirement while retaining a newer application requirement. Before
+  committing any update terminal, the provider first prunes requirements
+  already satisfied by the rules below. It
+  then compares the operation's captured boot UUID with the current boot. A
+  mismatch proves that reboot occurred after that operation began, so a terminal
+  result recovered from the old boot contributes the all-clear tuple; it is
+  never merged back after the boundary cleared it. Otherwise the provider,
+  regardless of the result, merges each member of the durable three-part
+  contribution into its corresponding restart bucket, using the current
+  terminal timestamp for the session and application cutoffs. An update that
+  ends `failed`, `canceled`, or `interrupted` when sending or backend execution
+  of the mutating `UpdatePackages` method cannot be excluded preserves every
+  durable observed contribution and changes only a system contribution of
+  `none` to `unknown`. This rule applies regardless of the last persisted
+  lifecycle state because packages may have changed before observation stopped.
+  With no observed requirement its effective tuple is
+  therefore system `unknown`, session `none`, and application `no`; observed
+  session and application contributions remain intact, and an observed system
+  or security-system contribution remains more specific than `unknown`. A
+  failure, conflict, cancellation, or interruption that the provider and journal
+  prove occurred before that mutating method was sent contributes the all-clear
+  tuple, as does an authorization denial or cancellation that the exact
+  transaction proves never reached `running`. An all-clear
+  contribution never weakens
+  an outstanding requirement; multiple updates before a recovery boundary
+  therefore retain every unsatisfied bucket and its latest applicable cutoff.
+  An `unknown` contribution is stored only as system bucket `unknown`, never as
+  `none` or in a session or application bucket, and remains until a boot change.
+  The displayed closed restart enum is recomputed from the remaining buckets by
+  maximum scope and security urgency; bucket data is never collapsed back from
+  that display value.
+  Terminalization is a write-ahead sequence under the exclusive journal lock.
+  The provider first durably commits `active` with the final result, effective
+  normalized error code or `-`, restart contribution tuple, boot UUID,
+  terminal-monotonic timestamp, and reserved slot instead of `pending`. It then commits and syncs the inactive `restart`
+  frame with the merged buckets and that active operation ID as the
+  last-applied ID before committing the terminal slot. Persistence failure at
+  either step leaves `active` for recovery and never reports durable success.
+  Recovery of a terminalized update active record first compares its captured
+  boot UUID with the current boot. A mismatch leaves the new boot's restart
+  record all-clear, skips contribution reapplication, and completes only the
+  terminal-slot, cursor, handoff, and empty-active commits. On the same boot, recovery
+  compares the operation ID with the validated restart last-applied ID. A match
+  proves the contribution was
+  already merged, even if a later snapshot satisfied and pruned its buckets, so
+  recovery skips the merge and completes only the idempotent terminal-slot,
+  cursor, handoff, and empty-active commit steps. A mismatch reapplies the contribution from
+  the durable active checkpoint once and records its ID before proceeding. No
+  new mutating operation is admitted while `active` exists or `handoff` remains
+  nonempty, so the single last-applied ID cannot be displaced before that
+  operation is terminally committed and acknowledged. Recovery never reconstructs a later cutoff or changes a durable
+  terminal result merely because it resumed after a session boundary.
+  Terminalized refresh, timezone, NTP, locale, and delegate records never read,
+  merge, or write the restart record; recovery completes only their idempotent
+  terminal-slot, cursor, handoff, and empty-active commits.
+
+  A changed boot UUID satisfies every bucket and resets `restart` to the
+  all-clear record for the new UUID. On the same boot, the application and
+  session buckets clear independently only when the current logind session's
+  validated `TimestampMonotonic` is strictly greater than that bucket's stored
+  cutoff. Under one ten-second aggregate deadline, the provider first calls the
+  fixed `org.freedesktop.login1.Manager.GetSessionByPID` method with its own PID,
+  validates the returned session object path, and then reads the
+  `org.freedesktop.login1.Session.TimestampMonotonic` property from that exact
+  object through `org.freedesktop.DBus.Properties.Get`. It accepts only the
+  expected unsigned 64-bit D-Bus value. Only a `NoSessionForPID` error permits
+  the managed-user-service fallback: resolve the invoking UID through `GetUser`,
+  read its typed `User.Display` session identity, and validate the session's
+  matching user UID/object path and ID, X11 type, user class, active state,
+  `Active=true`, and `Remote=false`. Read the same typed timestamp from that
+  session, then re-read `User.Display` and require an unchanged identity. Every
+  call shares the original ten-second deadline. Permission denial, timeout,
+  malformed data, and other lookup errors never enable the fallback. A session
+  that began while an update was
+  still running cannot clear its later requirement.
+  Missing logind state, timeout, or malformed data retains the guidance with
+  `partial` status until a later session or boot boundary proves satisfaction;
+  it is never guessed clear. The system bucket clears only after a boot change.
+  Every snapshot and journal-recovery load applies these satisfaction rules and
+  recomputes the display aggregate before publishing `update-restart`. If any
+  bucket changed, it commits and syncs the pruned restart frame before exposing
+  the refreshed snapshot. If that persistence
+  fails, the provider reports updates `partial` and retains the prior guidance
+  instead of claiming it cleared. The durable action ID must have the fixed kind
+  defined by the
+  protocol and determines the owning provider used for recovered errors. The
+  files never record passwords, environment dumps, repository credentials,
+  package payloads, or unbounded output.
+- Before any mutation, the provider obtains the fixed service transaction or
+  operation ID without invoking its mutating method, commits and syncs the
+  pending active payload, and completes the post-write path-identity check. For
+  PackageKit it calls `CreateTransaction`, persists the returned transaction
+  object path, and only then invokes `RefreshCache(force=true)` or
+  `UpdatePackages(ONLY_TRUSTED, ...)` on that transaction. Each later state and
+  terminal result is committed and synced in order. Failure to
+  create or persist the record prevents the mutation from starting.
+- A PackageKit-backed `refresh` or `update` operation in any nonterminal state
+  that lacks a terminal PackageKit result is `interrupted`, not successful.
+  The transition table permits this recovery result before and after the
+  operation begins running. Recovery first accepts a valid durable terminal
+  journal record that the provider wrote from PackageKit's `Finished` signal
+  only when its operation ID, originating action ID, operation kind, and
+  persisted PackageKit transaction object path exactly match the active
+  record. A missing, malformed, duplicate, or mismatched identity is never
+  consumed as that operation's result.
+  For a nonterminal record, recovery validates and copies the bounded record
+  under a shared journal lock, releases that lock, and only then attempts to
+  adopt the exact recorded transaction object and consume its current or
+  replayed result before checking the active PackageKit transaction list. Signals
+  received during the initial object-property read remain bounded in memory:
+  no running or restart checkpoint is written until the role and invoking UID
+  are validated. An absent or mismatched object cannot contribute those signals
+  to the journal. One
+  independent ten-second monotonic aggregate deadline covers attachment to the
+  recorded object, its required property reads and replayed signals, and the
+  manager `GetTransactionList` call. An exact validated `Finished` result skips
+  the secondary active-list lookup. If it arrives while that lookup is already
+  in flight, a failed or malformed list reply cannot discard the captured result;
+  malformed transaction evidence or a journal checkpoint failure still prevents
+  terminal recovery. Without terminal evidence, the active-list reply accepts at most 256
+  unique valid PackageKit transaction object paths and 64 KiB of their complete
+  encoded UTF-8 values. Expiry cancels unfinished local D-Bus requests, detaches
+  every recovery observer without calling `Cancel` on the recorded transaction,
+  and discards late replies and signals. Expiry supplies neither terminal nor
+  absence evidence. An update recovery may still use the independently bounded
+  history query to accept an exact terminal result, but otherwise it preserves
+  the nonterminal journal, emits its validated `active-operation` row with a
+  recovery `timeout` error, and blocks replacement mutation. Only a later
+  successful bounded lookup that proves exact absence may use the conservative
+  `interrupted` path.
+  An over-limit, duplicate, malformed, or wrong-typed active-list reply is a
+  recovery `malformed` error that preserves the journal and blocks mutation.
+  For an update transaction only, recovery finally
+  calls PackageKit transaction method `GetOldTransactions(64)` on a new
+  read-only transaction and consumes at most 64 emitted `Transaction` records.
+  One ten-second monotonic aggregate deadline covers `CreateTransaction`, the
+  `GetOldTransactions` call, every signal, and `Finished`. On expiry the
+  provider requests `Cancel` only if that transaction reports
+  `AllowCancel=true`, waits at most five additional seconds for `Finished`, then
+  detaches and discards every late signal. Expiry supplies no terminal evidence;
+  after the exact transaction is also absent from the bounded active lookup,
+  recovery follows the conservative `interrupted` path below. An over-limit or
+  malformed history result is a recovery `malformed` error and is never treated
+  as negative history.
+  That signal supplies the old transaction object path, success flag, role, and
+  UID used below; this is not the separate package-oriented
+  `GetPackageHistory` method. PackageKit does not record `RefreshCache`
+  transactions in old-transaction history. A history result is accepted only
+  when its transaction object path exactly matches the journaled path, its role
+  is `update-packages`, and its UID is the invoking user's UID.
+  Before either adoption or history assigns a restart contribution, it compares
+  the active record's captured boot UUID with the current boot. A mismatch uses
+  the all-clear tuple for every external result and never reintroduces unknown or
+  observed guidance from the previous boot.
+  Exact active-transaction adoption seeds its three restart contributions from
+  the validated nonterminal record, merges every accepted `RequireRestart`
+  signal observed during adoption using the per-scope rule above, and durably
+  persists that tuple in the terminal record before reporting the adopted
+  `Finished` result. If adoption reaches `Finished` without replaying any
+  `RequireRestart` signal, a permission denial or cancellation that the journal
+  and adopted transaction both prove never reached `running` uses the all-clear
+  tuple. Every succeeded result, failed result, or cancellation whose execution
+  cannot be excluded sets the system contribution to `unknown` while retaining
+  the validated session and application contributions already in `active`; a
+  restart signal may have occurred after the last successful active-frame
+  commit. A partial replay containing only application, session, or `none`
+  signals also cannot exclude a missed system-restart requirement: unless
+  execution is proven excluded, an otherwise `none` system contribution becomes
+  `unknown`. Specific system or security-system guidance is retained on that
+  partial-replay path. The no-replayed-signal and history paths still use their
+  explicitly required uncertainty replacement, even when `active` previously
+  recorded specific system guidance.
+  A valid durable
+  terminal record written from `Finished` recovers its persisted tuple. A
+  missing, malformed, or kind-incompatible contribution field in the active or
+  terminal record is a `malformed` recovery error that preserves the record and
+  blocks mutation; it is never downgraded to `interrupted`. That terminal state
+  is used only after the journal record is valid and exact bounded external
+  evidence still cannot supply a trustworthy result. An old-transaction history
+  match with `succeeded=true`
+  recovers only the terminal `succeeded` result and sets the system contribution
+  to `unknown` while retaining validated session and application contributions,
+  because history cannot
+  replay a `RequireRestart` signal that may have been missed before persistence.
+  It never substitutes or preserves `none` on that path. An exact history match
+  with `succeeded=false` is usable only after a successful bounded lookup proves
+  exact absence: PackageKit inserts that row at its ready state, before
+  execution finishes. A still-active transaction or a lookup timeout retains
+  ownership despite this unsuccessful history row. With confirmed absence the
+  result is `interrupted`, because history cannot
+  distinguish cancellation from another failure or reconstruct the required
+  typed error row. It uses the same conservative system `unknown` contribution
+  while retaining validated session and application evidence regardless of the
+  active record's last persisted lifecycle state, because the D-Bus method may have begun package
+  changes before that state was synced. Duplicate matches,
+  malformed identity fields,
+  another role or UID, and a success flag without the exact path are ambiguous
+  and never consumed as this operation's result. After any unlocked PackageKit
+  interaction, recovery reacquires the exclusive journal lock, revalidates the
+  full path chain, fixed files, and exact active operation identity, and only
+  then commits recovered state. A mismatch discards the stale D-Bus result and
+  changes no journal frame. No D-Bus method, signal wait, or bounded history
+  collection runs while a shared or exclusive directory lock is held.
+
+  A negative bounded lookup is never evidence that PackageKit succeeded or
+  failed. If exact adoption or the active transaction list confirms that the
+  exact transaction is still active, the finite snapshot emits its validated
+  `active-operation` row. The matching live originating refresh or install
+  stream remains its sole observer; only when no such stream is owned does the
+  root model start the required `watch-operation` process to keep the operation
+  nonterminal while consuming signals through `Finished`. Only after that exact
+  transaction is absent and the bounded terminal sources
+  cannot recover a result does the provider record `interrupted` to mean that
+  its observation was interrupted and the backend outcome is unknown. It
+  performs a new read-only discovery and offers diagnostics; it never retries
+  the refresh or update automatically. The UI states this ambiguity rather
+  than describing the PackageKit transaction itself as failed. Recovery never
+  expands to an unbounded history query. A regional operation recovers a
+  terminal result only from a valid terminal journal record durably written
+  before interruption. Recovery first probes the exact nonterminal native
+  owner's file lease under the short directory lock. A held lease preserves
+  the validated active record without querying the service or writing a
+  terminal result. A nonterminal `timezone`, `ntp`, or `locale` record whose
+  lease is no longer held becomes `interrupted` regardless of the owning systemd
+  service's current value, because the journal intentionally stores no target
+  and current state cannot prove this operation caused it. Recovery publishes a
+  fresh read-only regional snapshot and explains that the requested mutation's
+  outcome is unknown; it never retries or audits it as successful. A delegated
+  launch records its terminal `succeeded` result as soon as the trusted tool is
+  accepted; the tool owns all later internal work. A nonterminal delegated
+  record whose owner lease is no longer held becomes `interrupted`, while a valid
+  durable terminal record replays its exact launch result. Settings never
+  infers that the delegated tool's internal work succeeded.
+
+The internal native-owner lease and recovery guard are implemented independently
+of mutation commands. Tests cover all regional and delegated kinds, competing
+and originating descriptors, path replacement, lock and cleanup failures,
+normal process exit, abrupt process death, and durable terminal replay. Public
+native snapshot/watch integration now observes these owners without taking over
+service work. Fixed regional CLI origins retain this lease throughout their
+service workflow; fixed delegated origins retain it through accepted launch and
+durable handoff. Originating Settings actions remain gated; the cumulative
+snapshot minor is unchanged.
+
+## Event and Resource Contract
+
+The implemented fixed `dwm-system-management watch-updates` command accepts no
+arguments. It subscribes to the three global PackageKit signals below and the
+bus daemon's `NameOwnerChanged` for exactly `org.freedesktop.PackageKit`. It never
+activates PackageKit, reads its properties, or creates a transaction. An
+explicit successful asynchronous `AddMatch` reply for each fixed bus match rule
+and verified `GetNameOwner` result precede the fixed
+`update-event<TAB>ready` record. Every later matching signal emits the fixed
+`update-event<TAB>changed` record; startup changes coalesce into one such record
+after readiness. Consumers must establish this monitor before their initial
+read, invalidate confirmations on every change, and apply the bounded cycle
+below, rather than launching one process per event.
+
+One ten-second monotonic deadline covers connection and all setup round trips.
+Only a verified `NameHasNoOwner` response is accepted as an absent daemon;
+lookup denial or another failure cannot report readiness. Local callbacks use
+the explicitly tracked unique sender, and an owner notification received during
+lookup takes precedence over its older result.
+Setup or bus failure and lost output exit 1 with best-effort explicit-refresh
+guidance.
+Writes are nonblocking and each fixed row fits `PIPE_BUF`; a full output pipe
+or short write stops monitoring with the same failure instead of queuing events
+or blocking signal handling. Consumers must treat any unexpected exit as lost
+monitoring and invalidate their preview. There is no userspace output backlog.
+The command uses the same isolated output strategy as operation controls,
+without changing inherited file-status flags while live or on exit. Failure
+diagnostics are nonblocking and best-effort too, including when stderr shares
+a full stdout pipe. Exit status is authoritative when the diagnostic cannot be
+delivered.
+SIGTERM, SIGINT, or SIGHUP stop the subscriptions and exit 0. A missing PackageKit
+owner does not prevent readiness: the monitor waits for owner changes without
+activating the service, while finite discovery reports availability separately.
+There is no idle timer or automatic reconnect. This helper is an event stream,
+not a snapshot, action, journal record, or operation stream; its two exact record
+forms are independent of the cumulative snapshot minor.
+
+The pane-scoped `SystemUpdateDiscovery` subscriber now consumes this stream.
+Its process and bounded-cycle lifetime is shared through
+`SystemProviderDiscovery`, with a closed mapping for updates, time, locale,
+accounts, and printers. Each mapping fixes the command, arguments, and accepted
+event prefix; callers cannot provide another executable or arbitrary arguments.
+The update component remains a thin compatibility wrapper. The root snapshot
+coordinator now starts all five fixed subscriptions while System Settings is
+open; software sources share the update subscription. No new idle polling or
+operation origins are introduced by this subscriber. Native controls use the
+confirmed coordinator described above; NTP sampling is qualified in `P6-REGIONAL-UI-EVIDENCE.md`.
+Private nested-X11 tests exercise every fixed stream, event bursts, a dirty
+settling read, explicit retry, wrong-prefix fallback, close cleanup, and unknown
+domain rejection. Replacing a domain retires the old read token and readiness
+before any callback, then waits for the new handshake, including when shutdown
+already has a replacement queued. A regression first reproduced a reentrant
+read during that invalidation and now verifies that it is excluded.
+The fixture also changes domains from an unexpected-exit invalidation and
+verifies the replacement command, fresh baseline, and complete cleanup. All 91
+assertions passed in five repeated Fedora 44 runs. The supported
+[Fedora snapshot](https://github.com/quickshell-mirror/quickshell/blob/dacfa9de829ac7cb173825f593236bf2c21f637e/src/io/process.cpp)
+and [Quickshell 0.3.0](https://github.com/quickshell-mirror/quickshell/blob/v0.3.0/src/io/process.cpp)
+define `running` from the current process object, allocated synchronously when
+starting. An old exit notification therefore reads the replacement's current
+running state, not a captured false value; the existing `!running` guard does
+not finalize that replacement. This resolves the local review concern without
+changing correct process behavior.
+The test harness also includes the shared fixture helper in bounded failure
+cleanup. A live-pipe regression reproduced a leaked monitor before that fix;
+cleanup now removes it while preserving both successful and failing exit status.
+
+Opening or refreshing the section batches all five cycles before an optional
+snapshot can start. Every subscription must acknowledge readiness or reach its
+finite failed-monitor fallback. Required startup or operation recovery can bypass
+that barrier, but captures no optional tokens until every domain is ready. Thus
+neither a closed startup read nor opening during an existing read substitutes
+for a monitored baseline. The single snapshot process captures each participating
+domain's token, enters all completion handoffs before publication, and retains
+ownership through parsing, recovery callbacks, and per-domain completion.
+Uncaptured domains keep their pending or blocked cycle even when a cumulative
+read incidentally updates their displayed values. Available state is projected
+as partial when its own monitor fails or remains dirty; raw validated values
+are not overwritten, and locale-only monitoring failure does not degrade time
+state. Provider summaries retain explicit reload guidance. Closing the section
+retires all optional cycles and subscriptions, but required recovery and root
+operation observers survive. Reentrant close/reopen during token admission or
+loading publication cannot launch the canceled read or consume replacement
+tokens. Private nested-X11 tests cover these boundaries with 53 assertions,
+including required recovery while setup is held and a separate reopen baseline.
+Separate lock-contention cases prove each duplicate fixture monitor records an
+overlap before failing, without removing the existing owner's marker or pipe.
+
+The snapshot's checked-command wrapper installs cleanup and termination handlers
+before allocating either temporary capture. A signal during allocation exits
+with cancellation status after removing the known captures, and does not launch
+the requested helper. Allocation failure also cleans any earlier capture.
+Successful output remains withheld until helper success; helper errors and
+started-child termination retain the existing diagnostic and wait behavior.
+Seven private QML scenarios inject allocation failure or TERM at both setup
+points and verify output, child shutdown, and absence of capture files.
+Abrupt process KILL or host failure cannot run shell cleanup handlers and is not
+covered by the graceful-termination guarantee.
+
+The root's internal delegated confirmation entry admits only `accounts-open`,
+`password-open`, `printers-open`, and `sources-open`. It requires a visible
+Settings section, a quiet snapshot owner, fresh owning-provider cycle, validated
+available action, and empty operation/recovery ownership. Native admission does
+not require update-only recovery evidence. A pending confirmation captures the
+action, snapshot generation, request identity, and provider epoch; provider or
+global invalidation, replacement reads, and closure retire it. Update and native
+prompts cannot overlap. Dispatch is claimed before clearing the prompt and state
+is rechecked after reentrant callbacks, then the existing owner independently
+validates fixed empty arguments. Discarding or closing a prompt never starts an
+operation; closing after dispatch preserves observation. Sixteen private nested
+X11 cases cover all four tools, typed denial and unsupported results, and closure
+during dispatch callbacks. Accepted launch still does not verify administration
+inside the tool. These entry points are not exposed by IPC.
+
+`SystemDelegateControls.qml` now exposes the four fixed tool entries and an
+explicit launch-only confirmation. Scoped provider and action failures remain
+readable, including when a tool is missing or its monitor cannot establish fresh
+state. Account and repository lists are read-only, virtualized, and bounded to a
+180-pixel viewport. Confirmation focuses Cancel; Cancel returns to the originating
+card, and geometry notifications keep the whole focused card visible after layout
+or viewport changes. Native operations use neutral shared owner/recovery wording
+and never show update cancellation controls. The private UI matrix covers all
+four actions at three window sizes with success, denial, unsupported, and maximum
+256-account/512-source inventories. Keyboard and screenshot evidence is recorded
+in [P6-DELEGATE-UI-EVIDENCE.md](P6-DELEGATE-UI-EVIDENCE.md). Regional confirmation,
+regional controls, and combined installed acceptance remain separate boundaries.
+
+The shared subscription owner starts a discovery cycle only after readiness, with a 12-second frontend
+startup deadline covering the helper's ten-second setup and process startup.
+Failure falls back to a finite read with visible monitoring-unavailable guidance;
+there is no automatic reconnect. Explicit reload or section reopen retries the
+monitor. Closing the section sends TERM and uses a 1.5-second KILL grace if the
+observer does not exit. Required startup/recovery snapshots and root-owned
+operation streams are independent of that optional subscriber.
+
+`SystemDiscoveryCycle.js` serializes initial, settling, and blocked cycles.
+Snapshot ownership spans parsing and recovery publication, so invalidations in
+either completion callback are included before the next read is reserved or the
+provider becomes idle. A failed read or invalidated settling read retains dirty
+state until a later explicit cycle completes a quiet settling read. Readable
+inventory and backend diagnostics remain intact when monitoring fails; available
+update state becomes partial with separate reload guidance. Conservative
+PackageKit observer completion, uncertain exit, and active adoption share the
+same invalidation path. The model exposes confirmation invalidation for every
+global change and replacement read; originating mutation and confirmation UI
+remain a separate implementation boundary.
+
+- PackageKit `UpdatesChanged` and `InstalledChanged` invalidate update
+  discovery; `RepoListChanged` invalidates both repository and update discovery
+  because enabled sources determine inventory, simulation, and generation.
+  Transaction-list signals are consumed only for bounded
+  active-operation recovery; they never mark discovery dirty. Property,
+  progress, package, error, restart, and finished signals are consumed only by
+  the owner of their exact discovery, simulation, refresh, or update transaction.
+  Transaction-scoped creation, progress, and `Finished` for the provider's own
+  read-only transactions, and their accompanying `TransactionListChanged`,
+  cannot schedule another discovery. Global `UpdatesChanged`,
+  `InstalledChanged`, and `RepoListChanged` received while such a transaction is
+  active do participate in the bounded dirty-bit settling cycle below, whether
+  they arose from backend work or an external actor, because the global signal
+  carries no transaction identity. The root model permits only one bounded
+  PackageKit discovery/repository refresh at a time. Invalidations received while
+  it is in flight set one dirty bit. Its serialized completion handler atomically
+  tests and clears that bit while reserving at most one coalesced rerun before it
+  exposes the provider as idle; an invalidation arriving on either side of that
+  handoff therefore attaches to the reserved rerun or starts a new refresh and
+  is never lost. That reserved rerun is the settling read for the burst.
+  Every global invalidation received during that settling read, including at
+  its atomic completion handoff, sets a separate unresolved-dirty bit. Because
+  the signal has no transaction identity, the provider neither assumes it was
+  self-generated nor schedules an unbounded third read. If the bit is clear,
+  the provider publishes clean idle and a later signal starts a new cycle. If
+  it is set, the provider retains it, publishes updates or repositories as
+  `partial` with explicit-refresh guidance, and suppresses automatic reruns from
+  further global signals until an explicit refresh or a section close/reopen
+  starts a new bounded cycle. A cycle clears unresolved-dirty only when its
+  settling read completes without another invalidation. Thus external dirty
+  state is never silently discarded and a backend that emits on every passive
+  read cannot form a refresh loop. Bursts never accumulate provider processes
+  or overlapping PackageKit transactions.
+- Consuming `Finished` for every journaled, non-simulated `UpdatePackages`
+  transaction whose mutating method was sent and whose backend execution cannot
+  be excluded marks update discovery dirty before terminal persistence,
+  regardless of its last persisted lifecycle state or terminal result, because
+  a failed, canceled, or interrupted backend may still have changed packages.
+  The unjournaled
+  `SIMULATE|ONLY_TRUSTED` transaction never marks discovery dirty. A successful
+  or unsuccessful `RefreshCache` whose method was sent and whose backend work
+  cannot be excluded does the same because it may have refreshed a subset of
+  repositories. These provider-owned
+  invalidations use the same serialized dirty bit as `UpdatesChanged`, so
+  observing both causes exactly one rerun and absence of that signal cannot
+  leave post-transaction discovery stale. Transaction-list signals remain
+  excluded from discovery invalidation.
+- The root model also marks discovery dirty when an owned journaled refresh or
+  update stream exits without a terminal record after its external method was
+  sent and backend work cannot be excluded. Every recovery of a nonterminal
+  refresh or update reserves the same coalesced discovery rerun before it
+  publishes an idle provider, whether recovery adopts a transaction, finds
+  history, or records `interrupted`. These fallbacks make invalidation independent
+  of terminal-frame success while preserving the simulation exclusion.
+The preparatory regional event commands are now implemented:
+
+```text
+dwm-system-management watch-regional time
+dwm-system-management watch-regional locale
+```
+
+Each accepts only its fixed selector, subscribes to the service's fixed
+`PropertiesChanged` path/interface and bus-daemon `NameOwnerChanged`, and
+acknowledges the owner-change match and authenticates the initial owner before
+acknowledging the property match and repeating the owner barrier. Only then does
+it emit `regional-event<TAB>ready`. The entire setup has one ten-second
+deadline. Only a missing owner is accepted as dormant; denied or malformed
+setup never reports readiness. Relevant changed or invalidated properties and
+owner arrivals/replacements emit `regional-event<TAB>changed`. Changes during
+setup coalesce into one record immediately after readiness, and a newer owner
+notification wins over an older in-flight lookup.
+Property callbacks require the authenticated unique sender even before
+readiness. This also rejects unicast signals addressed directly to the monitor,
+which can bypass bus-side match rules, before parsing their payload or changing
+the setup dirty bit. Authentic changes during setup still coalesce normally.
+
+Readiness means the subscriptions are installed, not that the service is
+running. systemd's timedated and localed normally exit after being idle;
+departure clears the pinned sender without emitting a change or requesting a
+read. This avoids repeatedly reactivating an idle service. A later owner arrival
+invalidates state, and native actions still establish their own fresh monitored
+confirmation evidence. The monitor never calls a platform service method,
+activates a service, or starts an idle timer. Closed/full output, bus loss, or
+setup failure exits 1 with reload guidance; TERM, INT, and HUP clean up and exit
+0. Output uses the same isolated bounded writes as `watch-updates` and never
+changes inherited descriptor flags. Cleanup removes only acknowledged match
+rules, releases local sources, and does not close shared service connections.
+
+The internal `NtpRead` client separately issues exactly two fixed
+`Properties.Get` requests for `CanNTP` and `NTPSynchronized`, accepts only
+bounded boolean replies, and publishes a pair only after both succeed under
+one ten-second deadline. Partial, late, denied, and malformed replies do not
+publish a sample. The finite `dwm-system-management ntp-sample` command now
+exposes that reader without arguments, PackageKit discovery, journal access,
+authorization, mutation, or a timer. It uses a separate version 1.0 stream and
+does not change the cumulative snapshot minor. Successful output is exactly:
+
+```text
+ntp-sample-protocol<TAB>1<TAB>0
+sample<TAB>CAN_NTP<TAB>SYNCHRONIZED
+complete<TAB>ntp-sample
+```
+
+Both values are exactly `yes` or `no`. A failure replaces the sample line with
+`error<TAB>ntp-sample<TAB>CODE<TAB>DETAIL`; codes are `missing-provider`,
+`permission-denied`, `unsupported`, `timeout`, `malformed`, or `internal`.
+Detail is printable UTF-8 capped at 512 bytes. The complete stream is at most
+1024 bytes. Success exits 0, a typed read failure exits 1, and invalid arguments
+exit 2 without a sample. Consumers must require the exact header, one sample or
+error, matching completion, and corresponding normal exit before publication.
+
+The command buffers the entire result before a single bounded stdout write.
+It does not initialize an unused stderr writer; closed, absent, or read-only
+stderr does not prevent a valid sample. Child-process regressions cover these
+descriptor states independently of the private-bus checks.
+Absent stdout, a closed descriptor or Python stream, and read-only, full, or
+short stdout fail with exit 1, without traceback, retry, or a partial-value
+success claim. Invalid output setup does not start a service read.
+Output setup and TERM/INT/HUP interruption release private
+descriptors and restore signal handlers. The inherited output file-status flags
+are never changed. Regular-file output preserves its original offset/append
+semantics; this does not impose a deadline on storage I/O. The existing private
+bus fixture also exercises the CLI through typed success, denial, malformed
+data, a real ten-second timeout, and discarded late replies.
+Actual child-process TERM, INT, and HUP checks interrupt stalled private-bus
+calls and require exit 1 with empty output and no traceback. The signal handler
+queues one high-priority main-context cancellation and quit; it does not raise
+inside a GLib callback, where the exception can be swallowed. A deterministic
+loop-start fixture also signals after the reader's done check but before
+`MainLoop.run()`, proving that an early quit cannot be lost. Pending cancellation
+sources are removed on return, repeated signals coalesce, and the command
+rejects publication explicitly even if the read has just completed.
+A read-only Fedora 44 command check returned `sample<TAB>yes<TAB>yes` with
+matching completion and exit 0, without changing NTP or the system clock.
+
+Settings activation uses the shared root subscriptions and the qualified
+30-second visible NTP sampler. Spaced read-only Fedora samples can reactivate
+idle timedated and therefore emit owner-arrival notifications. Time-only
+reconciliation avoids turning these arrivals into repeated cumulative PackageKit
+reads without dropping genuine concurrent time changes. Sampling evidence is
+recorded in `P6-REGIONAL-UI-EVIDENCE.md`.
+
+Two fixed time discovery commands support scoped Settings reconciliation.
+Settings uses `watch-time`, while `watch-regional time` keeps its existing
+protocol. The fixed no-argument `time-status` command makes
+one `Properties.GetAll` call to timedate1 through the existing strict regional
+reader, under its ten-second aggregate connection/reply/decoding deadline:
+
+```text
+time-status-protocol<TAB>1<TAB>0
+time<TAB>TIMEZONE<TAB>CAN_NTP<TAB>NTP_ENABLED<TAB>SYNCHRONIZED
+complete<TAB>time-status
+```
+
+The timezone uses the existing validated identity grammar; each boolean is
+exactly `yes` or `no`. A failure replaces the complete `time` row with
+`error<TAB>time-status<TAB>CODE<TAB>DETAIL`, using the same six fixed error codes
+and printable 512-byte detail limit as `ntp-sample`. The whole stream is at most
+1024 bytes. Success returns 0, a typed failure returns 1, and extra arguments
+return 2. It shares the finite nonblocking output and cooperative signal
+boundary: missing stdout, a short/full/closed write, or an explicit stop cannot
+report success. Unused stderr need not be writable. No journal, PackageKit,
+mutation, clock change, or timer-driven discovery is added. This full-state
+command is for event-driven reconciliation, not the 30-second sampler; that
+sampler must still read only `CanNTP` and `NTPSynchronized`.
+
+The fixed no-argument `watch-time` command uses the same passive, authenticated
+two-match setup, initial/final owner barriers, bounded output, and shutdown as
+`watch-regional time`. Its records are `time-event<TAB>ready`,
+`time-event<TAB>changed`, and `time-event<TAB>owner-arrived`. Before readiness,
+matching properties and owner arrivals coalesce into the existing single
+`changed` after `ready`, preserving initialization reconciliation. Once ready,
+an authenticated nonempty owner arrival or replacement emits `owner-arrived`;
+relevant properties still emit `changed`. Departure stays quiet and clears the
+pinned sender. Untrusted, stale-owner, and unrelated signals cannot produce
+either notification. The monitor makes no platform read or activation call.
+
+An owner-arrival record is uncertainty, not certification that configuration
+is unchanged. Settings temporarily gates time admission and uses a separate
+bounded time-only owner to reconcile timezone, CanNTP, and NTP enablement.
+Unchanged configuration retains catalog and matching preview identities;
+synchronization-only changes update readable state. Genuine configuration
+changes use normal discovery invalidation. Initial and settling reads retain
+the existing two-read limit, and a baseline mismatch permits only one automatic
+cumulative recovery before explicit retry is required. Required recovery
+preempts and reaps optional readers. Arrivals during regional preview reads
+are retained until the finite reader releases and reconciliation finishes.
+With readable time state, the helper's timezone and NTP offers share admission;
+only NTP adds a capability check. Initial reconciliation therefore detects both
+capability loss and gain when those offers establish the prior capability.
+When shared admission blocks both actions, capability remains unknown rather
+than inferred absent, and time-only reads never enable the blocked offer.
+Private-bus
+fixtures exercise the new passive monitor lifecycle, fixed time-status reads,
+malformed/denied/timeout results, late replies, and all three handled signals.
+
+The shared `SystemRegionalPreflightModel` now also accepts these fixed
+no-argument `time-status` and `ntp-sample` reads. Its existing strict cumulative
+byte parser enforces the exact headers, one appropriate observation row or
+one command-owned error, the six closed error codes, and the 1024-byte stream
+limit. An observation is usable only after completion and a matching normal
+process exit; errors withhold all provisional values. The scoped commands use
+a 12-second outer deadline around the helper's ten-second budget, with the
+existing three-second TERM-to-KILL reaping grace. Catalogs and previews retain
+their 25-second outer deadline. Ownership remains claimed through publication
+callbacks, and close, overflow, timeout, or replacement cannot publish retired
+data. Time-only observations never supply journal recovery evidence. The visible
+30-second NTP sampler remains separate integration work.
+
+The fixed `dwm-system-management watch-accounts` command is also implemented.
+It accepts no arguments and emits only `accounts-event<TAB>ready` and
+`accounts-event<TAB>changed`. It shares the authenticated setup lifetime above:
+the owner-change match precedes the initial owner lookup, then three service
+matches are acknowledged before the final owner barrier and readiness. All
+four matches and both owner lookups share one ten-second setup deadline.
+The fixed service matches are manager `UserAdded` and `UserDeleted` plus one
+interface-wide `org.freedesktop.Accounts.User.Changed` subscription. Every
+notification requires the pinned unique sender even during setup; object paths
+and signatures are bounded and validated before invalidation. No account
+method, enumeration, property read, or mutation is called by this monitor.
+It retains no candidate identities and has no idle timer or reconnect loop.
+An absent owner can be dormant, departure quietly clears its identity, and
+arrival/replacement invalidates. Finite reads separately report availability.
+The same bounded output, explicit failure guidance, and TERM/INT/HUP cleanup
+apply. This command does not activate Settings or change the snapshot minor.
+
+The fixed `dwm-system-management watch-units printers|security` command is
+implemented separately. It emits only `units-event<TAB>ready` and
+`units-event<TAB>changed`. Printers selects `cups.service` and `cups.socket`;
+security selects only `firewalld.service`. A private asynchronous bus connection
+owns its systemd `Subscribe`, avoiding interference with another subscriber on
+a shared connection. Six acknowledged matches cover owner changes, manager
+`UnitNew`, `UnitRemoved`, `UnitFilesChanged`, `Reloading`, and interface-wide
+unit property changes. Owner authentication, subscription acceptance, fixed
+`GetUnit` lookups, and a final owner barrier all precede readiness within one
+ten-second aggregate setup budget. Every notification requires the pinned
+unique sender before decoding, including directly addressed setup signals.
+
+The monitor never loads, references, starts, or enumerates units. `GetUnit`
+resolves already-loaded fixed names and accepts no-such-unit as dormant state.
+Manager arrivals can name canonical aliases, so they coalesce into one fixed
+lookup pass and at most one settling pass under a shared ten-second burst
+deadline. An unrelated arrival with unchanged fixed mappings does not invalidate
+the UI. Matching removals, configuration reloads, unit-file changes, changed
+fixed mappings, and relevant properties invalidate state. Properties received
+while a mapping is unresolved conservatively invalidate without retaining other
+unit identities. A further manager event during the settling pass fails the
+monitor explicitly; there is no idle polling or reconnect loop. Stale resolution
+or owner-barrier callbacks cannot publish readiness. Systemd owner loss or
+replacement fails monitoring because its replacement does not inherit the old
+sender's subscription. Finite snapshots remain independently readable.
+
+Shutdown cancels outstanding local lookups and closes only the private
+connection, waiting at most one second for close completion. Unconfirmed cleanup
+is failure, not success; process disconnection also removes the sender's matches
+and subscription. Full or closed output retains bounded failure and never
+changes inherited file-status flags. This command adds no Settings activation
+or cumulative protocol minor. The finite CUPS reader still separately uses
+`ListUnitsByNames`, which may load fixed unit configuration but does not start
+the service; that method is not used by the monitor.
+
+- systemd D-Bus property changes drive time and locale refresh while the System
+  section is open. On pane open, the root model installs the timedate1 and
+  locale1 property subscriptions before starting their initial bounded reads.
+  A matching change received while a read is in flight marks that provider
+  dirty and reserves one serialized, coalesced reconciliation read. That is the
+  settling read for the initialization burst. A matching change during the
+  settling read or its completion handoff sets an unresolved-dirty bit; the
+  provider stops after those two reads, publishes regional state as `partial`
+  with explicit-refresh guidance, and suppresses further automatic regional
+  reruns until an explicit refresh or pane close/reopen starts a new bounded
+  cycle. A quiet settling read clears both bits and publishes clean state. This
+  prevents both an unmonitored initialization gap and an automatic refresh loop.
+  Because timedate1 marks `NTPSynchronized` and `CanNTP` as not emitting change
+  signals, one non-overlapping bounded read of only those properties runs every
+  30 seconds while the section is open and immediately after an NTP action. The
+  fallback and subscriptions stop on section close. If subscription setup is
+  unavailable, the finite bounded snapshot remains readable but live regional
+  monitoring is explicitly unavailable.
+  Settings shares one finite reader between time reconciliation and the
+  two-property sample. Recovery has priority and reaps an optional sample before
+  taking its snapshot. Routine synchronization results do not invalidate
+  catalogs or previews; capability changes do require fresh discovery. Sample
+  failures retain the last synchronization value with `partial` status and
+  retry guidance, without turning otherwise fresh time configuration into a
+  failure. A service arrival during sampling reserves full time reconciliation
+  after the sample is reaped. The sample is never journal or mutation evidence.
+- AccountsService manager `UserAdded` and `UserDeleted` signals and the `Changed`
+  signal on every valid de-duplicated candidate object selected within the
+  256-object bound trigger one bounded, coalesced account-summary refresh while
+  the section is open. On pane open, the root model acknowledges both manager
+  subscriptions and the authenticated interface-wide `Changed` subscription
+  before starting `ListCachedUsers`. The latter already covers every candidate
+  before its properties are read or filtered, including an excluded object
+  becoming eligible. This replaces separate per-candidate attachment without
+  a second monitor enumeration that could select different objects. Valid
+  changes outside the selected set conservatively invalidate, but no additional
+  identities or account values are retained and the 256-object read bound is
+  unchanged. A matching signal during the initial enumeration or
+  property reads reserves one serialized reconciliation read. A further signal
+  during that settling read or its completion handoff stops the cycle after two
+  reads, leaves accounts explicitly `partial` with refresh guidance, and
+  suppresses automatic reruns until explicit refresh or pane close/reopen. The
+  subscriptions and pending refresh stop when the section closes; an over-limit
+  enumeration remains explicitly `partial`.
+- The systemd manager's `UnitNew` and `UnitRemoved` signals for the fixed
+  `cups.service`, `cups.socket`, and `firewalld.service` names, plus
+  `PropertiesChanged` for each loaded unit's `LoadState`, `ActiveState`, and
+  `SubState`, trigger one bounded, coalesced refresh of the owning
+  state while the section is open. Those subscriptions stop on section close.
+  Fixed alias mappings are also reconciled after unit-file changes and completed
+  manager reloads, which can retarget an alias without creating a new object.
+  Delegated-tool availability remains a bounded snapshot; Phase 6 adds no CUPS
+  or firewalld polling loop.
+- A single pane-scoped `dwm-system-management watch-mounts` process monitors
+  mount-table changes while the System section is open. This fixed private
+  minor-2 command accepts no arguments and is not an action or operation
+  stream. Its supervisor starts exactly
+  `findmnt --poll --raw --noheadings --output ACTION` in a dedicated process
+  group. The child closes every inherited nonstandard descriptor before its
+  isolated Python startup, arms Linux parent-death SIGKILL, rechecks the original
+  parent identity, and replaces itself with the fixed program. Before emitting
+  anything, the supervisor
+  waits under a one-second monotonic deadline until the live child's descriptor
+  table contains the open `/proc/CHILD_PID/mountinfo` baseline. The readiness
+  probe walks every numeric entry beneath that exact `/proc/CHILD_PID/fd`
+  directory until it finds a symlink target equal to
+  `/proc/CHILD_PID/mountinfo` with the persistent polling descriptor flags, the
+  child exits, its proc identity changes, or
+  the deadline expires. It then emits the exact line
+  `mount-monitor-ready`; subsequent bounded nonempty findmnt lines are emitted
+  as `mount-change<TAB>ACTION`. Any other standard-output line, a line over 256
+  bytes, a missed readiness deadline, or an unexpected supervisor or child exit
+  marks storage `partial` with explicit-refresh guidance.
+
+  Fedora util-linux opens its initial parsing descriptor with `O_CLOEXEC` and
+  its persistent `poll_table` descriptor without that flag. The readiness probe
+  checks the exact descriptor's bounded `fdinfo` flags and rejects the initial
+  parsing open, which otherwise precedes the actual subscription. Unrecognized
+  descriptor behavior cannot certify readiness. A real Fedora findmnt regression
+  delays the initial parsing open and verifies that no acknowledgment escapes
+  before the persistent descriptor exists.
+
+  The fixed CLI helper and pane subscription are implemented. The helper uses a pidfd
+  and signal-wakeup pipe alongside child output, so no idle timer remains after
+  readiness. The helper requires write-only pipe output, as supplied by
+  Quickshell. Its read-interest watch catches consumer loss even with no mount
+  events, without a writable idle spin. Other output types are rejected before
+  starting a child: sockets can half-close without an event, and read/write
+  FIFOs retain their own reader. For command-line inspection, use
+  `dwm-system-management watch-mounts | cat`. Shared operation writers retain
+  their separate output-type support. Lost output or failed cleanup exits unsuccessfully. The bounded
+  readiness probe retains early child output until the baseline is acknowledged.
+  The root model now owns this subscription alongside firewalld notifications.
+  Captured monitor generations and read-cycle tokens reject retired callbacks,
+  including callbacks queued across closure and reopening. The helper itself
+  does not read a journal.
+
+  The root model starts the initial bounded JSON filesystem snapshot only after
+  receiving `mount-monitor-ready`. The first snapshot is authoritative for the
+  mount-table state that exists when it reads; the contract does not promise an
+  event for a transient change completed before findmnt opens its baseline. A
+  change observed by the already-live monitor produces `mount-change`; neither
+  findmnt nor this interface is a lossless mount-event history. Each emitted
+  `mount-change` line triggers one coalesced rerun of the normal bounded
+  snapshot; a line received before or while that read is active sets only one
+  dirty bit. The snapshot
+  completion handler atomically tests and clears that bit while reserving at
+  most one rerun before it publishes completion or an idle provider, matching
+  the PackageKit handoff above. An event on either side of the boundary
+  therefore attaches to the reserved rerun or starts the next snapshot. That
+  rerun is the settling read. A further mount event during its read or
+  completion handoff sets unresolved-dirty, publishes storage `partial` with
+  explicit-refresh guidance, and suppresses more automatic filesystem
+  snapshots until explicit refresh or section close/reopen starts a new bounded
+  cycle. Other provider events use `snapshot-without-storage` while the
+  storage cycle is blocked, preserving its retained rows. Continuous mount churn therefore cannot create an unbounded process
+  loop or be falsely published as clean.
+
+  Each monitor launch creates a separate Process and deadline owner. Its frozen
+  callback bundle captures both pane generation and a unique launch serial, so
+  queued parser, deadline, and exit callbacks cannot acquire a replacement
+  monitor's identity, including retries within the same pane generation.
+  Each open allocates a monotonically increasing monitor generation; ready,
+  line, exit, and queued-rerun callbacks verify both that the section is still
+  open and that their captured generation is current before changing state or
+  launching work. Section close invalidates the generation, removes the pending
+  rerun, closes every monitor pipe, sends `TERM` to the dedicated process group,
+  and uses nonblocking wait/waitpid checks for at most one second. If either
+  process remains, it sends `KILL` to the group and continues nonblocking checks
+  for at most one further second. A child still unreaped at that two-second
+  close deadline is handed to the root-scoped SIGCHLD-driven reaper, which
+  performs the eventual wait without blocking close or invoking the invalidated
+  pane callbacks. This is an event stream, not an idle timer. Other system
+  information and security probes run on open or explicit refresh and add no
+  idle timer.
+
+## Authorization and Recovery Rules
+
+- PackageKit, systemd, AccountsService, CUPS, and delegated tools keep their own
+  polkit or authentication policy. QML is never elevated.
+- An authorization denial is `permission-denied`, not `unavailable`, and keeps
+  the last validated read-only state visible.
+- Network, metadata, repository, dependency, package, and signature failures
+  remain distinct typed errors with the owning provider named.
+- A completed update reports restart guidance from PackageKit restart data. It
+  never initiates reboot; the existing confirmed session-action model owns that.
+- High-risk storage, firewall, service, encryption, account, and repository
+  operations remain delegated or unsupported until a separate specification
+  defines a narrow interface.
+
+## Validation and Rollback
+
+Real Fedora 44 PackageKit execution evidence and its explicit limitations are
+recorded in [P6-UPDATE-EVIDENCE.md](P6-UPDATE-EVIDENCE.md). This does not replace
+the combined installed-X11 Phase 6 acceptance check.
+
+Each implementation boundary must cover valid, malformed, missing-provider,
+authorization-denied, canceled, interrupted, overlapping, and failed states.
+PackageKit fixtures must exercise cancellation before and after `AllowCancel`
+changes, all terminal results, recovery after Settings closure, and reboot
+guidance. They terminate updates as `failed` from both `pending` and
+`authorizing` after the mutating method send cannot be excluded and, without an
+observed restart signal, prove the effective tuple is system `unknown`, session
+`none`, and application `no`. A pre-call `failed`/`conflict` fixture proves the
+all-clear tuple. Failed, post-running canceled, and interrupted fixtures seed
+security-session and application contributions and prove those lower-scope
+buckets remain intact when the system contribution becomes `unknown`. They
+also terminate failed, canceled, and interrupted updates from `pending` and
+`authorizing` after method execution becomes ambiguous, omit both global update
+signals, and prove provider-owned invalidation schedules the discovery rerun.
+They inject both `UpdatesChanged` and `InstalledChanged` at the
+discovery-completion boundary and prove exactly one coalesced rerun is scheduled.
+Self-scheduling fixtures emit all three global invalidations during both the
+initial and settling reads, prove the cycle stops after two reads in visible
+`partial` state, and prove further signals do not launch work. An invalidation
+at the settling completion handoff remains dirty; a later explicit refresh with
+a quiet settling read clears it and returns the provider to clean idle.
+Terminal fixtures omit
+`UpdatesChanged` after successful install, failed post-running install, and
+failed post-running refresh, and prove provider-owned invalidation refreshes
+discovery; a duplicate signal still coalesces to one rerun. Simulation fixtures
+prove completion schedules no rerun. Persistence-failure and provider-exit
+fixtures prove post-running operations still reserve that rerun without a
+terminal frame. Recovery fixtures
+match `succeeded=false` history while active is still `pending` and prove system
+restart guidance becomes `unknown` while seeded security-session and application
+contributions remain intact; refresh fixtures validate live and recovered
+monotonic terminal timestamps and reject malformed values. An adoption fixture
+crashes before an active contribution commit, omits replayed restart signals,
+and proves a possibly running `Finished` yields the conservative unknown tuple
+without clearing seeded lower-scope contributions, while a provably pre-running
+denial or cancellation remains all-clear. A
+previous-boot adoption and history fixture proves every result remains all-clear.
+Watch fixtures reject stale active IDs with status 3 and no stream. Exact
+regional and delegated IDs observe durable checkpoints through completion, or
+replay their retained terminal records, without reissuing an action. They prove
+that a requested PackageKit terminal record
+replays by its exact retained ID even when one or more newer terminal slots
+exist, while a missing ID, duplicate retained ID, malformed slot, or unrelated
+transaction path fails closed. A root-restart fixture terminates after `active`
+is cleared but before stream consumption, proves the next snapshot emits the
+durable terminal handoff, validates exact replay including a persisted failed
+error code, and acknowledges it only after operation completion. Crashes before
+and after acknowledgment prove at-least-once replay, no lost result, and no
+replacement mutation while handoff remains nonempty. Regional fixtures
+must prove fixed D-Bus destinations and methods. Logind fixtures cover both the manager
+lookup and session-property read under their shared aggregate deadline,
+including a malformed object path, wrong property type, and timeout after the
+first reply.
+Locale fixtures change the enumerated allowlist after confirmation and prove the
+second bounded enumeration rejects the stale requested name before `SetLocale`.
+They accept an array within its 8192-byte read bound whose canonical override
+detail exceeds 512 bytes and prove it becomes `partial` with mutation
+unavailable and no truncated or omitted confirmation value.
+Regional timeout fixtures stall each mutating D-Bus method before its reply and
+stall each post-success verification read. They prove the monotonic aggregate
+deadline terminalizes as `interrupted`, ignores late callbacks, releases the
+active slot, publishes only independently refreshed current state, and never
+retries the mutation.
+Malformed contribution fixtures prove active and terminal records fail closed
+without becoming `interrupted`.
+Update classification fixtures cover every accepted `GetUpdates` info mapping,
+including `BLOCKED` setting `unknown/blocked`, and prove that every other info
+value rejects the updates provider without leaving update or simulation rows.
+Regional initialization fixtures inject timedate1 and locale1 property changes
+after subscription attachment but during the initial reads and prove the one
+coalesced reconciliation publishes the changed values without overlapping
+reads. A second change during the settling read and at its completion handoff
+must stop the cycle after two reads, preserve unresolved-dirty, publish
+`partial` with explicit-refresh guidance, and clear only after a quiet explicit
+refresh or pane close/reopen.
+Recovery lookup fixtures stall recorded-object attachment, required property
+reads, and `GetTransactionList`; exceed both its 256-path and 64-KiB limits; and
+prove timeout detaches without canceling the target, preserves the nonterminal
+journal, and blocks replacement mutation unless a later bounded lookup proves
+exact absence, while malformed lists preserve the journal and block mutation.
+A pre-handoff conflict fixture proves a terminal stream with no durable handoff
+does not invoke acknowledgment. Hostname fixtures stall each property before
+and after the other property succeeds and prove the ten-second monotonic
+aggregate deadline discards late replies, degrades only unfinished states, and
+does not block other information records. CUPS fixtures stall each fixed
+unit-state reply, prove late replies are discarded, and verify the timeout
+degrades only `cups-service`; a socket timeout after the service is validated
+active must preserve `available`/`running`. Accounts initialization fixtures
+inject manager and candidate changes after subscription attachment but during
+initial reads,
+prove one serialized reconciliation observes them, and exercise the bounded
+unresolved-dirty fallback when the settling read also changes.
+Delegated-action tests must prove the executable allowlist and missing-tool
+behavior. QML tests must prove readable state survives denial and every
+section-owned process stops on close. Mount-monitor fixtures delay readiness and
+prove no filesystem snapshot starts, then change the persistent final mount
+state before the child's baseline opens and prove the first snapshot captures
+it. An event emitted by the monitor after baseline-open must set the dirty bit
+through a `mount-change` line. The fixtures make no event-observability
+assertion for a transient change that findmnt does not emit. They cover clean
+descriptor inheritance, the one-second readiness bound, child exit,
+proc-identity change, malformed monitor output, and complete process-group
+cleanup. Filesystem and encryption fixtures move wall time backward while
+`findmnt` and `lsblk` are stalled and prove both three-second deadlines remain
+monotonic. QML fixtures close
+and reopen the section with a new generation, invoke ready, mount-change, exit,
+and queued-rerun callbacks captured from the prior generation, and prove those
+callbacks schedule no work or state change while current-generation callbacks
+still work. A mount event at the initial filesystem snapshot completion boundary
+must reserve exactly one settling rerun. Events during that read and its handoff
+must end in visible `partial` state, launch no third read, and clear only after a
+quiet explicit refresh. Journal fixtures
+run two provider writers concurrently and prove the directory lock serializes
+validation and commit. Collision fixtures reject IDs present only in the
+restart last-applied field while that lock is held. They tear each inactive
+frame into a provably invalid image at every write boundary and prove the prior
+valid frame remains authoritative. Injected short-write, sync, and readback
+errors cover both outcomes: recovery selects and idempotently replays a valid
+higher-sequence frame, or selects the previous frame when the higher sequence is
+invalid. Golden byte fixtures
+cover both offsets, integer endianness, empty and maximum payloads, padding,
+digest coverage, invalid versions, and sequence exhaustion. Crash fixtures
+exercise every terminalization step, including simultaneous system plus
+security-session contributions, invoke `snapshot` and `watch-operation` from
+each intermediate state, and prove each scope is applied exactly once before
+terminal replay. Terminalized refresh, regional, and delegate fixtures prove
+the restart frame remains byte-for-byte unchanged.
+A terminalized-update fixture crashes after the active checkpoint, changes the
+boot UUID, and proves recovery completes without reapplying its contribution.
+Initialization fixtures tear and short-write every file before the cursor
+marker and prove bounded recovery completes it, while the same damage after the
+marker fails closed. Separate plain-text legacy active, restart, cursor, and
+terminal fixtures each prove `malformed`, mutation blocking, no conversion, and
+reboot-before-move-aside guidance. A long-running PackageKit fixture proves snapshots and a
+replacement watcher can acquire the lock and restore the active operation. A
+blocked adoption/history mock proves another reader can acquire the lock during
+the D-Bus wait, and a changed active identity causes the later commit to be
+discarded.
+History fixtures also stall `GetOldTransactions` before `Finished`, exercise
+cancel, grace, and detach, and prove recovery reaches the conservative
+`interrupted` result without retaining the active slot or consuming a late
+signal. Refresh-age fixtures stall `GetTimeSinceAction`, prove its independent
+monotonic deadline preserves the rest of the snapshot, and ignore a late reply.
+Snapshot-budget fixtures place every list type exactly at its byte and
+count limits and one byte or row beyond them, proving the defined owner-scoped
+discard behavior and an encoded stream no larger than 8 MiB.
+Directory-race fixtures rename the whole journal and each user-writable ancestor
+between identity checks and prove the root-anchored chain rejects it. They also
+replace each fixed path after its pre-write identity check but
+before the descriptor commit from a process that ignores the advisory lock.
+The provider must leave the replacement byte-for-byte unchanged, reject the
+post-write identity check, and never invoke the external mutating method. A
+separate fixture replaces a path after the last pre-call check, proves the
+post-call check marks the live operation persistence-faulted, then terminates
+the provider and proves a fresh snapshot blocks mutation without adopting an
+unidentified PackageKit transaction or reporting success.
+
+The complete phase runs the clean build, managed suite, Quickshell lint,
+ShellCheck, shfmt, staged and repeated installation, nested X11, installed-file
+parity, and a real Fedora 44 X11 exercise. Rollback for this inventory boundary
+removes the contract and package-map/Kickstart entries together; it does not
+automatically remove packages already installed by an image or recommended
+installer run. Runtime boundaries remove their new provider, model, and pane
+together without changing existing health or session-action contracts.
+
+## Authoritative Interface References
+
+- util-linux lsblk name, parent-name, and device-type implementation: <https://github.com/util-linux/util-linux/blob/v2.42.2/misc-utils/lsblk.c>
+- PackageKit D-Bus API: <https://packagekit.freedesktop.org/gtk-doc/api-reference.html>
+- PackageKit transaction API: <https://packagekit.freedesktop.org/gtk-doc/Transaction.html>
+- systemd timedate1 API: <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.timedate1.html>
+- systemd locale1 API: <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.locale1.html>
+- systemd manager implementation (GetUnit, ListUnitsByNames, Subscribe): <https://github.com/systemd/systemd/blob/v259/src/core/dbus-manager.c>
+- Gio private connection lifecycle: <https://docs.gtk.org/gio/method.DBusConnection.close.html>
+- AccountsService manager D-Bus XML: <https://gitlab.freedesktop.org/accountsservice/accountsservice/-/raw/main/data/org.freedesktop.Accounts.xml>
+- AccountsService user D-Bus XML: <https://gitlab.freedesktop.org/accountsservice/accountsservice/-/raw/main/data/org.freedesktop.Accounts.User.xml>
+- CUPS administration guidance: <https://openprinting.github.io/cups/doc/admin.html>
+
+
+### Information and recovery view qualification
+
+System Settings displays the thirteen system-information values, bounded mounted
+filesystem usage, and five security indicators supplied by minor 2. Byte
+counters retain their original decimal strings alongside approximate human
+units. The filesystem list uses a virtualized 240-pixel viewport; retained rows
+are explicitly labeled as last known and potentially stale after mount-monitor
+failure, with Reload status as the retry path. Missing probes remain Unknown.
+
+The fixed System Health button navigates to the existing read-only scan and
+closes Settings through the root owner. Health retains ownership of its named,
+separately confirmed repairs and diagnostic export. The view explains that
+exported paths or device names may identify the system. Reset guidance directs
+users to the relevant preference's scoped reset/revert or a backed-up recovery
+procedure; no factory reset, disk, firewall, encryption, or general service
+mutation is introduced.
+
+The isolated information-view fixture passes at 640x480, 780x580, and 1000x740:
+exact uint64 display, the 256-row virtualized inventory, unavailable security
+state with readable peers, explicit stale data, keyboard-focus reveal, one
+fixed health callback, and disabled navigation when its capability is absent.
+These are synthetic UI checks, not host security measurements or repairs.
+Visually inspected 780x580 captures show [information](evidence/p6-information-view.png),
+[storage](evidence/p6-storage-view.png), [security](evidence/p6-security-view.png),
+and [recovery guidance](evidence/p6-recovery-view.png).
+
+The combined implementation passed the complete managed repository gate with
+679 backend tests, all QML/nested-X11 workflows, build, shell/format, staged and
+repeated installation, preservation and release archive checks. The subsequent
+write-only pipe-output contract fix passed 60 affected backend/monitor checks.
+The later subscription/recovery fixes pass the full affected QML gate, including
+119 retired-callback assertions and 66/69/66 time/storage/security lifecycle
+assertions. Blocked storage and failed core recovery retain readable information.
+Source comparison confirmed every other tested source file was unchanged. Closed
+Settings used 0.200% CPU in the nested-X11 sample; the large-surface closed
+sample was 0.50%. Final installed-session qualification remains separate.
