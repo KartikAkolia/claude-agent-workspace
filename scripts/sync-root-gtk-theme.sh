@@ -15,7 +15,8 @@
 # theme that lives only under kartik's ~/.local/share/themes (as user-local
 # themes like Catppuccin do, rather than system-wide under /usr/share/themes)
 # needs the same treatment, since root's $HOME never reaches into
-# /home/kartik on its own -- so that directory is symlinked too.
+# /home/kartik on its own -- so that directory is symlinked too, as is the
+# legacy ~/.themes (where e.g. Nordic's README says to install).
 #
 # Because of that symlink, --set/--pick below never need sudo: they only
 # ever rewrite kartik's own files, and root reads the same paths already.
@@ -281,6 +282,7 @@ LINKS=(
 	"/root/.config/gtk-3.0/settings.ini:$KARTIK_HOME/.config/gtk-3.0/settings.ini"
 	"/root/.config/gtk-4.0/settings.ini:$KARTIK_HOME/.config/gtk-4.0/settings.ini"
 	"/root/.local/share/themes:$KARTIK_HOME/.local/share/themes"
+	"/root/.themes:$KARTIK_HOME/.themes"
 )
 
 drift=0
@@ -295,6 +297,19 @@ for pair in "${LINKS[@]}"; do
 	current="$(sudo readlink "$root_path" 2>/dev/null || true)"
 
 	if [ "$MODE" = "check" ]; then
+		# Same rule as --apply below: a source kartik doesn't have (e.g. no
+		# settings.ini on a Cinnamon host, which themes via XSETTINGS) can't
+		# be linked, so it isn't drift -- unless root already links to it, in
+		# which case that link is now dangling.
+		if [ ! -e "$real_path" ] && [ ! -L "$real_path" ]; then
+			if [ "$current" = "$real_path" ]; then
+				printf 'BROKEN  %s -> %s (target missing)\n' "$root_path" "$real_path"
+				drift=1
+			else
+				printf 'skip    %s (%s does not exist)\n' "$root_path" "$real_path"
+			fi
+			continue
+		fi
 		if [ "$current" = "$real_path" ]; then
 			printf 'ok      %s -> %s\n' "$root_path" "$real_path"
 		else
@@ -305,7 +320,15 @@ for pair in "${LINKS[@]}"; do
 	fi
 
 	if [ ! -e "$real_path" ] && [ ! -L "$real_path" ]; then
-		printf '%s: %s does not exist, skipping %s\n' "$PROG" "$real_path" "$root_path" >&2
+		# A root symlink to the now-missing source is this script's own
+		# dangling link (what --check reports as BROKEN): remove it so the
+		# two modes agree. Anything else at $root_path is left alone.
+		if [ "$current" = "$real_path" ] && sudo test -L "$root_path"; then
+			sudo rm -- "$root_path"
+			printf 'removed dangling %s (%s does not exist)\n' "$root_path" "$real_path"
+		else
+			printf '%s: %s does not exist, skipping %s\n' "$PROG" "$real_path" "$root_path" >&2
+		fi
 		continue
 	fi
 
@@ -335,5 +358,5 @@ fi
 echo "--- verify ---"
 for pair in "${LINKS[@]}"; do
 	root_path="${pair%%:*}"
-	sudo ls -la "$root_path"
+	sudo ls -la "$root_path" 2>/dev/null || printf 'not linked: %s\n' "$root_path"
 done

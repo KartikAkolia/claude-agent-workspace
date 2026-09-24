@@ -86,6 +86,11 @@ if [ -e /root/.local/share/themes ] && [ ! -L /root/.local/share/themes ]; then
   sudo mv /root/.local/share/themes "/root/.local/share/themes.bak-$(date +%s)"
 fi
 sudo ln -sfn /home/kartik/.local/share/themes /root/.local/share/themes
+
+if [ -e /root/.themes ] && [ ! -L /root/.themes ]; then
+  sudo mv /root/.themes "/root/.themes.bak-$(date +%s)"
+fi
+sudo ln -sfn /home/kartik/.themes /root/.themes
 ```
 
 No reboot or logout needed — GParted (or any other `pkexec`-elevated GTK app) picks it up on next
@@ -98,6 +103,17 @@ launch.
 - Confirmed by Kartik 2026-09-03: the symlink fix itself (after the static-copy fix from earlier
   the same day had drifted out of sync), and again after `sync-root-gtk-theme.sh` was written to
   wrap it — `--check` showed all four already `ok`, no drift.
+
+## `dell-optiplex` (Cinnamon) — 2026-09-24
+
+Nordic (from `EliverLara/Nordic` `master`) is installed user-locally in `~/.themes`, the legacy
+path Nordic's own README uses, which the script didn't link. It now also symlinks
+`/root/.themes` → `/home/kartik/.themes`. Cinnamon themes through XSETTINGS rather than
+`settings.ini`, which a `pkexec`-launched GParted still reads over X, so the two `settings.ini`
+sources don't exist on this host. `--check` reports those as `skip` rather than `DRIFT` (the same
+rule `--apply` already used). `sudo` has no TTY from a Claude Code shell, so the script was run
+whole as root in one call: `pkexec bash -c 'scripts/sync-root-gtk-theme.sh'` (absolute path).
+GParted confirmed themed by Kartik the same day.
 
 ## Re-checking or re-applying later
 
