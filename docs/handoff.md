@@ -546,6 +546,10 @@ NetworkManager was already managing `enp3s0`. Removed the ifupdown plugin from N
 
 **Next-login verification:** `echo "$QT_QPA_PLATFORMTHEME"` prints `qt6ct`, and opening "Qt6 Settings" (or any Qt app) shows Nord colors and Papirus icons.
 
+**Working tree committed; local and remote in sync.** The handoff itself went in as two commits (`710454b` for this entry, `773c3aa` for the earlier 2026-09-24 entries and items 27/28), then the eight files left modified from earlier sessions went in as four: `ea60c38` (Serena `.mcp.json` entry switched to `--project-from-cwd`, Pi doc to match, Serena's regenerated `project.yml`), `a2d88b6` (`headroom-ai` installed with the `proxy,code,mcp,reports` extras), `6d8e8c2` (the NetworkManager "Redone after reinstall" section), and `884c9eb` (`scripts/sync-root-gtk-theme.sh` + `docs/gparted-root-theme-fix.md`). The `/code-review` pass on the script caught a real mismatch: `--check` reported a root symlink to a since-deleted kartik source as `BROKEN`, but `--apply` only skipped that case, so `--check` could never pass again. `--apply` now removes that root symlink only when it is a symlink pointing exactly at the missing source; confirmed in a sandboxed copy (stub `sudo`, `/root` redirected), and a re-review found nothing further. `HEAD` = `origin/master` = `884c9eb`, clean working tree, all four CI workflows green.
+
+**Root GTK links checked live.** `pkexec /bin/bash /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --check` exits 0: `ok` for `/root/.gtkrc-2.0` and `/root/.themes`; `skip` for both `settings.ini` paths and `/root/.local/share/themes`, since those kartik sources don't exist on this Cinnamon host. No `--apply` needed.
+
 ## Files to read first
 
 - `AGENTS.md` — non-negotiables (never write into the 5 reference clones, verify before claiming done, ask before decisions only Kartik can make), repo map, sources of truth.
