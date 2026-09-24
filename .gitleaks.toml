@@ -1,0 +1,16 @@
+# gitleaks config for .github/workflows/gitleaks.yml. Keeps every default rule
+# and only skips files verified to hold no secrets.
+#
+# Uses the legacy [allowlist] table rather than [[allowlists]]: the CI action
+# runs gitleaks 8.24.3, and [[allowlists]] only exists from 8.25.0.
+
+title = "claude-agent-workspace gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Upstream dwm-titus evidence manifests: path -> SHA-256 file hashes only"
+paths = [
+  '''^dwm-titus-main/docs/evidence/p7/(completion/source-ui6|final-source|source)-manifest\.json$''',
+]
