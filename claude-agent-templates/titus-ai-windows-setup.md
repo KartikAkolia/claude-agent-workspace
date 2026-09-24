@@ -2,13 +2,13 @@
 
 ## What this repo actually is
 
-titus-ai is a portable configuration and reusable-skill library for OpenAI's Codex CLI, not a Claude Code repo. CLAUDE.md is only a two-line router pointing at AGENTS.md plus some RTK usage notes, it's not a parallel Claude setup. Mechanically it's dotfiles-style: an installer that symlinks files into `~/.codex` and `~/.agents/skills`. In substance it's a skill library: global Codex instructions, rules, local-model profiles, an opt-in plugin manifest, and thirteen named skills (including `ai-project-manager` and `pr-readiness`) meant to be linked into every repo you work in, not just this one. It deliberately keeps credentials, sessions, caches, and plugin state out of version control.
+titus-ai is a portable configuration and reusable-skill library for OpenAI's Codex CLI, not a Claude Code repo. CLAUDE.md is only a short router pointing at AGENTS.md, it's not a parallel Claude setup (it used to carry RTK usage notes; upstream dropped RTK in `46670004`, 2026-08-28). Mechanically it's dotfiles-style: an installer that symlinks files into `~/.codex` and `~/.agents/skills`. In substance it's a skill library: global Codex instructions, rules, local-model profiles, an opt-in plugin manifest, and fourteen named skills as of upstream `3b75271` (including `ai-project-manager` and `pr-readiness`) meant to be linked into every repo you work in, not just this one. It deliberately keeps credentials, sessions, caches, and plugin state out of version control.
 
 ## What README.md says to install
 
 The installer itself installs nothing. It only symlinks config and skill files already in the repo. Tools it references, but doesn't install:
 
-Codex CLI, assumed already present, required for the plugin flags and `codex review --uncommitted`. Codex plugins, optional, added via `codex plugin add`: `superpowers@openai-curated` is the only one preselected in `codex-plugins.txt`; the README also recommends but doesn't automate a GitHub plugin, a Codex Security plugin, and a Sentry plugin. MCP servers, manual and not installed by this repo: Context7, Playwright or Chrome DevTools. RTK, a Rust CLI, via `cargo install --git https://github.com/rtk-ai/rtk`, which needs Cargo already present. Optional local model tooling: Ollama (`ollama pull qwen3-coder`) and llama.cpp (`llama-server`).
+Codex CLI, assumed already present, required for the plugin flags and `codex review --uncommitted`. Codex plugins, optional, added via `codex plugin add`: `superpowers@openai-curated` is the only one preselected in `codex-plugins.txt`; the README also recommends but doesn't automate a GitHub plugin, a Codex Security plugin, and a Sentry plugin. MCP servers, manual and not installed by this repo: Context7, Playwright or Chrome DevTools. Optional local model tooling: Ollama (`ollama pull qwen3-coder`) and llama.cpp (`llama-server`).
 
 Claude Code itself is never mentioned as something this repo installs or configures.
 
@@ -43,7 +43,6 @@ Nothing in the repo uses winget. Every package ID below is inferred, not read fr
 3. `winget install --id Git.Git -e`, needed for the `~/github` worktree-discovery walk.
 4. Install Codex CLI itself. Not covered by this repo and not winget-confirmed here, check OpenAI's own install docs; it's commonly distributed via npm.
 5. From the repo root in `pwsh`: `.\scripts\install.ps1 -DryRun`, review the output, then `.\scripts\install.ps1` (add `-Plugins` once Codex is installed if you want `superpowers@openai-curated`).
-6. Optional RTK: `winget install --id Rustlang.Rustup -e`, then `cargo install --git https://github.com/rtk-ai/rtk`, and add `%USERPROFILE%\.cargo\bin` to PATH via `setx` or System Properties, there's no `export` on Windows.
-7. Optional local models: Ollama has a real native Windows installer, `winget install --id Ollama.Ollama -e` (inferred ID). llama.cpp has no reliable winget package, plan to grab prebuilt Windows binaries from its GitHub releases manually.
-8. Optional GitHub plugin support: `winget install --id GitHub.cli -e` for `gh`.
-9. No step here has zero Windows equivalent. The installer is already native. The only real failure mode is an org policy blocking both Developer Mode and elevation, in which case symlinking won't work until that's resolved.
+6. Optional local models: Ollama has a real native Windows installer, `winget install --id Ollama.Ollama -e` (inferred ID). llama.cpp has no reliable winget package, plan to grab prebuilt Windows binaries from its GitHub releases manually.
+7. Optional GitHub plugin support: `winget install --id GitHub.cli -e` for `gh`.
+8. No step here has zero Windows equivalent. The installer is already native. The only real failure mode is an org policy blocking both Developer Mode and elevation, in which case symlinking won't work until that's resolved.
