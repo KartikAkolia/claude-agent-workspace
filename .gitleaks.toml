@@ -10,7 +10,17 @@ title = "claude-agent-workspace gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Upstream dwm-titus evidence manifests: path -> SHA-256 file hashes only"
+description = "Verified non-secrets in the read-only reference-clone mirrors"
+# Paths: upstream dwm-titus evidence manifests, path -> SHA-256 file hashes only.
 paths = [
   '''^dwm-titus-main/docs/evidence/p7/(completion/source-ui6|final-source|source)-manifest\.json$''',
+]
+# Regexes match the exact extracted secret, so the rest of each file is still
+# scanned: a dwm-titus cursor-theme assignment, and website-master's reCAPTCHA
+# site key and Cloudflare Web Analytics beacon token (both public by design,
+# served to every visitor).
+regexes = [
+  '''^cursor=Capitaine-Cursors$''',
+  '''^6Lcej6IpAAAAAEqICzfK-10FyzNaeameNiQffcov$''',
+  '''^48e9040046c743328a1abd6b87ec22fd$''',
 ]
