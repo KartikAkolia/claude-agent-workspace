@@ -57,7 +57,7 @@ Serena is wired **project-scoped**, not user-scoped, via a tracked
         "--from", "git+https://github.com/oraios/serena",
         "serena", "start-mcp-server",
         "--context", "ide-assistant",
-        "--project", "/home/pi/claude-agent-workspace",
+        "--project-from-cwd",
         "--open-web-dashboard", "false"
       ]
     }

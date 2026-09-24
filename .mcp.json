@@ -9,8 +9,7 @@
         "start-mcp-server",
         "--context",
         "ide-assistant",
-        "--project",
-        "/home/pi/claude-agent-workspace",
+        "--project-from-cwd",
         "--open-web-dashboard",
         "false"
       ]
