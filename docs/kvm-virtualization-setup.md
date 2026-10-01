@@ -10,6 +10,10 @@ Bridging was redone the same day, adapted to the new install, which uses DHCP ra
 
 On 2026-09-25 the `win11` VM's physical SATA SSD disk definition was tuned (SSD rotation rate, real sector sizes, passed-through serial), and virtio mouse and keyboard devices were added by hand rather than through `vm-set-virtio-input.sh`. The exact XML, the `discard_granularity` failure to avoid, and how to verify from Windows are in [win11-vm-tuning.md](win11-vm-tuning.md).
 
+## Fedora 44 state (2026-10-01)
+
+The host now runs Fedora 44, so the Debian-specific detail above is historical. `br0` is a DHCP bridge whose only port is `enp4s0` (profile `Wired connection 1`). There's no separate rollback profile, and DNS comes from DHCP (Virgin). On 2026-10-01 it was set to `bridge.stp no`, `bridge.mac-address a4:1f:72:4d:d9:4e` and `ipv6.method disabled`, and it still gets `192.168.0.222`. `br0net` was redefined the same day under `qemu:///system` from the XML below and is active and autostarted alongside `default`. The `win11` domain doesn't use it: its NIC is `type='bridge'` with `source bridge='br0'`, which attaches straight to the bridge and works with or without `br0net`. Details and rollback are in `docs/handoff.md`'s 2026-10-01 entry.
+
 ## What was installed
 
 Confirmed via `dpkg -l` on the host: `qemu-system-x86` (11.0.3+ds-2) and the rest of the `qemu-system-*`/`qemu-utils`/`qemu-block-extra` set, `libvirt-daemon-system` (12.6.0-1, pulls in the full driver/storage/network/nwfilter/lock driver set), `virt-manager` (5.1.0-2), `ovmf`/`ovmf-generic`/`ovmf-amdsev`/`ovmf-inteltdx` (2026.05-2), and `ethtool` (7.1-1, needed for the later bridge networking step).
