@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Validates that JSON/YAML files parse cleanly -- nothing else catches a typo
-# in .claude/settings.json or .serena/project.yml before it silently breaks
+# in .claude/settings.json or a workflow file before it silently breaks
 # hook/tool wiring at runtime. Takes file paths as arguments, like
 # check-markdown-links.py, so both the pre-commit hook (staged files) and
 # lint-markdown.sh/CI (all tracked files) can share this one script.
