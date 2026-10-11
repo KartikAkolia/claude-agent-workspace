@@ -11,7 +11,7 @@ brew "bash"
 brew "shellcheck"
 brew "shfmt"
 
-# lint-python.sh runs ruff through `uvx`; the serena MCP server needs it too.
+# lint-python.sh runs ruff through `uvx`.
 brew "uv"
 
 # mdl (lint-markdown.sh) has no Homebrew formula and current releases don't

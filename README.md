@@ -6,14 +6,13 @@ Kartik's personal Claude Code / Cowork workspace: shared `AGENTS.md`/`SPEC.md`/`
 
 ```sh
 curl -fsSL https://claude.ai/install.sh | bash        # Claude Code CLI
-curl -LsSf https://astral.sh/uv/install.sh | sh        # uv, needed by the two local MCP servers
-uv tool install --python 3.13 "headroom-ai[proxy,code,mcp,reports]"  # headroom (plain install lacks MCP/proxy)
+curl -LsSf https://astral.sh/uv/install.sh | sh        # uv, for uvx (lint-python.sh runs ruff through it)
 sudo apt install shellcheck shfmt devscripts bind9-dnsutils rsync \
   quickshell qt6-declarative-dev-tools cmake ninja-build hugo podman
 gem install --user-install mdl                          # markdown linting (lint-markdown.sh, pre-commit hook)
 ```
 
-That covers the CLI itself, both local MCP servers (`headroom`, `serena` — the latter needs nothing beyond `uv`), the apt packages this repo's custom skills (`bash-scripting`, `linux-sysadmin`/`homelab-admin`, `quickshell`, `hugo`) expect to find on `PATH`, and `mdl` for this repo's own markdown tooling (see below). `gh` isn't in that one-liner — it comes from GitHub's own apt repo, not Debian's default archive; see the full breakdown for the exact steps.
+That covers the CLI itself, `uv`, the apt packages this repo's custom skills (`bash-scripting`, `linux-sysadmin`/`homelab-admin`, `quickshell`, `hugo`) expect to find on `PATH`, and `mdl` for this repo's own markdown tooling (see below). `gh` isn't in that one-liner — it comes from GitHub's own apt repo, not Debian's default archive; see the full breakdown for the exact steps.
 
 On macOS, the lint toolchain alone comes from the `Brewfile` instead:
 
