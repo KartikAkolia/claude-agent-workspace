@@ -54,8 +54,7 @@ Full breakdown — exact versions, which packages come from third-party apt repo
 - `SPEC.md` — what this project is, architecture, acceptance criteria.
 - `ROADMAP.md` / `TASKS.md` — phased plan and active-phase detail.
 - `docs/handoff.md` — continuity notes across sessions.
-- `docs/headroom-setup-plan.md` — the Windows 11 host's equivalent setup (different machine, `winget`-based).
 - `docs/debian-host-claude-setup.md` — the `dell-optiplex` Debian desktop's equivalent setup (`apt`-based, x86-64, user `kartik`).
-- `docs/raspberry-pi-host-setup.md` — the Raspberry Pi 5 host's equivalent setup (Debian `aarch64`, user `pi`; slim Headroom install + persistent `systemd --user` service).
+- `docs/raspberry-pi-host-setup.md` — the Raspberry Pi 5 host's equivalent setup (Debian `aarch64`, user `pi`).
 - `fjord/AGENTS.md` / `fjord/SPEC.md` — the Astro doc-reader subproject: what it renders, its own read-only non-negotiables, deployment on hold pending Kartik's review.
 - `job-search/README.md` — Kartik's personal IT job-search working notes (target roles, gap analysis, CV state, action plan); the reusable domain research backing it lives in `.claude/skills/it-job-search/references/`.

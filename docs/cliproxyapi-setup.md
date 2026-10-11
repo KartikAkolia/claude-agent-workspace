@@ -2,7 +2,7 @@
 
 ## Overview
 
-[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) is a Go proxy exposing OpenAI/Gemini/Claude/Codex/Grok-compatible API endpoints, backed by OAuth-linked CLI subscription accounts instead of pay-per-token API keys. Set up on the homelab host `dell-optiplex` (`192.168.0.222`) to give Claude Code (via Headroom) a stable upstream and, longer-term, a place to consolidate other provider accounts.
+[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) is a Go proxy exposing OpenAI/Gemini/Claude/Codex/Grok-compatible API endpoints, backed by OAuth-linked CLI subscription accounts instead of pay-per-token API keys. Set up on the homelab host `dell-optiplex` (`192.168.0.222`) to give Claude Code a stable upstream and, longer-term, a place to consolidate other provider accounts.
 
 - Host: `dell-optiplex`, rootless Podman.
 - Image: `docker.io/eceasy/cli-proxy-api:latest`.
@@ -128,24 +128,11 @@ Port map (all loopback-only):
 | 8317 | Main API (OpenAI/Gemini/Claude/Codex-compatible endpoints) |
 | 8085, 1455, 54545, 51121, 11451 | OAuth callback listeners for the various provider login flows |
 
-## Chaining Headroom through it
-
-Headroom (the local context-optimization proxy Claude Code talks to) was reconfigured to send its own upstream Anthropic calls through CLIProxyAPI instead of directly to `api.anthropic.com`, so Claude Code gets CLIProxyAPI's OAuth-account-backed reliability underneath Headroom's compression. Full detail, including a scope bug hit along the way, is in the handoff log — see `docs/handoff.md`'s 2026-08-27 "CLIProxyAPI set up... Headroom chained through it" section for the blow-by-blow. Summary:
-
-- New persistent deployment: `headroom-default.service` (systemd `--user`, port 8787), independent of any interactive session.
-- Its upstream is overridden via `ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8317` and `ANTHROPIC_TARGET_API_HEADERS={"x-api-key":"<CLIProxyAPI's key>"}`.
-- Claude Code's `~/.claude/settings.json` points at Headroom (`ANTHROPIC_BASE_URL=http://127.0.0.1:8787`), which now points at CLIProxyAPI, which round-robins across whatever OAuth accounts are linked.
-- Side effect: Claude Code's Remote Control (`/rc`) is disabled whenever `ANTHROPIC_BASE_URL` is overridden like this — `headroom doctor` surfaces this as a warning, expected and not a bug.
-
 ## Verifying it's healthy
 
 ```bash
-systemctl --user status cli-proxy-api.service headroom-default.service --no-pager
-curl -s http://127.0.0.1:8787/readyz   # Headroom's own health check, includes an "upstream" probe of CLIProxyAPI
-~/.local/bin/headroom doctor --port 8787
+systemctl --user status cli-proxy-api.service --no-pager
 ```
-
-`headroom doctor` should report `claude ✓ pass`, `shell env ✓ pass`, and `deployments ✓ pass`.
 
 ## Known gaps / open items
 

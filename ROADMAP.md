@@ -165,5 +165,3 @@ Six build/deploy approaches were presented to Kartik (new directory vs. repurpos
 ### Not proposed, and why
 
 - **Splitting `dashboard.html` into modules**: it's a single 3,003-line file, which would normally flag as a structural smell, but `SPEC.md`'s own non-goals rule out build tooling for this project — splitting it would fight a deliberate design choice, not fix a real problem. Not recommended.
-- **Headroom Phase 7/9** (cross-agent memory, Docker): both explicitly deferred in `docs/headroom-setup-plan.md` until Codex/Gemini are in daily use or a multi-instance need arises. No change.
-- **Reloading VS Code to pick up Headroom's Phase 5 wrap** (`docs/headroom-setup-plan.md`): declined (2026-08-21, Kartik's call). No longer tracked as an open loose end.
