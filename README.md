@@ -53,7 +53,7 @@ Full breakdown — exact versions, which packages come from third-party apt repo
 - `AGENTS.md` — non-negotiables, repository map, working conventions.
 - `SPEC.md` — what this project is, architecture, acceptance criteria.
 - `ROADMAP.md` / `TASKS.md` — phased plan and active-phase detail.
-- `docs/handoff.md` — continuity notes across sessions.
+- `docs/handoff.md` — continuity notes across sessions; older entries and closed items are in `docs/archival.md`.
 - `docs/debian-host-claude-setup.md` — the `dell-optiplex` Debian desktop's equivalent setup (`apt`-based, x86-64, user `kartik`).
 - `docs/raspberry-pi-host-setup.md` — the Raspberry Pi 5 host's equivalent setup (Debian `aarch64`, user `pi`).
 - `fjord/AGENTS.md` / `fjord/SPEC.md` — the Astro doc-reader subproject: what it renders, its own read-only non-negotiables, deployment on hold pending Kartik's review.

@@ -95,7 +95,7 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githu
 sudo apt update && sudo apt install gh
 ```
 
-`gh` also needs `gh auth login` (or the `GH_TOKEN`-based workaround this host actually uses — see the memory note on git push auth and `docs/handoff.md`'s PAM/keyring section) before `pr-readiness` or any `gh`-backed workflow can authenticate.
+`gh` also needs `gh auth login` (or the `GH_TOKEN`-based workaround this host actually uses — see the memory note on git push auth and `docs/archival.md`'s PAM/keyring section) before `pr-readiness` or any `gh`-backed workflow can authenticate.
 
 ## 8. Repo-root scripts — not tied to any single skill
 

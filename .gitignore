@@ -1,4 +1,6 @@
 __pycache__/
+.ruff_cache/
+.DS_Store
 website-master/.claude/
 .claude/settings.local.json
 pi-homelab/

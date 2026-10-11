@@ -2,7 +2,7 @@
 
 This documents the Claude Code CLI environment on the Raspberry Pi 5 host
 (`raspberrypi`, `192.168.0.166`, Debian `forky/sid`, `aarch64`, user `pi`) —
-the same box that runs AdGuardHome (see `docs/handoff.md`'s 2026-08-27 entry).
+the same box that runs AdGuardHome (see `docs/archival.md`'s 2026-08-27 AdGuardHome Pi entry).
 It sits alongside `docs/debian-host-claude-setup.md`, the `dell-optiplex`
 Debian desktop (`apt` / x86-64, user `kartik`).
 
