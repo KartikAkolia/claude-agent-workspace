@@ -6,6 +6,15 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Only the most recent session entry is kept below. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
 
+### This session's work (2026-10-16, on macOS): five Claude Code plugins/tools set up; Headroom un-retired
+
+Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugin and Headroom across all OSes. Full per-OS record in `docs/claude-plugins-setup.md` (linked from `README.md`).
+
+1. **Runtimes installed on this Mac (verified by each tool's own output):** `node` 26.12.0 via Homebrew (also added to `Brewfile`); `mempalace` via `uv tool` (`mempalace`, `mempalace-mcp` on `PATH`); `headroom` 0.41.0 via `uv tool install --python 3.12` (system Python 3.9 has no wheel); `omniroute` 3.8.51 via `npm install -g`. npm 11 skipped the dependencies' postinstall scripts, but a test start served the dashboard on `:20128`.
+2. **Plugin enablement not written.** The auto-mode classifier denied editing `.claude/settings.json` and running `claude plugin` commands (self-modification). Kartik runs the six `claude plugin … --scope project` commands from the doc himself.
+3. **Headroom reverses the 2026-10-11 retirement** at Kartik's request. Installed only; not wrapped on any host, because a configured-but-stopped proxy breaks every Claude request.
+4. **Other hosts untouched.** The Debian/Pi/Windows sections of the doc are written from upstream docs, not run.
+
 ### This session's work (2026-10-11, cont'd, on macOS): `.gitignore` additions; this file split into `docs/archival.md`
 
 1. **`.gitignore`** — added `.ruff_cache/` (previously ignored only by ruff's own self-written `.gitignore` inside the directory) and `.DS_Store` (this Mac has no global `core.excludesfile`). The `titus-ai-main/.serena/project.yml` rule was left in place: it is dead on this Mac now that Serena is removed, but whether Serena is gone from `dell-optiplex` and the Pi is unverified (see the 2026-10-11 "Serena and Headroom retired" entry in `docs/archival.md`).
@@ -38,7 +47,7 @@ All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 32.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 33.
 
 - **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
@@ -50,6 +59,7 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
 - **22.** **`asus-vivobook`: confirm the LightDM greeter shows Nordic/Papirus/Capitaine-Cursors/MesloLGS after the next logout or reboot.** (2026-08-29) `/etc/lightdm/lightdm.conf` and `lightdm-gtk-greeter.conf` were both updated, but deliberately not applied live since a `lightdm` restart would have killed the active desktop session — and a Claude Code session running on the same host structurally can't trigger that reboot/restart itself or observe a login screen, so this step needs Kartik at the console regardless. A pre-reboot static re-check caught and fixed one real gap first (Nordic theme was only ever installed per-user, not system-wide, so the greeter couldn't have seen it) — see `docs/lightdm-nordic-theme-setup.md`'s "Follow-up (2026-08-29)" section for the fix and the full verification (LightDM's own `--show-config`, asset existence, `lightdm`-user readability, exact font-family match).
 - **25.** **MCP connectors on the AdGuardHome Pi are unauthorized.** (2026-09-02) `plugin:engineering:*` / `plugin:cloudflare:*` / `plugin:productivity:*` all need interactive OAuth (`/mcp` in a real `claude`, or claude.ai → Connectors); `asana`/`github`/`pagerduty` also hit an upstream dynamic-client-registration incompatibility. None can be done from a non-interactive session. Optional alongside: set a Headroom proxy spend budget (`headroom proxy --budget N` / `HEADROOM_BUDGET`), which `headroom doctor` currently warns is unset.
 - **26.** **`docs/laptop-vfio-passthrough.md` Debian-vs-Arch discrepancy.** (2026-09-17) The reboot half of item 26 (`asus-vivobook` NVIDIA driver switch) is closed and archived; the discrepancy the same session flagged in that doc was not resolved — see that file's own flag note.
+- **32.** **Finish the 2026-10-16 plugin setup.** (2026-10-16) Run the six `claude plugin` commands in `docs/claude-plugins-setup.md` (blocked for Claude by auto mode), then `/mempalace:init`; create an OmniRoute API key (its MCP endpoint returns 401 without one) and start it loopback-only; decide whether to actually `headroom wrap` on any host; repeat the runtime installs on `dell-optiplex`, the Pi and Windows.
 
 ## Notes
 

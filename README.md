@@ -56,5 +56,7 @@ Full breakdown — exact versions, which packages come from third-party apt repo
 - `docs/handoff.md` — continuity notes across sessions; older entries and closed items are in `docs/archival.md`.
 - `docs/debian-host-claude-setup.md` — the `dell-optiplex` Debian desktop's equivalent setup (`apt`-based, x86-64, user `kartik`).
 - `docs/raspberry-pi-host-setup.md` — the Raspberry Pi 5 host's equivalent setup (Debian `aarch64`, user `pi`).
+- `docs/claude-plugins-setup.md` — the project-scoped Claude Code plugins (frontend-design, Playwright, MemPalace, OmniRoute) and opt-in Headroom proxy, with per-OS runtime installs.
+- `docs/README-plugin-setup.md` — what the 2026-10-16 plugin setup actually did on the Mac and what's still left to run.
 - `fjord/AGENTS.md` / `fjord/SPEC.md` — the Astro doc-reader subproject: what it renders, its own read-only non-negotiables, deployment on hold pending Kartik's review.
 - `job-search/README.md` — Kartik's personal IT job-search working notes (target roles, gap analysis, CV state, action plan); the reusable domain research backing it lives in `.claude/skills/it-job-search/references/`.

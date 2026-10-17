@@ -21,3 +21,7 @@ brew "uv"
 # to, $(brew --prefix)/lib/ruby/gems/<version>/bin, isn't on PATH). Rerun it
 # after a ruby minor-version bump, which moves the gem dir.
 brew "ruby"
+
+# Not lint: Node 20+ for the Playwright MCP plugin's `npx` and the OmniRoute
+# gateway (docs/claude-plugins-setup.md).
+brew "node"
