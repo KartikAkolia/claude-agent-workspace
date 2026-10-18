@@ -22,7 +22,7 @@ pkexec sh -c "install -o root -g root -m 0755 '$d/wordcraft-update' /usr/local/b
   systemctl daemon-reload"
 ```
 
-`wordcraft-update` is a bash script, so `.githooks/pre-commit` and CI lint it with `lint-bash.sh`. The PKGBUILD has no shebang, so the repo's tooling doesn't pick it up; lint it by hand with `shellcheck -s bash -e SC2034,SC2154 PKGBUILD` and `shfmt -ln bash -d PKGBUILD`. Check the units with `systemd-analyze verify`.
+`wordcraft-update` is a bash script, so `.githooks/pre-commit` lints it with `lint-bash.sh` when it's staged. CI's `lint-bash.yml` only triggers on `**.sh` paths and a few named files, so a change to this extensionless script alone doesn't run it in CI; it's covered there only when the workflow runs for another reason. The PKGBUILD has no shebang, so the repo's tooling doesn't pick it up; lint it by hand with `shellcheck -s bash -e SC2034,SC2154 PKGBUILD` and `shfmt -ln bash -d PKGBUILD`. Check the units with `systemd-analyze verify`.
 
 ## Day-to-day commands
 
