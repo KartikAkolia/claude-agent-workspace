@@ -31,6 +31,8 @@ Network (2026-10-18): Wi-Fi `wlp2s0` (Intel AX210, `iwlwifi`) is on NetworkManag
 
 Desktop portals, checked 2026-10-18 from a Konsole window inside Plasma: `xdg-desktop-portal` 1.22.1, `xdg-desktop-portal-kde` 6.8.0 and `xdg-desktop-portal-gtk` 1.15.3 are installed. The registered back-ends are `gtk`, `kde`, `kwallet` and `plasmanotify`, and `kde-portals.conf` is present. The `xdg-desktop-portal` and `plasma-xdg-desktop-portal-kde` user services are `active`, and the FileChooser portal answers with version `u 4`.
 
+GParted (2026-10-18): installed with `sudo pacman -S --needed gparted btrfs-progs dosfstools exfatprogs f2fs-tools gpart jfsutils mtools nilfs-utils ntfsprogs udftools xfsprogs polkit polkit-kde-agent xorg-xhost`. That's GParted's own `pacman -Si` optional-deps list, minus `bcachefs-tools`, plus Plasma's polkit agent. `pacman -Q` confirms `gparted` 1.8.1-2.2, `xorg-xhost` 1.0.10-1.2, `polkit-kde-agent` 6.8.0-1.1 and `ntfsprogs` 2026.9.28-1.1. Not yet checked: the rest of the filesystem tools individually, and GParted's View → File System Support grid. The older `docs/gparted-root-theme-fix.md` describes the pre-reinstall setup on this laptop.
+
 topgrade (2026-10-18): installed. `~/.config/topgrade.toml` was created fresh with only `[misc]` and `disable = ["firmware"]`. The `firmware` step is topgrade's `fwupd` step, and the step name comes from topgrade's docs. `topgrade --dry-run` shows no firmware or fwupd step.
 
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
