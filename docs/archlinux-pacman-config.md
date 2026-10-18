@@ -27,6 +27,8 @@ Brave (`brave-origin-bin` 1.97.59, Chromium 155) showed YouTube with sound but n
 
 Working fix, verified 2026-10-18 by Kartik (playback works, `brave://gpu` shows Video Decode hardware accelerated): `~/.config/brave-origin-flags.conf`, which is the file `/usr/bin/brave-origin` reads, containing `--ozone-platform=x11`, `--use-angle=vulkan` and `--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan`, one per line. The trade-off is that Brave runs under XWayland. A Wayland-native alternative, `--disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL`, hasn't been tested.
 
+Network (2026-10-18): Wi-Fi `wlp2s0` (Intel AX210, `iwlwifi`) is on NetworkManager profile `VM2411078` at `192.168.0.13/24`, gateway `192.168.0.1`. That profile was changed with `nmcli connection modify "VM2411078" ipv4.dns "1.1.1.1 1.0.0.1" ipv4.ignore-auto-dns yes ipv6.method disabled` and applied with `nmcli device reapply wlp2s0`. Verified: `IP4.DNS` shows only `1.1.1.1` and `1.0.0.1` (previously Virgin Media's `194.168.4.100` and `194.168.8.100`), `/etc/resolv.conf` matches, and there's no IPv6 address. This applies to that profile only, not to other networks or system-wide. It also bypasses the AdGuardHome Pi at `192.168.0.166`.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
