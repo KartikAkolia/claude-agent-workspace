@@ -29,6 +29,8 @@ Working fix, verified 2026-10-18 by Kartik (playback works, `brave://gpu` shows 
 
 Network (2026-10-18): Wi-Fi `wlp2s0` (Intel AX210, `iwlwifi`) is on NetworkManager profile `VM2411078` at `192.168.0.13/24`, gateway `192.168.0.1`. That profile was changed with `nmcli connection modify "VM2411078" ipv4.dns "1.1.1.1 1.0.0.1" ipv4.ignore-auto-dns yes ipv6.method disabled` and applied with `nmcli device reapply wlp2s0`. Verified: `IP4.DNS` shows only `1.1.1.1` and `1.0.0.1` (previously Virgin Media's `194.168.4.100` and `194.168.8.100`), `/etc/resolv.conf` matches, and there's no IPv6 address. This applies to that profile only, not to other networks or system-wide. It also bypasses the AdGuardHome Pi at `192.168.0.166`.
 
+Desktop portals, checked 2026-10-18 from a Konsole window inside Plasma: `xdg-desktop-portal` 1.22.1, `xdg-desktop-portal-kde` 6.8.0 and `xdg-desktop-portal-gtk` 1.15.3 are installed. The registered back-ends are `gtk`, `kde`, `kwallet` and `plasmanotify`, and `kde-portals.conf` is present. The `xdg-desktop-portal` and `plasma-xdg-desktop-portal-kde` user services are `active`, and the FileChooser portal answers with version `u 4`.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
