@@ -190,6 +190,24 @@ run_v4l2_set() {
 	return "$status"
 }
 
+# Validates $2 against the int control parse_ctrl last loaded ($1 is only
+# for the message), showing why it's rejected. Checks step as well as
+# range: drivers may round or reject an off-step value (the C920's
+# focus_absolute only takes multiples of 5).
+check_int_value() {
+	local name="$1" val="$2" step="${CTRL_STEP:-1}" err=""
+	if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
+		err="Not a number: $val"
+	elif [ "$val" -lt "$CTRL_MIN" ] || [ "$val" -gt "$CTRL_MAX" ]; then
+		err="$val is outside $name's range ($CTRL_MIN-$CTRL_MAX)."
+	elif [ "$step" -gt 1 ] && [ $(((val - CTRL_MIN) % step)) -ne 0 ]; then
+		err="$val isn't a valid $name value: it must be $CTRL_MIN plus a multiple of $step."
+	fi
+	[ -z "$err" ] && return 0
+	wt --msgbox "$err" 8 60
+	return 1
+}
+
 # One control, editor appropriate to its type. Returns 1 on cancel/no-op.
 edit_ctrl() {
 	local dev="$1" name="$2"
@@ -229,14 +247,7 @@ edit_ctrl() {
 	int | int64)
 		local val
 		val=$(wt --inputbox "$name (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, default=$CTRL_DEFAULT).$hint" 10 70 "$CTRL_VALUE" 3>&1 1>&2 2>&3) || return 1
-		[[ "$val" =~ ^-?[0-9]+$ ]] || {
-			wt --msgbox "Not a number: $val" 6 40
-			return 1
-		}
-		if [ "$val" -lt "$CTRL_MIN" ] || [ "$val" -gt "$CTRL_MAX" ]; then
-			wt --msgbox "$val is outside $name's range ($CTRL_MIN-$CTRL_MAX)." 8 50
-			return 1
-		fi
+		check_int_value "$name" "$val" || return 1
 		run_v4l2_set "$dev" "$name" "$val"
 		;;
 	bitmask | string | rect | *)
@@ -380,15 +391,15 @@ action_apply_manual_preset() {
 	if [ -n "$exp_abs" ]; then
 		parse_ctrl "$dev" "$exp_abs"
 		local val
-		val=$(wt --inputbox "Fixed exposure value (min=$CTRL_MIN max=$CTRL_MAX):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[[ "${val:-}" =~ ^[0-9]+$ ]] && run_v4l2_set "$dev" "$exp_abs" "$val"
+		val=$(wt --inputbox "Fixed exposure value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
+		[ -n "${val:-}" ] && check_int_value "$exp_abs" "$val" && run_v4l2_set "$dev" "$exp_abs" "$val"
 	fi
 	[ -n "$foc_auto" ] && run_v4l2_set "$dev" "$foc_auto" 0
 	if [ -n "$foc_abs" ]; then
 		parse_ctrl "$dev" "$foc_abs"
 		local val
-		val=$(wt --inputbox "Fixed focus value (min=$CTRL_MIN max=$CTRL_MAX, 0=infinity):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[[ "${val:-}" =~ ^[0-9]+$ ]] && run_v4l2_set "$dev" "$foc_abs" "$val"
+		val=$(wt --inputbox "Fixed focus value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, 0=infinity):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
+		[ -n "${val:-}" ] && check_int_value "$foc_abs" "$val" && run_v4l2_set "$dev" "$foc_abs" "$val"
 	fi
 	wt --msgbox "Manual preset applied." 6 40
 }
@@ -481,16 +492,24 @@ action_load_profile() {
 	chosen=$(wt --menu "Apply which profile to $dev?" 0 0 0 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 0
 	[ -z "$chosen" ] && return 0
 
-	local name val applied=0 skipped=0
-	while IFS='=' read -r name val; do
-		[ -z "$name" ] && continue
-		case "$name" in '#'*) continue ;; esac
-		if set_ctrl "$dev" "$name" "$val"; then
-			applied=$((applied + 1))
-		else
-			skipped=$((skipped + 1))
-		fi
-	done <"$PROFILE_DIR/$chosen"
+	# Two passes, auto-mode switches first: a manual value written while its
+	# auto mode is still on is ignored (the control is inactive), and drivers
+	# don't always list the switch first — the C920 lists focus_absolute
+	# before focus_automatic_continuous.
+	local pass name val kind applied=0 skipped=0
+	for pass in auto manual; do
+		while IFS='=' read -r name val; do
+			[ -z "$name" ] && continue
+			case "$name" in '#'*) continue ;; esac
+			[[ "$name" == *auto* ]] && kind=auto || kind=manual
+			[ "$kind" = "$pass" ] || continue
+			if set_ctrl "$dev" "$name" "$val"; then
+				applied=$((applied + 1))
+			else
+				skipped=$((skipped + 1))
+			fi
+		done <"$PROFILE_DIR/$chosen"
+	done
 	wt --msgbox "Applied $applied setting(s), skipped $skipped (unsupported on this camera/mode)." 8 60
 }
 
