@@ -20,6 +20,13 @@ Bluetooth, added later the same day: `sudo pacman -S --needed bluez bluez-utils 
 
 Xbox controller over Bluetooth: `xpadneo-dkms` 0.10.4 from the `cachyos` repo, installed with `linux-cachyos-headers`. `dkms status` shows `hid-xpadneo/v0.10.4` installed for both `7.2.10-1-cachyos` and `6.18.57-2-lts`, so `linux-lts-headers` is present too. The module loads, with a harmless unsigned-module taint warning. A Series X|S controller (`0005:045E:0B13`) paired, and xpadneo's welcome rumble test ran with rumble streaming enabled. Kartik confirmed the controller rumbled.
 
+Brave (`brave-origin-bin` 1.97.59, Chromium 155) showed YouTube with sound but no picture. There were two layers to it.
+
+1. `/etc/environment` set `LIBVA_DRIVER_NAME=nvidia`, which forced NVIDIA's VA-API driver even though Brave renders on the AMD 780M. That line was removed (backup at `/etc/environment.bak`), so Mesa now picks `radeonsi` on its own. `vainfo` shows VP9 and AV1 decode on both GPUs. `MOZ_DISABLE_RDD_SANDBOX=1` is still in `/etc/environment`. It's a Firefox-only leftover from the NVIDIA VA-API setup.
+2. Even with decoding on the AMD chip, Brave's default renderer (Wayland, ANGLE on OpenGL) failed to import decoded frames, logging `eglCreateImage failed with 0x00003009` (`EGL_BAD_MATCH`). `--disable-accelerated-video-decode` played fine, which pinned the fault on the hardware-decode handover. Vulkan isn't allowed under `--ozone-platform=wayland`; Chromium logs that the two aren't compatible.
+
+Working fix, verified 2026-10-18 by Kartik (playback works, `brave://gpu` shows Video Decode hardware accelerated): `~/.config/brave-origin-flags.conf`, which is the file `/usr/bin/brave-origin` reads, containing `--ozone-platform=x11`, `--use-angle=vulkan` and `--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan`, one per line. The trade-off is that Brave runs under XWayland. A Wayland-native alternative, `--disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL`, hasn't been tested.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
