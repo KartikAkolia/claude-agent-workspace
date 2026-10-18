@@ -16,6 +16,10 @@ Verified from Kartik's pasted output, not run by Claude:
 - **Graphics in a Plasma session:** `glxinfo` names the Radeon 780M (`radeonsi`), and `prime-run glxinfo` names the RTX 4060.
 - **gamemode:** `gamemoded -t` passes once Kartik is in the `gamemode` group.
 
+Bluetooth, added later the same day: `sudo pacman -S --needed bluez bluez-utils bluedevil pipewire-audio pipewire-pulse wireplumber`, then `sudo systemctl enable --now bluetooth`. `systemctl is-active bluetooth` reports `active`, and `bluetoothctl show` reports the adapter as `archlinux` with `Powered: yes`. No devices have been paired yet.
+
+Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
+
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
 
 ## Notable points
