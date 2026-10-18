@@ -23,6 +23,13 @@ brew bundle                                             # bash 5, shellcheck, sh
 
 Homebrew's `bash` is not optional there: the lint scripts use `mapfile`, which macOS's stock `/bin/bash` 3.2 lacks, and their `#!/usr/bin/env bash` shebang only finds the newer one when Homebrew's bin dir is ahead of `/bin` on `PATH`. `mdl` has no Homebrew formula, hence the gem on top of Homebrew's `ruby`; `--bindir` can be any directory already on `PATH`.
 
+On Arch Linux, everything except `mdl` is in the official repos:
+
+```sh
+sudo pacman -S --needed ruby shellcheck shfmt uv        # uv ships uvx
+gem install --user-install --no-document mdl --bindir ~/.local/bin
+```
+
 ## This repo's own tooling
 
 `lint-markdown.sh` is the repo's one lint entry point (the name predates what it's grown into — kept as-is since the pre-commit hook and CI both call it by name). It runs, across every tracked file outside the five read-only reference clones:
