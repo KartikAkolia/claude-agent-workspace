@@ -88,3 +88,7 @@ The desktop runs on the AMD iGPU, and `prime-run` switches to the 4060.
 
 - **In-game test:** launch a game from Steam with `prime-run gamemoderun mangohud %command%` and check that MangoHud reports the RTX 4060.
 - **NVIDIA idle power draw (optional):** set up runtime power management if the 9 W idle draw on battery matters.
+
+## 11. Machine identity confirmed
+
+`/sys/class/net/*/address` returned the Wi-Fi MAC `a4:f9:33:cb:70:be`, and `hostnamectl hostname` returned `archlinux`. That's the MAC `docs/laptop-vfio-passthrough.md` records for `asus-vivobook`, at the same `192.168.0.13` address. So this laptop is `asus-vivobook`, reinstalled or reconfigured as Arch with CachyOS repos. `dmidecode` wasn't installed, so its serial-number check wasn't run.
