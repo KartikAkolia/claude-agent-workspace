@@ -37,6 +37,16 @@ topgrade (2026-10-18): installed. `~/.config/topgrade.toml` was created fresh wi
 
 Virtualisation (2026-10-18): before setup, the hardware was ready (`lscpu` showed AMD-V, `/dev/kvm` existed, `kvm_amd` was loaded) but none of the virtualisation packages were installed. The `libvirt` group already existed and Kartik was already in it. Installed: `qemu-desktop libvirt virt-manager virt-viewer edk2-ovmf swtpm dnsmasq dmidecode`. Then `systemctl enable --now libvirtd.service`, `usermod -aG libvirt`, and `net-start` plus `net-autostart` for the `default` network. `virt-host-validate qemu` passes everything, including SVM, `/dev/kvm`, vhost-net, tun and IOMMU (IVRS). It warns on two expected items: the cgroup `devices` controller, because the check ran unprivileged, and SEV/TDX, which laptop CPUs don't have. `virsh -c qemu:///system net-list --all` shows `default` active, autostart and persistent. `LIBVIRT_DEFAULT_URI=qemu:///system` is set in `~/.config/environment.d/libvirt.conf` for the Plasma session. SSH bash shells don't read that file and still showed `qemu:///session`. That line was added to `~/.bashrc`, and plain `virsh uri` over SSH now prints `qemu:///system`. Networking is NAT only (`192.168.122.0/24`), because a Wi-Fi interface can't be bridged. The old `br0` used a USB Ethernet dongle. Whether any old VM definitions such as `win11` and `archlinux` survived the reinstall hasn't been checked.
 
+GTK Nordic theme (2026-10-18): the AUR `nordic-theme` package is installed system-wide at `/usr/share/themes/Nordic` (no variant folders), alongside `papirus-icon-theme`. Plasma's GTK settings button didn't appear, so the config was written by hand:
+
+- **GTK3:** `~/.config/gtk-3.0/settings.ini` was edited in place (backup at `settings.ini.bak`) to `gtk-theme-name=Nordic`, `gtk-icon-theme-name=Papirus-Dark` and `gtk-application-prefer-dark-theme=1`.
+- **GTK4:** `~/.config/gtk-4.0/settings.ini` was created with the same three keys.
+- **libadwaita:** `~/.config/gtk-4.0/gtk.css` and `gtk-dark.css` are symlinked to Nordic's `gtk-4.0/` files. Nordic's GTK4 CSS loads images from `../assets/`, which resolves from `~/.config/gtk-4.0/` to `~/.config/assets`, so `~/.config/assets` is a symlink to `/usr/share/themes/Nordic/assets`. There's no `assets` link inside `gtk-4.0/`.
+- **gsettings:** `gtk-theme 'Nordic'`, `icon-theme 'Papirus-Dark'` and `color-scheme 'prefer-dark'` were set, and `gsettings get` confirms `'Nordic'`. Over SSH this needs `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`; otherwise gsettings falls back to a memory backend and the changes are lost.
+- **Root GTK apps (GParted):** `/root/.config/gtk-3.0/settings.ini` is a symlink to Kartik's file, the same approach as `docs/gparted-root-theme-fix.md`.
+
+Not yet verified: whether `kde-gtk-config` is installed (it may reset the GTK icon line to match Plasma's icon theme), whether the Plasma-side Papirus-Dark icon change applied, and a visual check in an actual GTK app.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
