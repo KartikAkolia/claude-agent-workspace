@@ -1,0 +1,103 @@
+# Local package for WordCraft built from the clone at ~/build/wordcraft, so
+# pacman owns the installed files (remove with `pacman -R wordcraft`).
+#
+# Update by hand:
+#   git -C ~/build/wordcraft pull --ff-only
+#   makepkg -f && pkexec pacman -U "$(makepkg --packagelist)"
+# wordcraft-update (installed to /usr/local/bin, run by wordcraft-update.timer)
+# does the same unattended on odd days of the month. `touch HOLD` in this
+# directory pauses it, e.g. after rolling back with pacman -U on the older
+# package it keeps.
+#
+# pkgver() appends the clone's commit date and hash to the Cargo.toml version,
+# so every new upstream commit is a pacman upgrade even when Cargo.toml's
+# version hasn't moved. build() compiles in the clone itself (no source array)
+# so cargo's target/ stays incremental between updates; !buildflags keeps
+# makepkg.conf's RUSTFLAGS (target-cpu=native) from forcing full rebuilds and
+# leaves optimisation to the workspace's own [profile.release]. package()
+# mirrors the FHS staging in upstream's packaging/linux/package.sh; its
+# postinst.sh cache refreshes are done by pacman hooks from the last three
+# depends instead of a .install script.
+pkgname=wordcraft
+pkgver=0.8.0.r202610181831.gd82f17a
+pkgrel=1
+pkgdesc='Open-source native word processor that reads and writes .docx (local build)'
+arch=('x86_64')
+url='https://github.com/storytold/wordcraft'
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'gtk3' 'fontconfig' 'freetype2'
+	'desktop-file-utils' 'shared-mime-info' 'gtk-update-icon-cache')
+makedepends=('cargo' 'git')
+optdepends=(
+	'wayland: native Wayland backend (WORDCRAFT_WAYLAND=1)'
+	'libx11: X11/XWayland windowing'
+	'libxcursor: X11 cursors'
+	'libxi: X11 input'
+	'libxrandr: X11 display scaling'
+	'xdg-desktop-portal: file dialogs'
+)
+options=('!debug' '!buildflags')
+
+_srcroot="$HOME/build/wordcraft"
+_appid=ai.storyteller.wordcraft
+
+# [workspace.package] version from Cargo.toml. Same job as upstream's
+# workspace_version() in packaging/env.sh, but tolerant of trailing comments,
+# whitespace and CRLF line endings.
+_cargo_version() {
+	awk '{ sub(/\r$/, ""); sub(/[ \t]*#.*/, "") }
+		/^[ \t]*\[/ { h = $0; gsub(/[ \t]/, "", h); p = (h == "[workspace.package]"); next }
+		p && /^[ \t]*version[ \t]*=/ { sub(/^[^=]*=/, ""); gsub(/[" \t]/, ""); print; exit }' \
+		"$_srcroot/Cargo.toml"
+}
+
+# UTC committer date of the clone's HEAD in strftime format $1: for pkgver,
+# and for the metainfo release entry so it doesn't change on every rebuild of
+# the same commit.
+_commit_date() {
+	TZ=UTC git -C "$_srcroot" log -1 --format=%cd --date="format-local:$1"
+}
+
+pkgver() {
+	local ver when hash
+	ver="$(_cargo_version)" || return 1
+	when="$(_commit_date %Y%m%d%H%M)" || return 1
+	hash="$(git -C "$_srcroot" rev-parse --short=7 HEAD)" || return 1
+	if [ -z "$ver" ] || [ -z "$when" ] || [ -z "$hash" ]; then
+		error "could not read the version, commit date or hash from $_srcroot"
+		return 1
+	fi
+	printf '%s.r%s.g%s\n' "${ver//-/_}" "$when" "$hash"
+}
+
+build() {
+	cd "$_srcroot" || return 1
+	# The commit hash shown in the About dialog (option_env! in the app).
+	WORDCRAFT_BUILD_SHA="$(git rev-parse HEAD)" \
+		cargo build --release --locked -p wordcraft -p wordcraft-cli
+}
+
+package() {
+	local bin="$_srcroot/target/release" lp="$_srcroot/packaging/linux" ver date
+	ver="$(_cargo_version)" || return 1
+	date="$(_commit_date %Y-%m-%d)" || return 1
+	if [ -z "$ver" ] || [ -z "$date" ]; then
+		error "could not read the version or commit date for the metainfo"
+		return 1
+	fi
+
+	install -Dm755 "$bin/wordcraft" "$pkgdir/usr/bin/wordcraft"
+	install -Dm755 "$bin/wordcraft-cli" "$pkgdir/usr/bin/wordcraft-cli"
+	install -Dm644 "$lp/$_appid.desktop" "$pkgdir/usr/share/applications/$_appid.desktop"
+	install -Dm644 "$lp/$_appid.mime.xml" "$pkgdir/usr/share/mime/packages/$_appid.xml"
+	install -dm755 "$pkgdir/usr/share/metainfo"
+	# The upstream release version, not the r<date>.g<hash> pkgver.
+	sed -e "s/@VERSION@/$ver/g" -e "s/@DATE@/$date/g" \
+		"$lp/$_appid.metainfo.xml.in" >"$pkgdir/usr/share/metainfo/$_appid.metainfo.xml"
+	install -dm755 "$pkgdir/usr/share/icons"
+	cp -R "$_srcroot/assets/app-icon/hicolor" "$pkgdir/usr/share/icons/"
+	find "$pkgdir/usr/share/icons" -type d -exec chmod 755 {} + -o -type f -exec chmod 644 {} +
+	install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" "$_srcroot/README.md"
+	install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+		"$_srcroot/LICENSE-MIT" "$_srcroot/LICENSE-APACHE" "$_srcroot/NOTICE"
+}

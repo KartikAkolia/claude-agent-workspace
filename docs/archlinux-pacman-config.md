@@ -57,6 +57,10 @@ Steam launch option for running a game on the 4060: `prime-run gamemoderun mango
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
 
+## Locally built software
+
+WordCraft (2026-10-18) is built from source in `~/build/wordcraft` and installed as a local pacman package, which a root systemd timer (`wordcraft-update.timer`) rebuilds and reinstalls when upstream moves. It also became the default `.docx` handler. Full detail, including rollback and the `HOLD` file that pauses updates, is in `docs/wordcraft-source-build.md`.
+
 ## Notable points
 
 The machine uses CachyOS's optimized repositories on top of stock Arch. The three `znver4` repos (`cachyos-znver4`, `cachyos-core-znver4`, `cachyos-extra-znver4`) contain packages built for AMD Zen 4. They're listed ahead of `[cachyos]`, `[core]`, `[extra]`, and `[multilib]`, so for any package name found in more than one repo, the Zen 4 build wins. That's only safe on a Zen 4 CPU, or on a VM whose CPU model passes Zen 4 features through. On an older CPU, those packages fail with illegal-instruction errors.

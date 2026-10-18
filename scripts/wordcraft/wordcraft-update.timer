@@ -1,0 +1,15 @@
+[Unit]
+Description=Update WordCraft on odd days of the month
+
+[Timer]
+# Odd days of the month at 03:30: every 2 days, except a month ending on the
+# 29th or 31st is followed by a run on the 1st, the next day.
+# Persistent catches up a run missed while the laptop was off or asleep, at
+# the next boot or resume. The service's ConditionACPower skips a run on
+# battery; it isn't retried until the next scheduled one.
+OnCalendar=*-*-1/2 03:30
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
