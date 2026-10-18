@@ -45,7 +45,7 @@ GTK Nordic theme (2026-10-18): the AUR `nordic-theme` package is installed syste
 - **gsettings:** `gtk-theme 'Nordic'`, `icon-theme 'Papirus-Dark'` and `color-scheme 'prefer-dark'` were set, and `gsettings get` confirms `'Nordic'`. Over SSH this needs `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`; otherwise gsettings falls back to a memory backend and the changes are lost.
 - **Root GTK apps (GParted):** `/root/.config/gtk-3.0/settings.ini` is a symlink to Kartik's file, the same approach as `docs/gparted-root-theme-fix.md`.
 
-Not yet verified: whether `kde-gtk-config` is installed (it may reset the GTK icon line to match Plasma's icon theme), whether the Plasma-side Papirus-Dark icon change applied, and a visual check in an actual GTK app.
+Persistence was checked after a logout and login. Both `settings.ini` files still read `Nordic` and `Papirus-Dark`, and `gsettings` still reports `'Nordic'`. `kde-gtk-config` 6.8.0-1.1 is installed. The keys in `gtk-3.0/settings.ini` came back reordered, which suggests it rewrote the file at login and kept the values. Plasma's GTK settings button was missing even though the package is installed; the cause wasn't investigated. Not yet verified: a visual check in an actual GTK app.
 
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
