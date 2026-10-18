@@ -30,8 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install shellcheck and shfmt
-        run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt
+      - name: Install uv
+        # lint-bash.sh runs shellcheck pinned via uvx, so CI and the local
+        # pre-commit hook use the same version (not Ubuntu's apt one).
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install shfmt
+        run: sudo apt-get update && sudo apt-get install -y shfmt
 
       - name: lint-bash.sh
         run: |
