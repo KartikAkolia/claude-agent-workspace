@@ -18,6 +18,8 @@ Verified from Kartik's pasted output, not run by Claude:
 
 Bluetooth, added later the same day: `sudo pacman -S --needed bluez bluez-utils bluedevil pipewire-audio pipewire-pulse wireplumber`, then `sudo systemctl enable --now bluetooth`. `systemctl is-active bluetooth` reports `active`, and `bluetoothctl show` reports the adapter as `archlinux` with `Powered: yes`. No devices have been paired yet.
 
+Xbox controller over Bluetooth: `xpadneo-dkms` 0.10.4 from the `cachyos` repo, installed with `linux-cachyos-headers`. `dkms status` shows `hid-xpadneo/v0.10.4` installed for both `7.2.10-1-cachyos` and `6.18.57-2-lts`, so `linux-lts-headers` is present too. The module loads, with a harmless unsigned-module taint warning. A Series X|S controller (`0005:045E:0B13`) paired and got xpadneo's welcome rumble test, with rumble streaming enabled.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
