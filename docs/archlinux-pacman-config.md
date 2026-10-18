@@ -31,6 +31,8 @@ Network (2026-10-18): Wi-Fi `wlp2s0` (Intel AX210, `iwlwifi`) is on NetworkManag
 
 Desktop portals, checked 2026-10-18 from a Konsole window inside Plasma: `xdg-desktop-portal` 1.22.1, `xdg-desktop-portal-kde` 6.8.0 and `xdg-desktop-portal-gtk` 1.15.3 are installed. The registered back-ends are `gtk`, `kde`, `kwallet` and `plasmanotify`, and `kde-portals.conf` is present. The `xdg-desktop-portal` and `plasma-xdg-desktop-portal-kde` user services are `active`, and the FileChooser portal answers with version `u 4`.
 
+topgrade (2026-10-18): installed. `~/.config/topgrade.toml` was created fresh with only `[misc]` and `disable = ["firmware"]`. The `firmware` step is topgrade's `fwupd` step, and the step name comes from topgrade's docs. `topgrade --dry-run` shows no firmware or fwupd step.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
