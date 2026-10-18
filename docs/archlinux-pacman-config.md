@@ -47,6 +47,12 @@ GTK Nordic theme (2026-10-18): the AUR `nordic-theme` package is installed syste
 
 Persistence was checked after a logout and login. Both `settings.ini` files still read `Nordic` and `Papirus-Dark`, and `gsettings` still reports `'Nordic'`. `kde-gtk-config` 6.8.0-1.1 is installed. The keys in `gtk-3.0/settings.ini` came back reordered, which suggests it rewrote the file at login and kept the values. Plasma's GTK settings button was missing even though the package is installed; the cause wasn't investigated. Not yet verified: a visual check in an actual GTK app.
 
+Qt Nordic theme via Kvantum (2026-10-18): installed `kvantum` and `kvantum-qt5`, plus `kvantum-theme-nordic-git` and `nordic-kde-git` from the `cachyos` repo. Neither declares a conflict and there were no file conflicts. `nordic-theme`, the GTK theme, is a separate package from the AUR, installed with `yay` (`paru` isn't installed). Available Kvantum variants: `Nordic`, `Nordic-Darker`, `Nordic-Darker-Solid`, `Nordic-Solid`, `Nordic-bluish` and `Nordic-bluish-solid`. Available colour schemes: `Nordic`, `NordicDarker` and `nordicbluish`.
+
+Applied: `~/.config/Kvantum/kvantum.kvconfig` was written by hand with `[General]` and `theme=Nordic`, `kdeglobals [KDE] widgetStyle=kvantum` was set, and the colour scheme was set to `Nordic` (`kreadconfig6` confirms both). Over SSH, Qt GUI tools such as `kvantummanager` and `plasma-apply-colorscheme` abort because they can't open a display. Qt's error message blames a missing `xcb-cursor0`, but that's misleading: `xcb-util-cursor` was already installed. The workaround is `QT_QPA_PLATFORM=offscreen` together with the `DBUS_SESSION_BUS_ADDRESS` export. The colour scheme was applied as BreezeDark first, then Nordic, so the re-apply was forced. `nordic-kde-git` is labelled Plasma 5; its Plasma desktop theme and window decorations were deliberately not applied.
+
+`sddm-nordic-theme-git` is installed but not selected. It's a Plasma 5-era theme running on Qt6 SDDM, so it needs a `sddm-greeter-qt6 --test-mode` check before being made the login theme.
+
 Steam launch option for running a game on the 4060: `prime-run gamemoderun mangohud %command%`.
 
 Not yet verified: a game launched from Steam with `prime-run gamemoderun mangohud %command%` actually running on the 4060.
