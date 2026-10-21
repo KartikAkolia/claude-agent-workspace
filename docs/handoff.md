@@ -6,6 +6,21 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Only the most recent session entry is kept below. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
 
+### This session's work (2026-10-21, cont'd, on `asus-vivobook`): post-reboot verification; external monitor moved to HDMI
+
+Booted 09:45 on `7.2.10-1-cachyos` (the new `GRUB_DEFAULT` worked); `/proc/cmdline` carries `zswap.enabled=0`. `zramctl` shows `/dev/zram0` with `zstd` at 7.4G, `swapon --show` lists it at priority 100, `/sys/module/zswap/parameters/enabled` is `N` and `nvidia-powerd` is `active`. One difference from the expected values: `nvidia-smi` reported a 65 W current power limit at idle, not 75 W. The maximum is still 75 W and the default 35 W. Dynamic Boost adjusts the current limit at runtime, so this isn't treated as a failure. The 75 W figure under load is unverified. Item 33 is closed.
+
+Kartik also moved the external monitor from DisplayPort to the HDMI port, which is wired to the 4060. `HDMI-A-1` on the `nvidia` card runs at 1920x1080@180, and `eDP-1` is disabled. Detail is in `docs/archlinux-pacman-config.md`.
+
+### This session's work (2026-10-21, on `asus-vivobook`): Dynamic Boost and zram swap; reboot verified
+
+Kartik ran both changes himself after a Steam-tuning review; Claude only verified them. Detail is in `docs/archlinux-pacman-config.md` under "Gaming setup".
+
+1. **`nvidia-powerd` (verified live):** `enabled` and `active`, logging `DBus Connection is established`. `nvidia-smi -q -d POWER` now shows a 75 W current/max power limit against a 35 W default, where it previously reported `N/A`.
+2. **zram swap (config inspected, takes effect at reboot):** `zram-generator` 1.2.1 is installed and `/etc/systemd/zram-generator.conf` sets `[zram0]`, `zram-size = ram / 2` (about 7.4 GiB) and `compression-algorithm = zstd`. Running the generator unprivileged into a scratch directory emitted `dev-zram0.swap` (priority 100, `discard`) and a `swap.target.wants` link, so the config parses. No swap is active yet.
+3. **zswap (config inspected, takes effect at reboot):** it was still enabled (`Y`), and zswap in front of zram compresses pages twice. Kartik added `zswap.enabled=0` to `GRUB_CMDLINE_LINUX_DEFAULT` and reran `grub-mkconfig`; all three `linux` lines in `/boot/grub/grub.cfg` now carry it.
+4. **Boot-default problem found and fixed by Kartik (config inspected):** `GRUB_DEFAULT=0` selects the top-level "Arch Linux" entry, which boots `linux-lts` (6.18.57-2). Only `7.2.10-1-cachyos` has an `nvidia.ko` (from `linux-cachyos-nvidia-open`), so a plain reboot would come up without the NVIDIA driver. The running session was booted on the CachyOS kernel, presumably picked by hand under "Advanced options". Kartik set `GRUB_DEFAULT="gnulinux-advanced-0aec85a9-13e7-43bc-a371-ea890af4f0dd>gnulinux-linux-cachyos-advanced-0aec85a9-13e7-43bc-a371-ea890af4f0dd"` and reran `grub-mkconfig`. The regenerated `grub.cfg` has `set default=` with that path, and both IDs match the generated entries. `grubenv` sets no `next_entry` override.
+
 ### This session's work (2026-10-16, on macOS): five Claude Code plugins/tools set up; Headroom un-retired
 
 Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugin and Headroom across all OSes. Full per-OS record in `docs/claude-plugins-setup.md` (linked from `README.md`).
@@ -48,7 +63,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 33.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 34.
 
 - **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
