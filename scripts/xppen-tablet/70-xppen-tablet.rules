@@ -1,0 +1,4 @@
+# XP-Pen tablets (USB vendor 28bd) and uinput: grant the active seat user access
+# via logind ACLs instead of the vendor's MODE 0666. Must sort before 73-seat-late.
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="28bd", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

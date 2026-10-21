@@ -1,0 +1,54 @@
+# Local package of the official XP-Pen Linux driver (prebuilt binary).
+pkgname=xppen-tablet
+_pkgver=4.0.15
+_build=260422
+pkgver=${_pkgver}.${_build}
+pkgrel=2
+pkgdesc="XP-Pen official Linux tablet driver (PenTablet)"
+arch=('x86_64')
+url="https://www.xp-pen.com/download"
+license=('LicenseRef-XPPen-EULA')
+depends=('dbus' 'fontconfig' 'freetype2' 'glib2' 'libglvnd' 'libice' 'libpng'
+	'libsm' 'libusb' 'libx11' 'libxcb' 'libxext' 'libxi' 'libxrandr'
+	'libxrender' 'libxtst' 'systemd-libs' 'zlib')
+options=('!strip' '!debug')
+# The binary hardcodes its writable config under /usr/lib/pentablet/conf/xppen.
+backup=('usr/lib/pentablet/conf/xppen/config.xml'
+	'usr/lib/pentablet/conf/xppen/dialogpos.ini'
+	'usr/lib/pentablet/conf/xppen/language.ini'
+	'usr/lib/pentablet/conf/xppen/name_config.ini')
+source=("XPPenLinux${_pkgver}-${_build}.tar.gz"
+	'70-xppen-tablet.rules'
+	'xppentablet')
+sha256sums=('25a772fa96ea9f399532e334228e3f684e41edda8d94328fb27463fc56e59fa5'
+	'SKIP'
+	'SKIP')
+
+package() {
+	local app="${srcdir}/XPPenLinux${_pkgver}-${_build}/App"
+
+	install -d "${pkgdir}/usr/lib"
+	cp -a "${app}/usr/lib/pentablet" "${pkgdir}/usr/lib/"
+	chmod 0755 "${pkgdir}/usr/lib/pentablet/PenTablet.sh" \
+		"${pkgdir}/usr/lib/pentablet/PenTablet"
+
+	# Same permissions the vendor installer applies, so the GUI can save settings.
+	chmod 0777 "${pkgdir}/usr/lib/pentablet/conf/xppen"
+	chmod 0666 "${pkgdir}/usr/lib/pentablet/conf/xppen/"{config.xml,*.ini}
+
+	install -Dm755 "${srcdir}/xppentablet" "${pkgdir}/usr/bin/xppentablet"
+
+	install -Dm644 "${app}/usr/share/applications/xppentablet.desktop" \
+		"${pkgdir}/usr/share/applications/xppentablet.desktop"
+	install -Dm644 "${app}/etc/xdg/autostart/xppentablet.desktop" \
+		"${pkgdir}/etc/xdg/autostart/xppentablet.desktop"
+	install -Dm644 "${app}/usr/share/icons/hicolor/256x256/apps/xppentablet.png" \
+		"${pkgdir}/usr/share/icons/hicolor/256x256/apps/xppentablet.png"
+
+	# Replaces the vendor's world-writable (0666) rule with seat-scoped uaccess ACLs.
+	install -Dm644 "${srcdir}/70-xppen-tablet.rules" \
+		"${pkgdir}/usr/lib/udev/rules.d/70-xppen-tablet.rules"
+
+	install -Dm644 "${app}/usr/lib/pentablet/doc/EULA" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/EULA"
+}
