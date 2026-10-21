@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Usage: craft-update APP...   (e.g. craft-update wordcraft pdfcraft deckcraft)
+#
+# For each APP, pulls ~kartik/build/APP, and if upstream moved, rebuilds and
+# reinstalls the APP package from ~kartik/build/APP-pkg/PKGBUILD. Apps run one
+# after another, each in its own subshell, so one failing (network, build,
+# install) is logged and the rest still run; the exit status is 1 if any
+# failed. Run as root by craft-update.service (odd days of the month via
+# craft-update.timer). Only `pacman -U` runs as root: git and makepkg (which
+# runs cargo in its build()) run as kartik through runuser with a clean
+# environment. The package root installs is still one kartik built, so this
+# trusts that account as much as sudo already does.
+#
+# `touch ~kartik/build/APP-pkg/HOLD` pauses updates for that app, e.g. after
+# rolling back with pacman -U on the previously installed package kept there
+# (each update keeps only the new package and the one it replaced); otherwise
+# the next run would reinstall the newer one. Remove HOLD to resume.
+#
+# Don't run makepkg by hand in a package directory while this is running:
+# the lock below only stops two runs of this script overlapping.
+#
+# Installed to /usr/local/bin/craft-update (root:root 0755); the source copy
+# lives in scripts/craft-update/ in claude-agent-workspace. Logs:
+# journalctl -u craft-update.
+# The `bash -c '...'` snippets below expand $1 etc. in the inner shell.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+user=kartik
+home=/home/kartik
+
+log() { printf 'craft-update: %s\n' "$*"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+	log 'must run as root' >&2
+	exit 1
+fi
+if [ $# -eq 0 ]; then
+	log 'usage: craft-update APP...' >&2
+	exit 2
+fi
+
+exec 9>/run/lock/craft-update.lock
+if ! flock -n 9; then
+	log 'another run is in progress, skipping'
+	exit 0
+fi
+
+# 9>&-: children (git's detached auto-gc in particular) mustn't inherit the
+# lock and keep holding it after this script exits.
+as_user() {
+	runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
+		PATH=/usr/local/bin:/usr/bin LANG=C.UTF-8 "$@" 9>&-
+}
+
+# Runs in a subshell per app (see the loop at the bottom): `exit` here ends
+# only this app's update, and its EXIT trap only cleans up after it.
+update_app() {
+	local app="$1"
+	local src="$home/build/$app" pkgdir="$home/build/$app-pkg"
+	local attempt want have pkg err
+
+	log() { printf 'craft-update: %s: %s\n' "$app" "$*"; }
+
+	if [ -e "$pkgdir/HOLD" ]; then
+		log "$pkgdir/HOLD exists, updates paused"
+		exit 0
+	fi
+
+	# Retry only the network step: a catch-up run right after resume can
+	# start before Wi-Fi reconnects, and network-online.target doesn't wait
+	# for that (it was reached at boot). $fetch_tries drops to 1 once an app
+	# has given up (exit 3), so an outage isn't waited out once per app. The
+	# merge below fails at once on anything permanent (diverged upstream,
+	# local edits).
+	for attempt in $(seq "$fetch_tries"); do
+		if as_user git -C "$src" fetch --quiet; then
+			break
+		fi
+		if [ "$attempt" -eq "$fetch_tries" ]; then
+			log 'git fetch kept failing, giving up until the next run' >&2
+			exit 3
+		fi
+		log "git fetch failed (attempt $attempt/$fetch_tries), retrying in 60s"
+		sleep 60
+	done
+	if ! as_user git -C "$src" merge --ff-only --quiet '@{upstream}'; then
+		log "can't fast-forward $src (local edits or diverged upstream); updates blocked until fixed by hand" >&2
+		exit 1
+	fi
+
+	# pkgver() lives in the PKGBUILD; source it as kartik, never as root.
+	want="$(as_user bash -c 'set -e; cd "$1"; error() { printf "%s\n" "$*" >&2; }
+		source ./PKGBUILD; v="$(pkgver)"; printf "%s-%s\n" "$v" "$pkgrel"' _ "$pkgdir")"
+	have="$(pacman -Q "$app" 2>/dev/null | awk '{ print $2 }' || true)"
+	if [ "$want" = "$have" ]; then
+		log "$have already installed, nothing to do"
+		exit 0
+	fi
+	log "updating ${have:-none} -> $want"
+
+	as_user bash -c 'cd "$1" && makepkg -f --noconfirm' _ "$pkgdir"
+	pkg="$(as_user bash -c 'cd "$1" && makepkg --packagelist' _ "$pkgdir")"
+
+	if [ ! -f "$pkg" ] || [ -L "$pkg" ] || [ "$(stat -c %U "$pkg")" != "$user" ]; then
+		log "unexpected package file ${pkg@Q}" >&2
+		exit 1
+	fi
+
+	# Checked again here: HOLD may have been created during an hour-long build.
+	if [ -e "$pkgdir/HOLD" ]; then
+		log "$pkgdir/HOLD appeared during the build; $pkg is built but not installed"
+		exit 0
+	fi
+
+	# Retry the install itself, only while pacman reports the database lock,
+	# so another pacman taking it can't fail a finished build. Give up after
+	# 30 minutes, which also covers a stale lock left by a crash.
+	err="$(mktemp)"
+	# shellcheck disable=SC2064 # expand now: $err is local to this function
+	trap "rm -f '$err'" EXIT
+	for attempt in $(seq 60); do
+		# LC_ALL=C keeps the message grepped below untranslated.
+		if LC_ALL=C pacman -U --noconfirm "$pkg" 2>"$err"; then
+			cat "$err" >&2
+			break
+		fi
+		cat "$err" >&2
+		if ! grep -q 'unable to lock database' "$err" || [ "$attempt" -eq 60 ]; then
+			log "pacman -U failed; $pkg is built, install it by hand" >&2
+			exit 1
+		fi
+		log 'pacman database is locked, retrying in 30s'
+		sleep 30
+	done
+
+	# Keep only this package and the one it replaced, so `pacman -U` can roll
+	# back to what was actually running. In the package's own directory,
+	# which follows PKGDEST if that's ever set; any PKGEXT compression.
+	as_user bash -c 'cd "$1" || exit 1
+		for f in "$4"-*.pkg.tar*; do
+			[ -f "$f" ] && [ "$f" != "$2" ] || continue
+			if [ -n "$3" ]; then case "$f" in "$3"*) continue ;; esac; fi
+			rm -f -- "$f"
+		done' _ "$(dirname "$pkg")" "$(basename "$pkg")" "${have:+$app-$have-x86_64.pkg.tar}" "$app"
+
+	log "installed $want"
+}
+
+failed=()
+fetch_tries=10
+for app in "$@"; do
+	# The name becomes paths under ~kartik/build and a pacman package name.
+	if [[ ! "$app" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+		log "${app@Q}: not a valid app name (lowercase letters, digits, -), skipping" >&2
+		failed+=("$app")
+		continue
+	fi
+	if [ ! -f "$home/build/$app-pkg/PKGBUILD" ]; then
+		log "$app: no $home/build/$app-pkg/PKGBUILD, skipping" >&2
+		failed+=("$app")
+		continue
+	fi
+	# Not `if ! (update_app ...)`: bash ignores set -e inside a condition, so
+	# a failed makepkg would carry on to pacman -U.
+	set +e
+	(
+		set -e
+		update_app "$app"
+	)
+	rc=$?
+	set -e
+	if [ "$rc" -ne 0 ]; then
+		failed+=("$app")
+	fi
+	if [ "$rc" -eq 3 ]; then
+		fetch_tries=1
+	fi
+done
+
+if [ ${#failed[@]} -gt 0 ]; then
+	log "failed: ${failed[*]}" >&2
+	exit 1
+fi

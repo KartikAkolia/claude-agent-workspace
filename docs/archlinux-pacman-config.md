@@ -70,7 +70,7 @@ Dynamic Boost and zram (2026-10-21), both set up by Kartik and inspected by Clau
 
 ## Locally built software
 
-WordCraft (2026-10-18) is built from source in `~/build/wordcraft` and installed as a local pacman package, which a root systemd timer (`wordcraft-update.timer`) rebuilds and reinstalls when upstream moves. It also became the default `.docx` handler. Full detail, including rollback and the `HOLD` file that pauses updates, is in `docs/wordcraft-source-build.md`.
+WordCraft (2026-10-18), PdfCraft and DeckCraft (2026-10-21) are built from source in `~/build/<app>` and installed as local pacman packages, which one root systemd timer (`craft-update.timer`) rebuilds and reinstalls when upstream moves. They also became the default handlers for `.docx`, `.pdf` and `.pptx`. Full detail, including rollback and the `HOLD` file that pauses updates, is in `docs/craft-update.md` and each app's `docs/<app>-source-build.md`.
 
 ## Notable points
 

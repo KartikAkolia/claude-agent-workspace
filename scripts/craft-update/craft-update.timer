@@ -1,5 +1,5 @@
 [Unit]
-Description=Update WordCraft on odd days of the month
+Description=Update the *Craft apps on odd days of the month
 
 [Timer]
 # Odd days of the month at 03:30: every 2 days, except a month ending on the

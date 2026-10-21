@@ -4,10 +4,10 @@
 # Update by hand:
 #   git -C ~/build/wordcraft pull --ff-only
 #   makepkg -f && pkexec pacman -U "$(makepkg --packagelist)"
-# wordcraft-update (installed to /usr/local/bin, run by wordcraft-update.timer)
-# does the same unattended on odd days of the month. `touch HOLD` in this
-# directory pauses it, e.g. after rolling back with pacman -U on the older
-# package it keeps.
+# craft-update (installed to /usr/local/bin, run by craft-update.timer for
+# every *Craft app) does the same unattended on odd days of the month.
+# `touch HOLD` in this directory pauses it for wordcraft, e.g. after rolling back
+# with pacman -U on the older package it keeps.
 #
 # pkgver() appends the clone's commit date and hash to the Cargo.toml version,
 # so every new upstream commit is a pacman upgrade even when Cargo.toml's

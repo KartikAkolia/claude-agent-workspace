@@ -10,22 +10,22 @@ name: Lint Bash
 # Bash scripts aren't reliably *.sh (list-lint-files.sh finds them by
 # shebang instead), but a GitHub Actions path filter can only match on the
 # file path itself, not its content -- so .githooks/pre-commit and
-# scripts/wordcraft/wordcraft-update (the tracked bash scripts without a
-# .sh extension) are listed explicitly below.
+# scripts/craft-update/craft-update (the tracked bash scripts without a .sh
+# extension) are listed explicitly below.
 # A future non-.sh bash script would need adding here too.
 on:
   push:
     paths:
       - "**.sh"
       - ".githooks/pre-commit"
-      - "scripts/wordcraft/wordcraft-update"
+      - "scripts/craft-update/craft-update"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
   pull_request:
     paths:
       - "**.sh"
       - ".githooks/pre-commit"
-      - "scripts/wordcraft/wordcraft-update"
+      - "scripts/craft-update/craft-update"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
 

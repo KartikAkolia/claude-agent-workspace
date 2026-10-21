@@ -1,0 +1,117 @@
+# Local package for PdfCraft built from the clone at ~/build/pdfcraft, so
+# pacman owns the installed files (remove with `pacman -R pdfcraft`).
+#
+# Update by hand:
+#   git -C ~/build/pdfcraft pull --ff-only
+#   makepkg -f && pkexec pacman -U "$(makepkg --packagelist)"
+# craft-update (installed to /usr/local/bin, run by craft-update.timer for
+# every *Craft app) does the same unattended on odd days of the month.
+# `touch HOLD` in this directory pauses it for pdfcraft, e.g. after rolling back
+# with pacman -U on the older package it keeps.
+#
+# Same layout as scripts/wordcraft/PKGBUILD (see docs/pdfcraft-source-build.md):
+# pkgver() appends the clone's commit date and hash to the Cargo.toml version,
+# build() compiles in the clone itself so cargo's target/ stays incremental,
+# and !buildflags keeps makepkg.conf's RUSTFLAGS (target-cpu=native) from
+# forcing full rebuilds. package() mirrors the FHS staging in upstream's
+# packaging/linux/package.sh, including the OCR models it downloads with
+# `cargo xtask models` (SHA-256 verified, and skipped when the copy already
+# in target/pdfcraft-models matches) into /usr/share/pdfcraft/models, where
+# the app looks relative to its executable. postinst.sh's cache
+# refreshes are done by pacman hooks from the last three depends.
+pkgname=pdfcraft
+pkgver=0.10.1.r202610210759.g4164951
+pkgrel=1
+pkgdesc='Open-source native PDF workbench: read, annotate, fill, sign, organize, edit, redact (local build)'
+arch=('x86_64')
+url='https://github.com/storytold/pdfcraft'
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'xdg-desktop-portal'
+	'desktop-file-utils' 'shared-mime-info' 'gtk-update-icon-cache')
+makedepends=('cargo' 'git' 'curl')
+optdepends=(
+	'xdg-desktop-portal-kde: file dialogs on Plasma (or another portal backend: -gtk, -gnome)'
+	'cups: printing through lp/lpstat (without it, Print offers only Save as PDF)'
+	'wayland: native Wayland windowing'
+	'libx11: X11/XWayland windowing'
+	'libxcursor: X11 cursors'
+	'libxi: X11 input'
+	'libxrandr: X11 display scaling'
+)
+options=('!debug' '!buildflags')
+
+_srcroot="$HOME/build/pdfcraft"
+_appid=ai.storyteller.pdfcraft
+_models="$_srcroot/target/pdfcraft-models"
+
+# [workspace.package] version from Cargo.toml, tolerant of trailing comments,
+# whitespace and CRLF line endings.
+_cargo_version() {
+	awk '{ sub(/\r$/, ""); sub(/[ \t]*#.*/, "") }
+		/^[ \t]*\[/ { h = $0; gsub(/[ \t]/, "", h); p = (h == "[workspace.package]"); next }
+		p && /^[ \t]*version[ \t]*=/ { sub(/^[^=]*=/, ""); gsub(/[" \t]/, ""); print; exit }' \
+		"$_srcroot/Cargo.toml"
+}
+
+# UTC committer date of the clone's HEAD in strftime format $1.
+_commit_date() {
+	TZ=UTC git -C "$_srcroot" log -1 --format=%cd --date="format-local:$1"
+}
+
+pkgver() {
+	local ver when hash
+	ver="$(_cargo_version)" || return 1
+	when="$(_commit_date %Y%m%d%H%M)" || return 1
+	hash="$(git -C "$_srcroot" rev-parse --short=7 HEAD)" || return 1
+	if [ -z "$ver" ] || [ -z "$when" ] || [ -z "$hash" ]; then
+		error "could not read the version, commit date or hash from $_srcroot"
+		return 1
+	fi
+	printf '%s.r%s.g%s\n' "${ver//-/_}" "$when" "$hash"
+}
+
+build() {
+	cd "$_srcroot" || return 1
+	cargo build --release --locked -p pdfcraft -p pdfcraft-cli
+	# Reused between builds: xtask re-downloads only files whose SHA-256
+	# doesn't match. A model upstream drops from ATTRIBUTION.toml would stay
+	# here and keep shipping; `rm -r` this directory if that ever happens.
+	mkdir -p "$_models"
+	# `cargo xtask` without its alias, to add --locked: a rewritten
+	# Cargo.lock would make the next `git merge --ff-only` refuse.
+	cargo run --locked -p xtask -- models "$_models"
+	# Left by a download interrupted in an earlier build.
+	rm -f "$_models"/*.part
+	if ! compgen -G "$_models/*.LICENCE.txt" >/dev/null || [ ! -s "$_models/ATTRIBUTION.txt" ]; then
+		error "no OCR models in $_models after cargo xtask models"
+		return 1
+	fi
+}
+
+package() {
+	local bin="$_srcroot/target/release" lp="$_srcroot/packaging/linux" ver date
+	ver="$(_cargo_version)" || return 1
+	date="$(_commit_date %Y-%m-%d)" || return 1
+	if [ -z "$ver" ] || [ -z "$date" ]; then
+		error "could not read the version or commit date for the metainfo"
+		return 1
+	fi
+
+	install -Dm755 "$bin/pdfcraft" "$pkgdir/usr/bin/pdfcraft"
+	install -Dm755 "$bin/pdfcraft-cli" "$pkgdir/usr/bin/pdfcraft-cli"
+	install -Dm644 "$lp/$_appid.desktop" "$pkgdir/usr/share/applications/$_appid.desktop"
+	install -Dm644 "$lp/$_appid.mime.xml" "$pkgdir/usr/share/mime/packages/$_appid.xml"
+	install -dm755 "$pkgdir/usr/share/metainfo"
+	# The upstream release version, not the r<date>.g<hash> pkgver.
+	sed -e "s/@VERSION@/$ver/g" -e "s/@DATE@/$date/g" \
+		"$lp/$_appid.metainfo.xml.in" >"$pkgdir/usr/share/metainfo/$_appid.metainfo.xml"
+	install -dm755 "$pkgdir/usr/share/icons"
+	cp -R "$_srcroot/assets/app-icon/hicolor" "$pkgdir/usr/share/icons/"
+	install -dm755 "$pkgdir/usr/share/pdfcraft"
+	cp -R "$_models" "$pkgdir/usr/share/pdfcraft/models"
+	find "$pkgdir/usr/share/icons" "$pkgdir/usr/share/pdfcraft" \
+		-type d -exec chmod 755 {} + -o -type f -exec chmod 644 {} +
+	install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" "$_srcroot/README.md"
+	install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+		"$_srcroot/LICENSE-MIT" "$_srcroot/LICENSE-APACHE" "$_srcroot/NOTICE"
+}
