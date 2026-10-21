@@ -7,12 +7,13 @@
 # dir is ahead of /bin on PATH (the default after `brew shellenv`).
 brew "bash"
 
-# lint-bash.sh uses shfmt from here; its shellcheck is pinned via uvx (see
-# below), so this one is only for editors/ad hoc use.
+# lint-bash.sh. Their versions also drive .lint-versions: committing a bash
+# file after `brew upgrade shellcheck`/`shfmt` bumps it to the new version
+# (and re-lints every bash script with it) -- see lint-versions.sh.
 brew "shellcheck"
 brew "shfmt"
 
-# lint-python.sh runs ruff, and lint-bash.sh a pinned shellcheck, through `uvx`.
+# lint-python.sh runs ruff through `uvx`, at the version in .lint-versions.
 brew "uv"
 
 # mdl (lint-markdown.sh) has no Homebrew formula and current releases don't

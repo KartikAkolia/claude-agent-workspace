@@ -48,7 +48,9 @@ else
 fi
 
 ./validate-config.sh "${config_files[@]}" || status=1
-./lint-bash.sh "${bash_files[@]}" || status=1
-./lint-python.sh "${python_files[@]}" || status=1
+# LINT_VERSIONS_MODE cleared: a full sweep only warns about versions, even
+# if the caller's shell has it exported (see lint-versions.sh).
+LINT_VERSIONS_MODE='' ./lint-bash.sh "${bash_files[@]}" || status=1
+LINT_VERSIONS_MODE='' ./lint-python.sh "${python_files[@]}" || status=1
 
 exit "$status"

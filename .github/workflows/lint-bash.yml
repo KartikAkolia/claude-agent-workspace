@@ -9,20 +9,25 @@ name: Lint Bash
 #
 # Bash scripts aren't reliably *.sh (list-lint-files.sh finds them by
 # shebang instead), but a GitHub Actions path filter can only match on the
-# file path itself, not its content -- so .githooks/pre-commit (the one
-# tracked bash script without a .sh extension) is listed explicitly below.
+# file path itself, not its content -- so .githooks/pre-commit and
+# scripts/wordcraft/wordcraft-update (the tracked bash scripts without a
+# .sh extension) are listed explicitly below.
 # A future non-.sh bash script would need adding here too.
 on:
   push:
     paths:
       - "**.sh"
       - ".githooks/pre-commit"
+      - "scripts/wordcraft/wordcraft-update"
       - ".github/workflows/lint-bash.yml"
+      - ".lint-versions"
   pull_request:
     paths:
       - "**.sh"
       - ".githooks/pre-commit"
+      - "scripts/wordcraft/wordcraft-update"
       - ".github/workflows/lint-bash.yml"
+      - ".lint-versions"
 
 jobs:
   lint:
@@ -30,15 +35,36 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install uv
-        # lint-bash.sh runs shellcheck pinned via uvx, so CI and the local
-        # pre-commit hook use the same version (not Ubuntu's apt one).
-        uses: astral-sh/setup-uv@v7
-
-      - name: Install shfmt
-        run: sudo apt-get update && sudo apt-get install -y shfmt
+      - name: Install shellcheck and shfmt at the versions in .lint-versions
+        # Not Ubuntu's apt packages, which lag Kartik's machines (see
+        # lint-versions.sh). .lint-versions follows whatever's installed
+        # locally, so these are the official release binaries for those
+        # exact versions, ahead of any preinstalled ones on PATH.
+        # lint-bash.sh fails if they still don't match. Downloads go to a
+        # file, not a pipe: a --retry after a partial transfer would
+        # otherwise feed the bytes twice.
+        run: |
+          sc=$(./lint-versions.sh get shellcheck)
+          sf=$(./lint-versions.sh get shfmt)
+          bin="$RUNNER_TEMP/lint-bin"
+          mkdir -p "$bin"
+          case "$(uname -m)" in
+          x86_64) sf_arch=amd64 ;;
+          aarch64) sf_arch=arm64 ;;
+          *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/shellcheck.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${sc}/shellcheck-v${sc}.linux.$(uname -m).tar.xz"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/shellcheck-v${sc}/shellcheck" "$bin/"
+          curl -fsSL --retry 3 -o "$bin/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/v${sf}/shfmt_v${sf}_linux_${sf_arch}"
+          chmod +x "$bin/shfmt"
+          echo "$bin" >> "$GITHUB_PATH"
 
       - name: lint-bash.sh
+        env:
+          LINT_VERSIONS_MODE: strict
         run: |
           mapfile -t files < <(./list-lint-files.sh bash)
           ./lint-bash.sh "${files[@]}"

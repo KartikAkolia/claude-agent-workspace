@@ -36,8 +36,8 @@ gem install --user-install --no-document mdl --bindir ~/.local/bin
 
 - `mdl` plus `check-markdown-links.py` (catches local cross-references to files that no longer exist) on markdown.
 - `validate-config.sh` on JSON/YAML — just confirms it parses, catching a typo in `.claude/settings.json` or similar before it silently breaks hook/tool wiring at runtime.
-- `lint-bash.sh` (`shellcheck` + `shfmt -d` + `bash -n`) on every bash script — shellcheck pinned to one version via `uvx` so the pre-commit hook and CI can't disagree, the way distro packages lagging differently did (Ubuntu's 0.9.0 vs Arch's 0.11.0) — found by shebang rather than a `.sh` extension since not all of them have one (`.githooks/pre-commit`).
-- `lint-python.sh` (`ruff check` + `ruff format --check`, run via `uvx` so nothing needs a system-wide install) on every `.py` file.
+- `lint-bash.sh` (`shellcheck` + `shfmt -d` + `bash -n`) on every bash script, found by shebang rather than a `.sh` extension since not all of them have one (`.githooks/pre-commit`, `scripts/wordcraft/wordcraft-update`). CI installs the shellcheck and shfmt versions recorded in `.lint-versions`, which the pre-commit hook keeps at your newest installed ones — bumping the file, re-linting every bash script with the new version, and failing the commit until the bump is staged — except for a line you've changed yourself or marked `# hold`. The full rules are under "Sync mode" in `lint-versions.sh`.
+- `lint-python.sh` (`ruff check` + `ruff format --check`, run via `uvx` so nothing needs a system-wide install) on every `.py` file — at exactly the `ruff` version in `.lint-versions`, set by hand, so local and CI never drift.
 
 `.githooks/pre-commit` runs the same four checks against whatever's staged, so `git commit` blocks on a style violation, a broken local link, invalid config, or a lint finding. Hooks come from `.githooks/`, not `.git/hooks/` — set once per clone with `git config core.hooksPath .githooks`.
 

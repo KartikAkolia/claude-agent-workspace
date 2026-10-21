@@ -2,8 +2,13 @@
 # Lints staged markdown with mdl and checks local cross-references for rot;
 # validates staged JSON/YAML config parses cleanly; and runs
 # lint-bash.sh/lint-python.sh over staged bash and Python files, before
-# allowing a commit. Skips the read-only ChrisTitusTech reference clones and
-# vendored/tool-generated content (see AGENTS.md non-negotiable #1).
+# allowing a commit. When a commit changes a linter's version in
+# .lint-versions, every file of that kind is linted with it (as CI will),
+# even if none is staged; and lint-bash.sh may write a newer installed
+# version of either bash linter into .lint-versions and fail until that's
+# staged (see lint-versions.sh). Skips the read-only ChrisTitusTech
+# reference clones and vendored/tool-generated content (see AGENTS.md
+# non-negotiable #1).
 # Config: ../.mdlrc, ../.mdl_style.rb
 set -uo pipefail
 
@@ -74,12 +79,70 @@ for f in "${staged_py[@]}"; do
 	[ "$skip" -eq 0 ] && [ -f "$f" ] && python_files+=("$f")
 done
 
+# A commit that changes a linter's version in .lint-versions gets every
+# file of that kind linted with it, as CI will -- not just the staged ones,
+# and even when no file of that kind is staged at all. Runs before the
+# nothing-to-lint early exit below, since a commit of .lint-versions alone
+# stages nothing else.
+version_error=0
+
+# 0 if this commit changes $1's version, 1 if not. A git read error is
+# flagged (failing the commit) rather than read as "unchanged".
+version_changed() {
+	local rc
+	# One git failure is enough to fail the commit; don't repeat it per tool.
+	[ "$version_error" -eq 0 ] || return 1
+	"$repo_root/lint-versions.sh" changed "$1"
+	rc=$?
+	[ "$rc" -le 1 ] && return "$rc"
+	printf 'pre-commit: could not tell whether this commit changes %s in .lint-versions\n' "$1" >&2
+	version_error=1
+	return 1
+}
+
+# Replaces array $2 with every tracked $1-category file still on disk.
+# Not mapfile < <(...), which would hide a list-lint-files.sh failure.
+use_all_lint_files() {
+	local list f
+	if ! list=$("$repo_root/list-lint-files.sh" "$1"); then
+		printf 'pre-commit: could not list the %s files to re-lint\n' "$1" >&2
+		version_error=1
+		return
+	fi
+	local -n files_ref="$2"
+	files_ref=()
+	while IFS= read -r f; do
+		[ -n "$f" ] && [ -f "$f" ] && files_ref+=("$f")
+	done <<<"$list"
+}
+
+# For shellcheck/shfmt, lint-bash.sh decides whether a full re-lint means
+# anything -- only when the installed tool is the version CI will run, not
+# an older one -- so this only makes sure it runs, even with no bash file
+# staged.
+bash_versions_changed=0
+ruff_version_changed=0
+# None of it applies unless this commit touches .lint-versions at all (a
+# deletion counts: --cached diffs against HEAD).
+if ! git diff --cached --quiet -- .lint-versions; then
+	if version_changed shellcheck || version_changed shfmt; then
+		bash_versions_changed=1
+	fi
+	if version_changed ruff; then
+		ruff_version_changed=1
+		printf 'pre-commit: this commit changes ruff in .lint-versions -- linting every .py file, as CI will\n' >&2
+		use_all_lint_files python python_files
+	fi
+fi
+
 if [ "${#md_files[@]}" -eq 0 ] && [ "${#config_files[@]}" -eq 0 ] &&
-	[ "${#bash_files[@]}" -eq 0 ] && [ "${#python_files[@]}" -eq 0 ]; then
+	[ "${#bash_files[@]}" -eq 0 ] && [ "${#python_files[@]}" -eq 0 ] &&
+	[ "$bash_versions_changed" -eq 0 ] && [ "$ruff_version_changed" -eq 0 ] &&
+	[ "$version_error" -eq 0 ]; then
 	exit 0
 fi
 
-status=0
+status=$version_error
 
 if [ "${#md_files[@]}" -gt 0 ]; then
 	if ! command -v mdl >/dev/null 2>&1; then
@@ -115,12 +178,18 @@ if [ "${#config_files[@]}" -gt 0 ]; then
 	"$repo_root/validate-config.sh" "${config_files[@]}" || status=1
 fi
 
-if [ "${#bash_files[@]}" -gt 0 ]; then
-	"$repo_root/lint-bash.sh" "${bash_files[@]}" || status=1
+if [ "${#bash_files[@]}" -gt 0 ] || [ "$bash_versions_changed" -eq 1 ]; then
+	# sync: bump .lint-versions to a newer installed shellcheck/shfmt,
+	# require it staged, and re-lint every bash script when this commit
+	# changes a version (see lint-versions.sh). Runs with no files too.
+	LINT_VERSIONS_MODE=sync "$repo_root/lint-bash.sh" "${bash_files[@]}" || status=1
 fi
 
-if [ "${#python_files[@]}" -gt 0 ]; then
-	"$repo_root/lint-python.sh" "${python_files[@]}" || status=1
+if [ "${#python_files[@]}" -gt 0 ] || [ "$ruff_version_changed" -eq 1 ]; then
+	# sync: lint with the ruff version this commit will contain, which is
+	# what lint-python.yml reads (see lint-python.sh). Runs with no files
+	# too when ruff changes, so the new ruff line is still checked.
+	LINT_VERSIONS_MODE=sync "$repo_root/lint-python.sh" "${python_files[@]}" || status=1
 fi
 
 exit "$status"

@@ -1,0 +1,8 @@
+# Linter versions CI runs -- see lint-versions.sh.
+# shellcheck/shfmt: the pre-commit hook bumps these to the newest installed
+# version, except a line you've changed yourself or marked `# hold`; the
+# full rules are under "Sync mode" in lint-versions.sh.
+# ruff: set by hand; lint-python.sh runs exactly this via uvx.
+shellcheck=0.11.0
+shfmt=3.14.1
+ruff=0.17.1
