@@ -54,7 +54,7 @@ Give Kartik a working local task dashboard tied to Cowork's productivity skill.
 
 `productivity/dashboard.html` (kanban, dark mode), `TASKS.md`, `CLAUDE.md` (Cowork memory), usage guide, pre-refactor backup kept.
 
-**Retired 2026-09-03** (`fjord/ROADMAP.md` Phase 4): `dashboard.html` and its supporting test/usage-guide/backup files archived, not deleted, under `productivity/dashboard-archive/`, once Fjord's read-only doc reader took over as the workspace's entry point. `TASKS.md` and `CLAUDE.md` stayed live in `productivity/`, untouched.
+**Retired 2026-09-03** (Phase 4 of Fjord's own ROADMAP.md; `fjord/` was removed 2026-10-21): `dashboard.html` and its supporting test/usage-guide/backup files archived, not deleted, under `productivity/dashboard-archive/`, once Fjord's read-only doc reader took over as the workspace's entry point. `TASKS.md` and `CLAUDE.md` stayed live in `productivity/`, untouched.
 
 ### Exit Criteria
 
@@ -149,6 +149,8 @@ Status: declined (2026-08-21, Kartik's call, reaffirmed this session). Originall
 Status: done (2026-08-21, Kartik's call — see `docs/dashboard-card-listitem-merge-roadmap.md`). Option B implemented: the four board/list "start editing" wrapper pairs were collapsed into four shared, `styleCss`-parameterized functions; `createListItem`'s dead `section` parameter was removed. `createCard`/`createListItem` themselves were left separate, as planned. All 4 phases complete — Phases 0–2 automated (48 tests passing across `productivity/dashboard-baseline.test.js`, `dashboard-start-editing.test.js`, `dashboard-interactions.test.js`, and `escapeHtml.test.js`), Phase 3 manual browser QA run by Kartik with no issues found.
 
 ### 6. Fjord: Nord-themed docs/README viewer, replacing `productivity/dashboard.html`
+
+Removed 2026-10-21: Kartik deleted `fjord/`, along with its CI workflow and Dependabot config. The record below is kept as history.
 
 Status: halted (2026-08-29), Kartik's call. Kartik asked for a web interface to browse and read this repo's documentation, following `website-master`'s Astro setup style but scoped down to a personal read-only reader, Nord palette, replacing `dashboard.html` as the workspace's entry point outright (his explicit choice — no kanban reimplementation). Scaffolded as `fjord/` with its own `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md`, same pattern as `personal-website`/Loopwire (Candidate Next Step 3) — that sub-project's docs are the source of truth for phase detail from here. Phase 0 (documentation/decisions), Phase 1 (Nord-palette moodboards — "Nord Terminal" direction picked), Phase 2 (Astro scaffold), and Phase 3 (the actual reading UI — dwm-style status bar, ranger/lf-style source/file-list/preview panes, all 39 in-scope docs live and verified via a running dev server plus a clean `npm run build`) are all complete and committed (`98b3ea3`). Node.js and the `browser-use` CLI were installed on this machine this session (Kartik's explicit request), which also unblocked Phase 2.
 

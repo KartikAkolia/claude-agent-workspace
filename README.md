@@ -1,6 +1,6 @@
 # Github
 
-Kartik's personal Claude Code / Cowork workspace: shared `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` conventions across every project under this folder, plus five read-only ChrisTitusTech reference clones. It also hosts a couple of small projects that grew out of that setup — `fjord/`, a read-only Astro reader for this repo's own docs, and `job-search/`, working notes from an `it-job-search` skill session. See `SPEC.md` for what this project is and `AGENTS.md` for how to work in it.
+Kartik's personal Claude Code / Cowork workspace: shared `AGENTS.md`/`SPEC.md`/`ROADMAP.md`/`TASKS.md` conventions across every project under this folder, plus five read-only ChrisTitusTech reference clones. It also hosts a couple of small projects that grew out of that setup — `job-search/`, working notes from an `it-job-search` skill session. See `SPEC.md` for what this project is and `AGENTS.md` for how to work in it.
 
 ## Quick start: replicating this Claude Code setup on a fresh Debian host
 
@@ -49,9 +49,8 @@ Three GitHub Actions workflows under `.github/workflows/`, none of them a blocki
 
 - `lint.yml` — re-runs `lint-markdown.sh` on every push/PR, a backstop for a `--no-verify` bypass or a commit made on a machine without the hook wired up.
 - `gitleaks.yml` — secret scanning on every push/PR.
-- `fjord-ci.yml` — `astro check` plus `astro build` for `fjord/`, path-filtered so it only runs when `fjord/**` actually changes.
 
-`dependabot.yml` adds weekly npm update checks scoped to `/fjord` (the only subfolder with a `package.json` that isn't a read-only reference clone or an untracked separate repo).
+`fjord-ci.yml` and `dependabot.yml`, which built and updated the `fjord/` Astro site, were removed with it on 2026-10-21.
 
 Full breakdown — exact versions, which packages come from third-party apt repos (`gh`), which MCP connectors are cloud/account-based rather than local packages (Gmail, Google Drive, Microsoft 365, etc.), the two enabled plugins, and a skill-by-skill dependency table — is in [`docs/debian-host-claude-setup.md`](docs/debian-host-claude-setup.md).
 
@@ -69,5 +68,4 @@ Full breakdown — exact versions, which packages come from third-party apt repo
 - `scripts/xppen-tablet/README.md` — XP-Pen's official tablet driver on `asus-vivobook`, repackaged from the vendor tarball as a local pacman package with a seat-scoped udev rule. Covers build, upgrade, removal, verification, and how it differs from the vendor's `install.sh`.
 - `docs/claude-plugins-setup.md` — the project-scoped Claude Code plugins (frontend-design, Playwright, MemPalace, OmniRoute) and opt-in Headroom proxy, with per-OS runtime installs.
 - `docs/README-plugin-setup.md` — what the 2026-10-16 plugin setup actually did on the Mac and what's still left to run.
-- `fjord/AGENTS.md` / `fjord/SPEC.md` — the Astro doc-reader subproject: what it renders, its own read-only non-negotiables, deployment on hold pending Kartik's review.
 - `job-search/README.md` — Kartik's personal IT job-search working notes (target roles, gap analysis, CV state, action plan); the reusable domain research backing it lives in `.claude/skills/it-job-search/references/`.
