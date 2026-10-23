@@ -130,13 +130,44 @@ as_owner() {
 	fi
 }
 
-# place SRC DEST MODE — copy a staged file into the server directory.
-place() {
+# place SRC DEST MODE — copy beside the destination, then rename atomically.
+place() (
+	# This subshell owns its cleanup variable even after callers unwind on error.
+	place_staged=$(as_owner mktemp "$(dirname "$2")/.install-file.XXXXXX") || return
+	trap 'as_owner rm -f -- "$place_staged" || true' EXIT
 	if [[ $service_mode == system ]]; then
-		sudo install -o "$SYSTEM_USER" -g "$system_group" -m "$3" "$1" "$2"
+		sudo install -o "$SYSTEM_USER" -g "$system_group" -m "$3" "$1" "$place_staged" || return
 	else
-		install -m "$3" "$1" "$2"
+		install -m "$3" "$1" "$place_staged" || return
 	fi
+	as_owner mv -fT -- "$place_staged" "$2"
+)
+
+# Keep artifact backups private to the installer, including in system mode.
+artifact_cmd() {
+	if [[ $service_mode == system ]]; then sudo "$@"; else "$@"; fi
+}
+remember_artifact() {
+	local dest=$1 backup=''
+	[[ ! ${saved_artifacts[$dest]+saved} ]] || return 0
+	if as_owner test -e "$dest" || as_owner test -L "$dest"; then
+		backup=$tmp/artifact.${#artifact_paths[@]}
+		artifact_cmd cp -a -- "$dest" "$backup" || return
+	fi
+	printf '%s\t%s\n' "$dest" "$backup" >>"$tmp/recovery-map"
+	saved_artifacts[$dest]=1
+	artifact_paths+=("$dest") artifact_backups+=("$backup")
+}
+rollback_artifacts() {
+	local i failed=false
+	for ((i = ${#artifact_paths[@]} - 1; i >= 0; i--)); do
+		if [[ -n ${artifact_backups[i]} ]]; then
+			artifact_cmd mv -fT -- "${artifact_backups[i]}" "${artifact_paths[i]}" || failed=true
+		else
+			as_owner rm -f -- "${artifact_paths[i]}" || failed=true
+		fi
+	done
+	! $failed
 }
 
 # write_file DEST MODE <content — stage stdin, then place it.
@@ -208,23 +239,47 @@ if ((${#missing[@]})); then
 fi
 
 tmp=$(mktemp -d)
-boot_pid=''
+boot_pid='' boot_stop_failed=false
+artifacts_pending=false artifact_paths=() artifact_backups=()
+declare -A saved_artifacts
 # Whatever way the script ends, a first-boot server must not outlive it.
 finished=false stopped_units=()
 # on_exit — stop a first-boot server, and if the script dies after stopping
 # a running server, say so: nothing restarts it automatically.
 on_exit() {
-	[[ -z $boot_pid ]] || shut_down_boot
-	rm -rf "$tmp"
+	local status=$? keep_tmp=false
+	if [[ -n $boot_pid ]]; then
+		if $boot_stop_failed || ! shut_down_boot; then
+			warn "first-boot shutdown is unfinished; do not start another server. PID file: $boot_pidfile; logs: $tmp"
+			status=1 keep_tmp=true
+		fi
+	fi
+	if $artifacts_pending; then
+		if rollback_artifacts; then
+			warn "restored the previous launcher, managed mods and install state after the failed update"
+		else
+			warn "artifact recovery failed; do not start the server. Backups and destination map are in $tmp"
+			status=1 keep_tmp=true
+		fi
+	fi
+	$keep_tmp || rm -rf "$tmp"
 	if ! $finished && ((${#stopped_units[@]})); then
 		local scope hints=()
 		for scope in "${stopped_units[@]}"; do
 			if [[ $scope == user ]]; then hints+=("systemctl --user start $UNIT_NAME"); else hints+=("sudo systemctl start $UNIT_NAME"); fi
 		done
-		warn "the server was stopped for this update and is still down; start it again with: ${hints[0]}${hints[1]:+, then ${hints[1]}}"
+		if $keep_tmp; then
+			warn "the service was stopped; finish recovery before starting it again"
+		else
+			warn "the server was stopped for this update and is still down; rerun the installer before starting it with: ${hints[0]}${hints[1]:+, then ${hints[1]}}"
+		fi
 	fi
+	exit "$status"
 }
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 fetch() { curl -fsSL --proto =https --proto-redir =https -A "$USER_AGENT" "$@"; }
 
@@ -294,12 +349,62 @@ peek() {
 	sudo "$@" 2>/dev/null
 }
 
+read_geyser_ports() {
+	local config port
+	# Read the scalar settings in Geyser's generated block-style YAML without
+	# requiring a YAML package. Reject unsupported values rather than open a
+	# guessed port. Indentation, quoted scalars and comments are accepted.
+	config=$(peek cat "$server_dir/config/Geyser-Fabric/config.yml" || true)
+	port=$(python3 -Ic '
+import re, sys
+settings = {}
+stack = []
+for line in sys.stdin:
+    match = re.fullmatch(r"( *)([\w-]+):(?:\s+(.*))?\s*", line.rstrip())
+    if not match:
+        continue
+    indent, key, value = match.groups()
+    while stack and stack[-1][0] >= len(indent):
+        stack.pop()
+    path = ".".join([entry[1] for entry in stack] + [key])
+    value = (value or "").split("#", 1)[0].strip()
+    if value and path in ("bedrock", "bedrock.signaling"):
+        sys.exit("Use block-style mappings for Geyser " + path)
+    if not value:
+        stack.append((len(indent), key))
+    else:
+        settings[path] = value.strip("\"\x27").lower()
+def port(key, default):
+    value = settings.get(key, str(default))
+    if not value.isdecimal() or not 0 <= int(value) <= 65535:
+        sys.exit("Invalid Geyser port: " + key)
+    return int(value)
+base = port("bedrock.port", sys.argv[2])
+if not base:
+    sys.exit("Geyser bedrock.port must be a fixed nonzero port")
+clone = settings.get("bedrock.clone-remote-port", "false")
+if clone not in ("true", "false"):
+    sys.exit("Invalid Geyser clone-remote-port; use true or false")
+if clone == "true":
+    base = int(sys.argv[1])
+udp = port("bedrock.webrtc-port", 0) or base
+tcp = port("bedrock.signaling.port", 0) or base
+mode = settings.get("bedrock.signaling.mode", "builtin")
+if mode not in ("builtin", "hybrid", "nxs"):
+    sys.exit("Invalid Geyser signaling mode: " + mode)
+# Built-in signaling falls back to NXS when Java already owns its TCP port.
+if mode == "nxs" or tcp == int(sys.argv[1]):
+    tcp = 0
+print(udp, tcp)' "$java_port" "$BEDROCK_PORT" <<<"$config") || die "couldn't resolve Geyser ports in $server_dir/config/Geyser-Fabric/config.yml"
+	read -r bedrock_port signaling_port <<<"$port"
+}
+
 # read_existing — what an earlier run recorded: a rerun keeps its type and
 # mode by default, and the version is checked before the world moves on.
 read_existing() {
 	local state port
 	previous_version='' previous_type='' previous_mode='' previous_launcher='' java_port=$JAVA_PORT
-	previous_jars=() previous_heap='' bedrock_port=$BEDROCK_PORT
+	previous_jars=() previous_heap='' bedrock_port=$BEDROCK_PORT signaling_port=$BEDROCK_PORT
 	[[ -d $server_dir ]] || return 0
 	[[ -r $server_dir && -x $server_dir ]] || info "Reading the existing install in $server_dir with sudo"
 	state=$(peek cat "$server_dir/$STATE_FILE" || true)
@@ -318,10 +423,7 @@ read_existing() {
 	fi
 	port=$(peek cat "$server_dir/server.properties" | sed -n 's/^server-port=//p' || true)
 	[[ ! $port =~ ^[0-9]+$ ]] || java_port=$port
-	# Geyser's own port, if its config moved it off the default.
-	port=$(peek cat "$server_dir/config/Geyser-Fabric/config.yml" |
-		awk '/^[^ #]/ { in_bedrock = /^bedrock:/ } in_bedrock && /^  port:/ { print $2; exit }' || true)
-	[[ ! $port =~ ^[0-9]+$ ]] || bedrock_port=$port
+
 }
 read_existing
 
@@ -418,6 +520,7 @@ geyser) wanted_mods=(fabric-api geyser) ;;
 floodgate) wanted_mods=(fabric-api geyser floodgate) ;;
 *) die "--type must be java, geyser or floodgate" ;;
 esac
+[[ $server_type == java ]] || read_geyser_ports
 
 # A rerun keeps the cap the last run set.
 [[ -n $heap ]] || heap=$previous_heap
@@ -585,6 +688,34 @@ unit_file_for() {
 unit_path=''
 [[ $service_mode == none ]] || unit_path=$(unit_file_for "$service_mode")
 
+# Jar name patterns of the mods this script manages.
+declare -A mod_patterns=(
+	["fabric-api"]='fabric-api-[0-9]*.jar'
+	[geyser]='Geyser-Fabric-*.jar'
+	[floodgate]='Floodgate-Fabric-*.jar'
+)
+
+# Never delete or overwrite an unrecorded custom build. A matching upstream
+# artifact can be adopted, including installations made before the state file.
+for slug in "${wanted_mods[@]}"; do
+	IFS=$'\t' read -r filename sha512 _ <<<"${mod_files[$slug]}"
+	peek test -d "$server_dir/mods" || continue
+	jars=$(peek find "$server_dir/mods" -maxdepth 1 -iname "${mod_patterns[$slug]}" -printf '%f\n') ||
+		die "can't inspect existing mods in $server_dir"
+	while IFS= read -r old; do
+		[[ -n $old ]] || continue
+		managed=false
+		for recorded in "${previous_jars[@]}"; do
+			[[ $old != "$recorded" ]] || managed=true
+		done
+		$managed && continue
+		if [[ $old == "$filename" ]] && peek sha512sum -c --status <<<"$sha512  $server_dir/mods/$old"; then
+			continue
+		fi
+		die "unmanaged mods/$old conflicts with $slug; move it out of mods/ before rerunning (it has been left untouched)"
+	done <<<"$jars"
+done
+
 # --- confirm -----------------------------------------------------------------
 
 mods_summary=
@@ -604,7 +735,7 @@ cat <<EOF
 	system) echo "systemd system unit $unit_path, user $SYSTEM_USER" ;;
 	none) echo "start.sh only" ;;
 	esac)
-  Ports          TCP $java_port$([[ $server_type == java ]] || echo ", TCP+UDP $bedrock_port (Bedrock over NetherNet)")
+  Ports          TCP $java_port$([[ $server_type == java ]] || echo ", UDP $bedrock_port$(if ((signaling_port)); then echo ", TCP $signaling_port"; fi) (Bedrock over NetherNet)")
 
 EOF
 
@@ -670,9 +801,14 @@ ctl_in() {
 	if [[ $scope == user ]]; then systemctl --user "$@"; else sudo systemctl "$@"; fi
 }
 service_ctl() { ctl_in "$service_mode" "$@"; }
-# is-active needs no root in either scope.
+# Reading ActiveState needs no root. Include queued restarts and shutdowns.
+state_in() {
+	if [[ $1 == user ]]; then systemctl --user show -p ActiveState --value "$UNIT_NAME"; else systemctl show -p ActiveState --value "$UNIT_NAME"; fi
+}
 active_in() {
-	if [[ $1 == user ]]; then systemctl --user is-active -q "$UNIT_NAME"; else systemctl is-active -q "$UNIT_NAME"; fi
+	local state
+	state=$(state_in "$1") || return 1
+	[[ -n $state && $state != inactive && $state != failed ]]
 }
 user_bus=false
 systemctl --user show-environment >/dev/null 2>&1 && user_bus=true
@@ -698,9 +834,12 @@ serving_unit_active() {
 if ! command -v ss >/dev/null; then
 	warn "ss (iproute2) isn't installed, so a server started from start.sh can't be detected; make sure none is running"
 elif ! serving_unit_active && [[ -n $(ss -Hltn "sport = :$java_port" 2>/dev/null)$(
-	[[ $server_type == java ]] || ss -Hltun "sport = :$bedrock_port" 2>/dev/null
+	if [[ $server_type != java ]]; then
+		ss -Hlun "sport = :$bedrock_port" 2>/dev/null
+		((signaling_port == 0)) || ss -Hltn "sport = :$signaling_port" 2>/dev/null
+	fi
 ) ]]; then
-	warn "something is already listening on TCP $java_port or TCP/UDP $bedrock_port. If it's this server running from start.sh, stop it first: updating jars under a running server can break it."
+	warn "something is already listening on a selected server port (Java TCP $java_port, Bedrock UDP $bedrock_port, signaling TCP $signaling_port). If it's this server running from start.sh, stop it first: updating jars under a running server can break it."
 	confirm "Continue anyway?" n || die "cancelled"
 fi
 
@@ -716,13 +855,18 @@ if $have_systemd; then
 			[[ $scope == system ]] || $user_bus ||
 				die "$file also serves $server_dir, but there's no user systemd session here to stop or remove it; rerun from a normal login"
 		fi
-		if active_in "$scope" 2>/dev/null; then
+		state=$(state_in "$scope") || die "can't inspect the $scope unit $UNIT_NAME"
+		[[ -n $state ]] || die "no state reported for the $scope unit $UNIT_NAME"
+		if [[ $state != inactive && $state != failed ]]; then
 			confirm "The $scope unit $UNIT_NAME is running. Stop it to update (players will be disconnected)?" y ||
 				die "cancelled"
-			ctl_in "$scope" stop "$UNIT_NAME"
 			stopped_units+=("$scope")
 			was_running=true
 		fi
+		# Stop even an inactive unit to cancel queued jobs before any writes.
+		ctl_in "$scope" stop "$UNIT_NAME"
+		state=$(state_in "$scope") || die "can't verify the $scope unit stopped"
+		[[ $state == inactive || $state == failed ]] || die "the $scope unit is still $state; refusing to update"
 		if [[ $scope != "$service_mode" ]]; then
 			if confirm "Disable and remove the old $scope unit $file for this directory?" y; then
 				ctl_in "$scope" disable -q "$UNIT_NAME" || true
@@ -745,14 +889,20 @@ else
 fi
 as_owner mkdir -p "$server_dir/mods"
 
-[[ ! -f $tmp/launcher.jar ]] || place "$tmp/launcher.jar" "$server_dir/fabric-server-launch.jar" 644
+artifacts_pending=true
+if [[ -f $tmp/launcher.jar ]]; then
+	remember_artifact "$server_dir/fabric-server-launch.jar"
+	place "$tmp/launcher.jar" "$server_dir/fabric-server-launch.jar" 644
+fi
+# Install all replacements before removing any previously managed versions.
+for slug in "${wanted_mods[@]}"; do
+	IFS=$'\t' read -r filename _ <<<"${mod_files[$slug]}"
+	if [[ -f $tmp/mods/$filename ]]; then
+		remember_artifact "$server_dir/mods/$filename"
+		place "$tmp/mods/$filename" "$server_dir/mods/$filename" 644
+	fi
+done
 
-# Jar name patterns of the mods this script manages.
-declare -A mod_patterns=(
-	["fabric-api"]='fabric-api-[0-9]*.jar'
-	[geyser]='Geyser-Fabric-*.jar'
-	[floodgate]='Floodgate-Fabric-*.jar'
-)
 # Jars a previous run recorded but this one doesn't want (another version, or
 # a mod dropped from the server type).
 for old in "${previous_jars[@]}"; do
@@ -761,26 +911,24 @@ for old in "${previous_jars[@]}"; do
 		[[ ${mod_files[$slug]%%$'\t'*} != "$old" ]] || keep=true
 	done
 	if ! $keep && as_owner test -e "$server_dir/mods/$old"; then
+		remember_artifact "$server_dir/mods/$old"
 		as_owner rm -f -- "$server_dir/mods/$old"
 		info "Removed mods/$old (no longer part of this '$server_type' server)"
 	fi
 done
-for slug in fabric-api geyser floodgate; do
-	if [[ -z ${mod_files[$slug]:-} ]]; then
-		# Recorded jars were removed above; anything else is someone's own.
-		leftover=$(as_owner find "$server_dir/mods" -maxdepth 1 -iname "${mod_patterns[$slug]}" -printf '%f ')
-		[[ -z $leftover ]] || info "Left ${leftover% } in mods/: not installed by this script, so not removed for a '$server_type' server"
-		continue
-	fi
-	IFS=$'\t' read -r filename _ <<<"${mod_files[$slug]}"
-	[[ ! -f $tmp/mods/$filename ]] || place "$tmp/mods/$filename" "$server_dir/mods/$filename" 644
-	# Then drop any other version of the same mod so two copies never load.
-	# Compared as a string, not passed to find -name, which would treat any
-	# glob characters in the real filename as a pattern.
-	while IFS= read -r -d '' old; do
-		[[ ${old##*/} == "$filename" ]] || as_owner rm -f -- "$old"
-	done < <(as_owner find "$server_dir/mods" -maxdepth 1 -iname "${mod_patterns[$slug]}" -print0)
-done
+
+remember_artifact "$server_dir/$STATE_FILE"
+write_file "$server_dir/$STATE_FILE" 644 <<EOF
+# Written by install.sh; read on rerun.
+mc_version=$mc_version
+server_type=$server_type
+loader_version=$loader_version
+installer_version=$installer_version
+service_mode=$service_mode
+heap=$heap
+$(for slug in "${wanted_mods[@]}"; do printf 'mod_%s=%s\n' "$slug" "${mod_files[$slug]%%$'\t'*}"; done)
+EOF
+artifacts_pending=false
 
 if $accept_eula; then
 	echo "eula=true" | write_file "$server_dir/eula.txt" 644
@@ -860,14 +1008,18 @@ EOF
 	# Two servers on one world corrupt it, so refuse beside the service, in
 	# either scope and in every mode (a unit kept from an earlier mode too).
 	cat <<EOF
-if systemctl --user is-active -q $UNIT_NAME 2>/dev/null; then
+case \$(systemctl --user show -p ActiveState --value $UNIT_NAME 2>/dev/null) in
+active|activating|reloading|deactivating|refreshing)
 	echo "$UNIT_NAME (user) is running; stop it first: systemctl --user stop $UNIT_NAME" >&2
 	exit 1
-fi
-if systemctl is-active -q $UNIT_NAME 2>/dev/null; then
+	;;
+esac
+case \$(systemctl show -p ActiveState --value $UNIT_NAME 2>/dev/null) in
+active|activating|reloading|deactivating|refreshing)
 	echo "$UNIT_NAME (system) is running; stop it first: sudo systemctl stop $UNIT_NAME" >&2
 	exit 1
-fi
+	;;
+esac
 EOF
 	cat <<EOF
 cd "\$(dirname "\$(readlink -f "\${BASH_SOURCE[0]}")")"
@@ -880,7 +1032,7 @@ if [[ $service_mode != none ]]; then
 		hardening="User=$SYSTEM_USER
 Group=$system_group
 # The user may predate this directory (its passwd home elsewhere).
-Environment=HOME=$server_dir
+Environment=$(systemd_quote "HOME=$server_dir")
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -927,21 +1079,13 @@ EOF
 	fi
 fi
 
-write_file "$server_dir/$STATE_FILE" 644 <<EOF
-# Written by install.sh; read on rerun.
-mc_version=$mc_version
-server_type=$server_type
-loader_version=$loader_version
-installer_version=$installer_version
-service_mode=$service_mode
-heap=$heap
-$(for slug in "${wanted_mods[@]}"; do printf 'mod_%s=%s\n' "$slug" "${mod_files[$slug]%%$'\t'*}"; done)
-EOF
-
 # --- firewall ----------------------------------------------------------------
 
 ports=("$java_port/tcp")
-[[ $server_type == java ]] || ports+=("$bedrock_port/udp" "$bedrock_port/tcp")
+if [[ $server_type != java ]]; then
+	ports+=("$bedrock_port/udp")
+	((signaling_port == 0)) || ports+=("$signaling_port/tcp")
+fi
 if systemctl is-active -q firewalld 2>/dev/null; then
 	if confirm "firewalld is active. Open ${ports[*]} permanently in its default zone?" n; then
 		for p in "${ports[@]}"; do sudo firewall-cmd -q --permanent --add-port="$p"; done
@@ -985,16 +1129,24 @@ shut_down_boot() {
 			kill "-$1" "$boot_pid"
 		fi 2>/dev/null || true
 	}
+	boot_alive() {
+		alive "$boot_pid" || { [[ -n $java_pid ]] && alive "$java_pid"; }
+	}
 	signal_boot TERM
-	while alive "$boot_pid" && ((SECONDS < wait_until)); do sleep 1; done
-	if alive "$boot_pid"; then
+	while boot_alive && ((SECONDS < wait_until)); do sleep 1; done
+	if boot_alive; then
 		warn "the server didn't stop within 2 minutes; killing it"
 		signal_boot KILL
 		wait_until=$((SECONDS + 15))
-		while alive "$boot_pid" && ((SECONDS < wait_until)); do sleep 1; done
-		! alive "$boot_pid" || warn "couldn't stop the first-boot server (PID ${java_pid:-$boot_pid}); stop it by hand before starting another"
+		while boot_alive && ((SECONDS < wait_until)); do sleep 1; done
+		if boot_alive; then
+			boot_stop_failed=true
+			warn "couldn't stop the first-boot server (PID ${java_pid:-$boot_pid}); stop it by hand before starting another"
+			return 1
+		fi
 	fi
 	as_owner rm -f "$boot_pidfile"
+	wait "$boot_pid" 2>/dev/null || true
 	boot_pid=''
 }
 first_boot() {
@@ -1002,8 +1154,7 @@ first_boot() {
 	boot_pidfile=$server_dir/.first-boot.pid
 	: >"$log"
 	info "First boot: generating the world and configs (can take a few minutes)"
-	# Interrupted (Ctrl-C, a dropped SSH session): stop the server first.
-	trap 'shut_down_boot; exit 130' INT TERM HUP
+	# The global EXIT trap stops this JVM on errors, Ctrl-C or a dropped SSH session.
 	# A PID left by an interrupted earlier run could belong to anything now.
 	as_owner rm -f "$boot_pidfile"
 	# The wrapper records the JVM's own PID (it execs into java), so it can
@@ -1042,7 +1193,6 @@ first_boot() {
 		sleep 2
 	done
 	shut_down_boot
-	trap - INT TERM HUP
 }
 
 if ${needs_first_boot:-false}; then
@@ -1099,7 +1249,14 @@ cat <<EOF
 Done: Minecraft $mc_version Fabric server in $server_dir
   Java players:    ${addresses:-<this host>} port $java_port
 EOF
-[[ $server_type == java ]] || echo "  Bedrock players: ${addresses:-<this host>} port $bedrock_port (TCP + UDP)"
+if [[ $server_type != java ]]; then
+	echo "  Bedrock gameplay: ${addresses:-<this host>} UDP $bedrock_port"
+	if ((signaling_port)); then
+		echo "  Bedrock signaling: ${addresses:-<this host>} TCP $signaling_port"
+	else
+		echo "  Bedrock signaling: external NXS service (no separate TCP listener)"
+	fi
+fi
 case $service_mode in
 user)
 	echo "  Manage:          systemctl --user start|stop|status $UNIT_NAME; journalctl --user -u $UNIT_NAME -f"
