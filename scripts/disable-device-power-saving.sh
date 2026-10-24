@@ -1,116 +1,282 @@
 #!/usr/bin/env bash
-# disable-device-power-saving.sh — keep every USB and PCI device on
-# asus-vivobook (Arch, GRUB, mkinitcpio) fully powered: no USB autosuspend,
-# no PCI runtime PM, no NVIDIA dGPU runtime suspend, no PCIe ASPM power
-# saving, no NVMe APST, no HDA audio power_save, no Wi-Fi powersave.
-# System suspend/hibernate/lid handling is deliberately left untouched.
-#
-# Installs, all via sudo (so run it in a real terminal):
-#   /etc/udev/rules.d/99-no-runtime-pm.rules        power/control=on for usb+pci
-#   /etc/modprobe.d/no-power-saving.conf            hda, nvidia, iwlmvm options
-#   /etc/NetworkManager/conf.d/wifi-powersave-off.conf
-#   /etc/default/grub                               cmdline params (backup kept
-#                                                   as /etc/default/grub.bak-nopm)
-# then regenerates grub.cfg and the initramfs (the kms hook pulls nvidia into
-# it, and the modconf hook bakes in the modprobe.d options), and applies what
-# it can to the running system. The NVIDIA, NVMe and ASPM changes need a
-# reboot to fully land.
-#
-# Kernel params go on the cmdline rather than in modprobe.d because usbcore is
-# built into this kernel (modprobe.d options never reach it) and pcie_aspm is
-# not a module at all.
-#
-#   scripts/disable-device-power-saving.sh
-# Rerun-safe. To undo: `sudo rm` the three new files, restore the grub backup,
-# then `sudo grub-mkconfig -o /boot/grub/grub.cfg && sudo mkinitcpio -P`.
-
+# Disable device power saving on asus-vivobook (Arch, GRUB, mkinitcpio).
+# Keep this file beside device-power-saving-config.py. Requires Python 3,
+# NetworkManager, iw and kmod. Suspend, hibernate and lid policy are untouched.
+# Run: scripts/disable-device-power-saving.sh
+# Undo: scripts/disable-device-power-saving.sh --undo BACKUP_DIRECTORY
+# Each successful run prints its private backup path. Undo runs in reverse order.
+# Undo preserves unrelated later GRUB edits and refuses conflicting file/profile
+# edits. Reboot after install OR undo; live sysfs values persist until reboot.
+# Recovery after an incomplete rollback: --recover BACKUP_DIRECTORY.
+# Requires the modconf hook in mkinitcpio presets for early-loaded modules.
+# Needs enough space under /var/lib to snapshot /boot before each run.
+# GRUB defaults must have one literal quoted assignment (no expansions).
+# Do not delete backup directories until their runs have been undone.
+# Failed installs restore config, profiles and existing /boot files. Backups
+# remain for recovery, including failed rollback. This is not power-loss atomic.
 set -euo pipefail
 
-readonly RULE_FILE=/etc/udev/rules.d/99-no-runtime-pm.rules
-readonly MODPROBE_FILE=/etc/modprobe.d/no-power-saving.conf
-readonly NM_FILE=/etc/NetworkManager/conf.d/wifi-powersave-off.conf
+if ((EUID != 0)); then
+	exec sudo -- bash "$0" "$@"
+fi
+umask 077
+readonly STATE_ROOT=/var/lib/device-power-saving
 readonly GRUB_FILE=/etc/default/grub
-readonly CMDLINE_PARAMS=(usbcore.autosuspend=-1 pcie_aspm.policy=performance nvme_core.default_ps_max_latency_us=0)
-
+readonly BOOT_DIR=/boot
+# Presets writing outside /boot need their own backup before using this script.
+HELPER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/device-power-saving-config.py"
+readonly HELPER
+readonly FILES=(/etc/udev/rules.d/99-no-runtime-pm.rules /etc/modprobe.d/no-power-saving.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf "$GRUB_FILE")
 die() {
-	printf 'error: %s\n' "$1" >&2
+	echo "error: $*" >&2
 	exit 1
 }
+for tool in python3 grub-mkconfig mkinitcpio modprobe nmcli iw udevadm flock; do
+	command -v "$tool" >/dev/null || die "$tool not found"
+done
+[[ -f $HELPER ]] || die "missing $HELPER"
+mkdir -p "$STATE_ROOT"
+exec 9>"$STATE_ROOT/lock"
+flock -n 9 || die "another power-policy operation is running"
 
-command -v grub-mkconfig >/dev/null || die "grub-mkconfig not found"
-command -v mkinitcpio >/dev/null || die "mkinitcpio not found"
-grep -q '^GRUB_CMDLINE_LINUX_DEFAULT="' "$GRUB_FILE" || die "no GRUB_CMDLINE_LINUX_DEFAULT in $GRUB_FILE"
+# Copy beside a destination, retaining metadata, then rename. Failed staging
+# never truncates a live file; EXIT cleans abandoned sibling staging files.
+place() (
+	local source=$1 destination=$2 staged
+	staged=$(mktemp "$(dirname "$destination")/.device-power.XXXXXX") || return
+	trap 'rm -f -- "$staged"' EXIT
+	cp --preserve=all -- "$source" "$staged" || return
+	mv -fT -- "$staged" "$destination"
+)
+profile_value() {
+	local value
+	value=$(nmcli -g 802-11-wireless.powersave connection show uuid "$1")
+	value=${value%% *}
+	[[ $value =~ ^[0-3]$ ]] || return 1
+	printf '%s\n' "$value"
+}
+restore_profiles() {
+	local uuid value failed=0
+	while read -r uuid value; do
+		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave "$value" || failed=1
+	done <"$1/profiles"
+	return "$failed"
+}
+restore_files() {
+	local dir=$1 i failed=0
+	for i in "${!FILES[@]}"; do
+		if [[ -f $dir/before/$i ]]; then
+			place "$dir/before/$i" "${FILES[i]}" || failed=1
+		else
+			rm -f -- "${FILES[i]}" || failed=1
+		fi
+	done
+	return "$failed"
+}
+# Restore transaction bookkeeping if final publication itself failed.
+restore_cursor() {
+	local dir=$1 parent
+	parent=$(cat "$dir/parent") || return
+	rm -f -- "$dir/complete" || return
+	if [[ -f $dir/undo-source ]]; then
+		rm -f -- "$(cat "$dir/undo-source")/undone" || return
+	fi
+	if [[ -n $parent ]]; then
+		ln -sfnT "$parent" "$STATE_ROOT/current"
+	else
+		rm -f -- "$STATE_ROOT/current"
+	fi
+}
+backup='' pending=false
+finish() {
+	local status=$? failed=false
+	trap - EXIT INT TERM HUP
+	if $pending; then
+		echo "Installation failed; restoring from $backup" >&2
+		restore_files "$backup" || failed=true
+		restore_profiles "$backup" || failed=true
+		# Restore all pre-existing boot artifacts, including images partially
+		# overwritten by a failed mkinitcpio. Old grub.cfg references old images.
+		cp -a -- "$backup/boot/." "$BOOT_DIR/" || failed=true
+		restore_cursor "$backup" || failed=true
+		udevadm control --reload || failed=true
+		nmcli general reload conf || failed=true
+		if $failed; then
+			echo "RECOVERY INCOMPLETE: do not reboot; retry: $0 --recover $backup" >&2
+		else
+			rm -f -- "$backup/pending"
+			echo "Previous config, profiles and boot files restored; backup: $backup" >&2
+		fi
+		status=1
+	fi
+	exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-# Named 99- so it runs after 60-autosuspend.rules, which sets "auto" for
-# devices hwdb marks ID_AUTOSUSPEND=1. "bind" catches drivers that re-enable
-# runtime PM when they attach.
-rule='# Installed by scripts/disable-device-power-saving.sh — keep USB and PCI
-# devices out of runtime suspend.
+if [[ ${1:-} == --recover ]]; then
+	[[ $# == 2 ]] || die "usage: $0 --recover BACKUP_DIRECTORY"
+	backup=$(readlink -f "$2")
+	[[ $backup == "$STATE_ROOT"/run.* && -f $backup/before/3 && -d $backup/boot && -f $backup/profiles && -f $backup/parent && -f $backup/pending && ! -f $backup/complete ]] || die "not an incomplete recovery backup"
+	# Recovery restores whole snapshots; unlike undo, run this immediately,
+	# before making other changes. Reuse the normal error cleanup on failure.
+	pending=true
+	restore_files "$backup"
+	restore_profiles "$backup"
+	cp -a -- "$backup/boot/." "$BOOT_DIR/"
+	restore_cursor "$backup"
+	udevadm control --reload
+	nmcli general reload conf
+	pending=false
+	rm -f -- "$backup/pending"
+	echo "Recovered $backup. Reboot before relying on device policy."
+	exit 0
+fi
+
+# Do not snapshot a partially recovered policy as a new starting state.
+for previous in "$STATE_ROOT"/run.*/pending; do
+	[[ ! -f $previous || -f ${previous%/pending}/complete ]] ||
+		die "unfinished recovery; run: $0 --recover ${previous%/pending}"
+done
+
+if [[ ${1:-} == --undo ]]; then
+	[[ $# == 2 ]] || die "usage: $0 --undo BACKUP_DIRECTORY"
+	backup=$(readlink -f "$2")
+	[[ $backup == "$STATE_ROOT"/run.* && -f $backup/complete && ! -e $backup/undone ]] || die "not a completed, unconsumed backup"
+	[[ $(readlink -f "$STATE_ROOT/current") == "$backup" ]] || die "undo the most recent run first"
+	# Refuse undo out of order and preserve later user edits rather than
+	# overwriting them with an old whole-file snapshot.
+	for i in 0 1 2; do
+		cmp -s "${FILES[i]}" "$backup/after/$i" || die "${FILES[i]} changed; reconcile it before undo"
+	done
+	while read -r uuid value; do
+		[[ $(profile_value "$uuid") == 2 ]] || die "Wi-Fi profile $uuid changed; reconcile it before undo"
+	done <"$backup/profiles"
+	python3 "$HELPER" undo-grub "$GRUB_FILE" "$backup/before/3" >"$backup/undo-grub"
+	# An undo is itself recoverable. Snapshot its starting config and boot
+	# files before touching them; retain the original backup for retries.
+	source_backup=$backup
+	backup=$(mktemp -d "$STATE_ROOT/run.XXXXXX")
+else
+	[[ $# == 0 ]] || die "usage: $0 [--undo|--recover BACKUP_DIRECTORY]"
+	backup=$(mktemp -d "$STATE_ROOT/run.XXXXXX")
+fi
+: >"$backup/parent"
+[[ ! -L $STATE_ROOT/current ]] || readlink -f "$STATE_ROOT/current" >"$backup/parent"
+mkdir "$backup/before" "$backup/after"
+for i in "${!FILES[@]}"; do
+	file=${FILES[i]}
+	[[ -d $(dirname "$file") ]] || die "missing configuration directory for $file"
+	[[ ! -L $file && (! -e $file || -f $file) ]] || die "refusing non-regular configuration: $file"
+	[[ ! -f $file ]] || cp -a -- "$file" "$backup/before/$i"
+done
+[[ -f $backup/before/3 && -f $BOOT_DIR/grub/grub.cfg ]] || die "GRUB defaults or generated config missing"
+# Snapshot all /boot outputs: mkinitcpio presets may use custom image names.
+# Sufficient space is required; a failed snapshot precedes all managed writes.
+cp -a -- "$BOOT_DIR" "$backup/boot"
+: >"$backup/profiles"
+nmcli -t -f UUID,TYPE connection show >"$backup/profile-list"
+while IFS=: read -r uuid type; do
+	[[ $type == 802-11-wireless || $type == wifi ]] || continue
+	value=$(profile_value "$uuid") || die "cannot read Wi-Fi policy for $uuid"
+	printf '%s %s\n' "$uuid" "$value" >>"$backup/profiles"
+done <"$backup/profile-list"
+
+if [[ -n ${source_backup:-} ]]; then
+	cp -a -- "$source_backup/undo-grub" "$backup/new-grub"
+else
+	python3 "$HELPER" grub "$GRUB_FILE" >"$backup/new-grub"
+fi
+# Retain permissions, owner and labels of the GRUB defaults.
+cp --attributes-only --preserve=all "$GRUB_FILE" "$backup/new-grub"
+bash -n "$backup/new-grub"
+[[ -z ${source_backup:-} ]] || printf '%s\n' "$source_backup" >"$backup/undo-source"
+touch "$backup/pending"
+pending=true
+if [[ -n ${source_backup:-} ]]; then
+	for i in 0 1 2; do
+		if [[ -f $source_backup/before/$i ]]; then
+			place "$source_backup/before/$i" "${FILES[i]}"
+		else
+			rm -f -- "${FILES[i]}"
+		fi
+	done
+	restore_profiles "$source_backup"
+else
+	cat >"$backup/after/0" <<'EOF'
+# Installed by disable-device-power-saving.sh
 ACTION=="add|bind", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
-ACTION=="add|bind", SUBSYSTEM=="pci", TEST=="power/control", ATTR{power/control}="on"'
-
-# NVreg_DynamicPowerManagement=0x00 turns off the dGPU's RTD3 runtime suspend
-# (the driver defaults to 3 = fine-grained on this laptop). iwlmvm
-# power_scheme=1 is "active" (no power saving).
-modprobe_conf='# Installed by scripts/disable-device-power-saving.sh
+ACTION=="add|bind", SUBSYSTEM=="pci", TEST=="power/control", ATTR{power/control}="on"
+EOF
+	cat >"$backup/after/1" <<'EOF'
+# Installed by disable-device-power-saving.sh
 options snd_hda_intel power_save=0 power_save_controller=N
 options nvidia NVreg_DynamicPowerManagement=0x00
-options iwlmvm power_scheme=1'
-
-# wifi.powersave: 2 = disable.
-nm_conf='# Installed by scripts/disable-device-power-saving.sh
+options iwlmvm power_scheme=1
+EOF
+	cat >"$backup/after/2" <<'EOF'
+# Installed by disable-device-power-saving.sh
 [connection]
-wifi.powersave = 2'
-
-printf 'Installing %s, %s and %s.\n' "$RULE_FILE" "$MODPROBE_FILE" "$NM_FILE"
-printf '%s\n' "$rule" | sudo tee "$RULE_FILE" >/dev/null
-printf '%s\n' "$modprobe_conf" | sudo tee "$MODPROBE_FILE" >/dev/null
-printf '%s\n' "$nm_conf" | sudo tee "$NM_FILE" >/dev/null
-
-[ -f "$GRUB_FILE.bak-nopm" ] || sudo cp -p "$GRUB_FILE" "$GRUB_FILE.bak-nopm"
-for param in "${CMDLINE_PARAMS[@]}"; do
-	key="${param%%=*}"
-	if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=\".*\b${key//./\\.}=" "$GRUB_FILE"; then
-		sudo sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/s/\b${key//./\\.}=[^ \"]*/$param/" "$GRUB_FILE"
-	else
-		sudo sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/s/\"$/ $param\"/" "$GRUB_FILE"
-	fi
-done
-grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE"
-# The append above only matches a line ending in the closing quote; fail
-# rather than build a grub.cfg that silently lacks a parameter.
-for param in "${CMDLINE_PARAMS[@]}"; do
-	grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=\".*\b${param//./\\.}\b" "$GRUB_FILE" ||
-		die "$param did not land in $GRUB_FILE; add it by hand and rerun"
-done
-
-sudo grub-mkconfig -o /boot/grub/grub.cfg
-sudo mkinitcpio -P
-
-# Apply to the running system. Failures here are non-fatal: whatever doesn't
-# take now takes on the next boot.
-echo "Applying to the running system..."
-sudo udevadm control --reload
-echo -1 | sudo tee /sys/module/usbcore/parameters/autosuspend >/dev/null || true
-for ctl in /sys/bus/usb/devices/*/power/control /sys/bus/pci/devices/*/power/control; do
-	echo on | sudo tee "$ctl" >/dev/null 2>&1 || true
-done
-echo performance | sudo tee /sys/module/pcie_aspm/parameters/policy >/dev/null 2>&1 ||
-	echo "  ASPM policy not writable now (firmware-controlled or needs reboot)"
-if [ -e /sys/module/snd_hda_intel/parameters/power_save ]; then
-	echo 0 | sudo tee /sys/module/snd_hda_intel/parameters/power_save >/dev/null || true
-	echo N | sudo tee /sys/module/snd_hda_intel/parameters/power_save_controller >/dev/null || true
+wifi.powersave=2
+EOF
+	for i in 0 1 2; do
+		chmod 644 "$backup/after/$i"
+		if [[ -f $backup/before/$i ]]; then
+			cp --attributes-only --preserve=all "$backup/before/$i" "$backup/after/$i"
+		fi
+		place "$backup/after/$i" "${FILES[i]}"
+	done
+	modprobe --showconfig >"$backup/effective-modules"
+	python3 "$HELPER" modules <"$backup/effective-modules"
+	while read -r uuid value; do
+		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave 2
+		[[ $(profile_value "$uuid") == 2 ]] || die "Wi-Fi profile $uuid did not retain the policy"
+	done <"$backup/profiles"
 fi
-for dev in /sys/class/net/*/wireless; do
-	[ -e "$dev" ] || continue
-	iface="${dev%/wireless}"
-	iface="${iface##*/}"
-	if command -v iw >/dev/null; then
-		sudo iw dev "$iface" set power_save off || true
+place "$backup/new-grub" "$GRUB_FILE"
+# Build images first. A failure in either build restores the /boot snapshot.
+mkinitcpio -P
+grub-mkconfig -o "$BOOT_DIR/grub/grub.cfg"
+if [[ -z ${source_backup:-} ]]; then
+	python3 "$HELPER" boot <"$BOOT_DIR/grub/grub.cfg"
+fi
+udevadm control --reload
+nmcli general reload conf
+if [[ -n ${source_backup:-} ]]; then
+	touch "$source_backup/undone"
+	parent=$(cat "$source_backup/parent")
+	if [[ -n $parent && -d $parent ]]; then
+		ln -sfnT "$parent" "$STATE_ROOT/current"
 	else
-		echo "  iw not installed; $iface powersave goes off after NetworkManager reconnects"
+		rm -f "$STATE_ROOT/current"
 	fi
-done
-sudo systemctl reload NetworkManager || true
+else
+	cp -a -- "$GRUB_FILE" "$backup/after/3"
+	touch "$backup/complete"
+	ln -sfnT "$backup" "$STATE_ROOT/current"
+fi
+pending=false
+rm -f -- "$backup/pending"
 
-echo "Done. Reboot to apply the NVIDIA, NVMe APST and ASPM changes."
+if [[ -n ${source_backup:-} ]]; then
+	echo "Undo complete. Reboot to restore device policy, including loaded udev/sysfs and Wi-Fi state."
+else
+	# Live application is best effort. No new boot-time failure can follow it.
+	echo -1 >/sys/module/usbcore/parameters/autosuspend || true
+	for ctl in /sys/bus/usb/devices/*/power/control /sys/bus/pci/devices/*/power/control; do
+		[[ ! -e $ctl ]] || echo on >"$ctl" || true
+	done
+	echo performance >/sys/module/pcie_aspm/parameters/policy 2>/dev/null || true
+	for spec in power_save:0 power_save_controller:N; do
+		file=/sys/module/snd_hda_intel/parameters/${spec%:*}
+		[[ ! -e $file ]] || echo "${spec#*:}" >"$file" || true
+	done
+	for dev in /sys/class/net/*/wireless; do
+		[[ -e $dev ]] || continue
+		iface=${dev%/wireless}
+		iw dev "${iface##*/}" set power_save off || echo "Reboot needed for Wi-Fi policy on ${iface##*/}" >&2
+	done
+	echo "Done. Reboot for full device policy. Undo: $0 --undo $backup"
+fi
