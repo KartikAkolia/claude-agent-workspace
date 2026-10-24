@@ -25,6 +25,8 @@ set -uo pipefail
 
 readonly PROG="${0##*/}"
 readonly PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/webcam-tui/profiles"
+# See set_ctrl_settled().
+readonly SETTLE_SECS=2 SETTLE_TRIES=3
 
 # ---------------------------------------------------------------------------
 # Setup / preflight
@@ -190,6 +192,33 @@ run_v4l2_set() {
 	return "$status"
 }
 
+# Current value only, as v4l2-ctl -C reports it ("name: 1 (Manual Mode)"
+# -> "1").
+ctrl_cur() {
+	v4l2-ctl -d "$1" -C "$2" 2>/dev/null | awk -F': ' '{ split($2, v, " "); print v[1]; exit }'
+}
+
+# run_v4l2_set, then read back after a pause and re-apply if the camera has
+# moved off the value. The C920 can accept a manual exposure, report it
+# straight back, then drift off it a second or two later while its auto
+# exposure is still settling after a mode switch (seen 2026-10-21: 250 ->
+# 156) - an immediate read-back misses that. Skipped while the control is
+# inactive (its auto mode still on): the camera ignores the value then, so
+# it would never settle - edit_ctrl's prompt already warns about that.
+set_ctrl_settled() {
+	local dev="$1" name="$2" val="$3" try cur
+	run_v4l2_set "$dev" "$name" "$val" || return
+	parse_ctrl "$dev" "$name" && [ "$CTRL_INACTIVE" -eq 1 ] && return 0
+	for ((try = 1; try <= SETTLE_TRIES; try++)); do
+		sleep "$SETTLE_SECS"
+		cur=$(ctrl_cur "$dev" "$name")
+		[ "$cur" = "$val" ] && return 0
+		[ "$try" -lt "$SETTLE_TRIES" ] && set_ctrl "$dev" "$name" "$val"
+	done
+	wt --msgbox "$name was set to $val but the camera keeps moving it (now ${cur:-unreadable}).\nTry again in a few seconds, or pick a different value." 10 70
+	return 1
+}
+
 # Validates $2 against the int control parse_ctrl last loaded ($1 is only
 # for the message), showing why it's rejected. Checks step as well as
 # range: drivers may round or reject an off-step value (the C920's
@@ -209,8 +238,9 @@ check_int_value() {
 }
 
 # One control, editor appropriate to its type. Returns 1 on cancel/no-op.
+# $3 optionally names the setter for int values (default run_v4l2_set).
 edit_ctrl() {
-	local dev="$1" name="$2"
+	local dev="$1" name="$2" setter="${3:-run_v4l2_set}"
 	parse_ctrl "$dev" "$name" || {
 		wt --msgbox "Could not read $name on $dev." 8 50
 		return 1
@@ -248,7 +278,7 @@ edit_ctrl() {
 		local val
 		val=$(wt --inputbox "$name (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, default=$CTRL_DEFAULT).$hint" 10 70 "$CTRL_VALUE" 3>&1 1>&2 2>&3) || return 1
 		check_int_value "$name" "$val" || return 1
-		run_v4l2_set "$dev" "$name" "$val"
+		"$setter" "$dev" "$name" "$val"
 		;;
 	bitmask | string | rect | *)
 		wt --msgbox "$name is a $CTRL_TYPE control — not editable from this menu yet.\nUse: v4l2-ctl -d $dev --set-ctrl=$name=<value>" 10 70
@@ -362,14 +392,14 @@ action_exposure_focus() {
 		auto) action_apply_auto_preset "$dev" "$exp_auto" "$foc_auto" ;;
 		exposure)
 			if [ -n "$exp_abs" ]; then
-				edit_ctrl "$dev" "$exp_abs"
+				edit_ctrl "$dev" "$exp_abs" set_ctrl_settled
 			else
 				wt --msgbox "No exposure-value control found on $dev." 6 60
 			fi
 			;;
 		focus)
 			if [ -n "$foc_abs" ]; then
-				edit_ctrl "$dev" "$foc_abs"
+				edit_ctrl "$dev" "$foc_abs" set_ctrl_settled
 			else
 				wt --msgbox "No focus-value control found on $dev." 6 60
 			fi
@@ -392,14 +422,14 @@ action_apply_manual_preset() {
 		parse_ctrl "$dev" "$exp_abs"
 		local val
 		val=$(wt --inputbox "Fixed exposure value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[ -n "${val:-}" ] && check_int_value "$exp_abs" "$val" && run_v4l2_set "$dev" "$exp_abs" "$val"
+		[ -n "${val:-}" ] && check_int_value "$exp_abs" "$val" && set_ctrl_settled "$dev" "$exp_abs" "$val"
 	fi
 	[ -n "$foc_auto" ] && run_v4l2_set "$dev" "$foc_auto" 0
 	if [ -n "$foc_abs" ]; then
 		parse_ctrl "$dev" "$foc_abs"
 		local val
 		val=$(wt --inputbox "Fixed focus value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, 0=infinity):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[ -n "${val:-}" ] && check_int_value "$foc_abs" "$val" && run_v4l2_set "$dev" "$foc_abs" "$val"
+		[ -n "${val:-}" ] && check_int_value "$foc_abs" "$val" && set_ctrl_settled "$dev" "$foc_abs" "$val"
 	fi
 	wt --msgbox "Manual preset applied." 6 40
 }
@@ -496,7 +526,7 @@ action_load_profile() {
 	# auto mode is still on is ignored (the control is inactive), and drivers
 	# don't always list the switch first — the C920 lists focus_absolute
 	# before focus_automatic_continuous.
-	local pass name val kind applied=0 skipped=0
+	local pass name val kind applied=0 skipped=0 drifted=0
 	for pass in auto manual; do
 		while IFS='=' read -r name val; do
 			[ -z "$name" ] && continue
@@ -510,7 +540,19 @@ action_load_profile() {
 			fi
 		done <"$PROFILE_DIR/$chosen"
 	done
-	wt --msgbox "Applied $applied setting(s), skipped $skipped (unsupported on this camera/mode)." 8 60
+	# One settle-and-reapply pass for exposure/focus values - see
+	# set_ctrl_settled() for why an immediate read-back isn't enough.
+	sleep "$SETTLE_SECS"
+	while IFS='=' read -r name val; do
+		case "$name" in '#'* | *auto*) continue ;; *exposure* | *focus*) ;; *) continue ;; esac
+		# Not a control here (already counted as skipped), or inactive
+		# because the profile left its auto mode on: nothing to settle.
+		parse_ctrl "$dev" "$name" && [ "$CTRL_INACTIVE" -eq 0 ] || continue
+		[ "$CTRL_VALUE" = "$val" ] && continue
+		set_ctrl "$dev" "$name" "$val"
+		drifted=$((drifted + 1))
+	done <"$PROFILE_DIR/$chosen"
+	wt --msgbox "Applied $applied setting(s), skipped $skipped (unsupported on this camera/mode), re-applied $drifted that drifted." 8 70
 }
 
 # ---------------------------------------------------------------------------
