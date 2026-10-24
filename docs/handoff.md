@@ -105,7 +105,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 38.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 39.
 
 - **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
@@ -120,6 +120,7 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
 - **32.** **Finish the 2026-10-16 plugin setup.** (2026-10-16) Run the six `claude plugin` commands in `docs/claude-plugins-setup.md` (blocked for Claude by auto mode), then `/mempalace:init`; create an OmniRoute API key (its MCP endpoint returns 401 without one) and start it loopback-only; decide whether to actually `headroom wrap` on any host; repeat the runtime installs on `dell-optiplex`, the Pi and Windows.
 - **36.** **CachyOS laptop: apply the full topgrade revert, reboot, and check whether the external monitors still flicker.** (2026-10-23) There are 125 packages to downgrade, including Plasma 6.8.1, pipewire 1.6.10, `amd-ucode` and the firmware. The command and the post-reboot checks are in the third 2026-10-23 session entry above.
 - **37.** **CachyOS laptop: run `scripts/disable-device-power-saving.sh`, reboot, and run the checks.** (2026-10-24) This turns off USB autosuspend, PCI runtime PM, dGPU runtime suspend, ASPM, NVMe APST, HDA power_save and Wi-Fi powersave. Battery life will drop, mostly because the dGPU stays powered. The checks are in the 2026-10-24 session entry above.
+- **38.** **Decide how CodeRabbit gates merges.** (2026-10-24) `docs/coderabbit-ci-integration.md` is a proposed ADR with four options and a recommendation (a `.coderabbit.yaml` plus a `master` ruleset first). It ends with three decision points, and nothing is wired up yet. PR #13 merged while CodeRabbit's status was still `pending`.
 
 ## Notes
 
