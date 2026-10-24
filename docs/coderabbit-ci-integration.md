@@ -151,9 +151,9 @@ jobs:
                 }}}')
           open=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[]
             | select(.isResolved|not)
-            | select(.comments.nodes[0].author.login|startswith("coderabbitai"))] | length' <<<"$data")
+            | select((.comments.nodes[0].author.login // "")|startswith("coderabbitai"))] | length' <<<"$data")
           state=$(jq -r '[.data.repository.pullRequest.latestReviews.nodes[]
-            | select(.author.login|startswith("coderabbitai")) | .state][0] // "NONE"' <<<"$data")
+            | select((.author.login // "")|startswith("coderabbitai")) | .state][0] // "NONE"' <<<"$data")
           echo "CodeRabbit latest review: $state, unresolved threads: $open"
           [ "$state" != CHANGES_REQUESTED ] && [ "$open" -eq 0 ]
 ```
@@ -182,4 +182,4 @@ jobs:
       # and open an issue (or fail) when there are any.
 ```
 
-Check that `--base` accepts a commit SHA. The docs only confirm that `--source-branch` takes a full 40-character SHA.
+Check that `--base` accepts a commit SHA. The docs only confirm that `--source-branch` takes a full 40-character SHA. When a push creates the branch, `github.event.before` is all zeros, so skip the review in that case or fall back to `HEAD~1`.
