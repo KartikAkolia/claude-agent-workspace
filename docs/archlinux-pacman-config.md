@@ -72,7 +72,7 @@ Dynamic Boost and zram (2026-10-21), both set up by Kartik and inspected by Clau
 
 ## Locally built software
 
-WordCraft (2026-10-18), PdfCraft and DeckCraft (2026-10-21) are built from source in `~/build/<app>` and installed as local pacman packages, which one root systemd timer (`craft-update.timer`) rebuilds and reinstalls when upstream moves. They also became the default handlers for `.docx`, `.pdf` and `.pptx`. Full detail, including rollback and the `HOLD` file that pauses updates, is in `docs/craft-update.md` and each app's `docs/<app>-source-build.md`.
+The XP-Pen driver (`xppen-tablet`, a local package from `scripts/xppen-tablet/`) was also removed on 2026-10-31, by Kartik at 09:14. WordCraft, PdfCraft and DeckCraft were built from source as local pacman packages, kept current by a root `craft-update.timer`. All three were uninstalled on 2026-10-31, and the timer, its script, the user data and this repo's PKGBUILDs and docs were removed the same day (see the 2026-10-31 entry in `docs/handoff.md`). Git history has the old craft-update and per-app build docs. With them gone, `xdg-mime query default` gives `brave-origin.desktop` for `.pdf` and no default for `.docx` or `.pptx` (checked 2026-10-31).
 
 ## Notable points
 

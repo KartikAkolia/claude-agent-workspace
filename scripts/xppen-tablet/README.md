@@ -1,6 +1,8 @@
 # XP-Pen tablet driver on `asus-vivobook`
 
-XP-Pen's official Linux driver (PenTablet 4.0.15, build 260422) is installed on `asus-vivobook` (hostname `archlinux`, Arch Linux with CachyOS repos, see `docs/archlinux-pacman-config.md`) as a local pacman package, `xppen-tablet`. The tablet is an XP-Pen Star G640 (USB `28bd:0914`). Set up on 2026-10-18; everything below was verified by running the commands on the laptop that day.
+**Status (2026-10-31):** not installed. Kartik removed `xppen-tablet` with `pacman -Rns` at 09:14 on 2026-10-31 (`/var/log/pacman.log`), and `~/build`, including `~/build/xppen-pkg`, no longer exists. The vendor tarball isn't in `~/Downloads` either. To reinstall, recreate `~/build/xppen-pkg` and download the Linux tarball from the link below. If XP-Pen no longer offers 4.0.15 build 260422, follow "Upgrade to a new driver release" to bump `_pkgver`, `_build` and `sha256sums` first. The rest of this file describes the 2026-10-18 setup.
+
+XP-Pen's official Linux driver (PenTablet 4.0.15, build 260422) was installed on `asus-vivobook` (hostname `archlinux`, Arch Linux with CachyOS repos, see `docs/archlinux-pacman-config.md`) as a local pacman package, `xppen-tablet`. The tablet is an XP-Pen Star G640 (USB `28bd:0914`). Set up on 2026-10-18; everything below was verified by running the commands on the laptop that day.
 
 XP-Pen ships the driver as prebuilt binaries with its own copy of Qt 5.6, not source, so nothing is compiled. The PKGBUILD repackages the vendor tarball so pacman tracks every file, instead of running the tarball's `install.sh`, which copies files loose into `/usr` and has to be undone by hand.
 
