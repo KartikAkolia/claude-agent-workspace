@@ -168,18 +168,39 @@ on:
     branches: [master]
 jobs:
   review:
+    # Skip the whole job when the push created the branch (no earlier commit)
+    # or deleted it (after is all zeros). Later steps need review.ndjson.
+    # Unreviewed pushes are reported by the unreviewed-push job below.
+    if: ${{ !github.event.created && !github.event.deleted && !github.event.forced }}
     runs-on: ubuntu-latest
     steps:
       # install step: per https://docs.coderabbit.ai/cli
       - run: cr auth login --api-key "$CODERABBIT_API_KEY"
         env:
           CODERABBIT_API_KEY: ${{ secrets.CODERABBIT_API_KEY }}
-      - run: >-
+      - shell: bash # adds -o pipefail, so a failed review isn't masked by tee
+        run: >-
           cr review --remote "$GITHUB_REPOSITORY"
           --base "${{ github.event.before }}" --source-branch "$GITHUB_SHA"
           --agent | tee review.ndjson
       # then: count findings in review.ndjson, write $GITHUB_STEP_SUMMARY,
       # and open an issue (or fail) when there are any.
+  unreviewed-push:
+    # No safe diff base: a force push may leave before outside the new
+    # history, and a created branch has none. Report instead of passing
+    # silently; a force push also fails the run.
+    if: ${{ (github.event.forced || github.event.created) && !github.event.deleted }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          COMPARE: ${{ github.event.compare }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          if [ "$FORCED" = true ]; then
+            echo "::error::Force push to master; review $COMPARE by hand"
+            exit 1
+          fi
+          echo "::warning::master was created by this push; review $COMPARE by hand"
 ```
 
-Check that `--base` accepts a commit SHA. The docs only confirm that `--source-branch` takes a full 40-character SHA. When a push creates the branch, `github.event.before` is all zeros, so skip the review in that case or fall back to `HEAD~1`.
+Check that `--base` accepts a commit SHA. The docs only confirm that `--source-branch` takes a full 40-character SHA. When a push creates the branch, `github.event.before` is all zeros and `github.event.created` is `true`, so the job-level `if:` skips the whole job, including the findings step. It does the same for a branch deletion (`github.event.deleted`), where there is nothing to review. A force push (`github.event.forced`) may leave `before` outside the new head's history, so the `unreviewed-push` job fails the run and links the compare view instead of passing with no review. For a push that creates the branch, the same job posts a warning with the compare link but doesn't fail. Also check that `cr review` exits 0 when a review completes with findings. `shell: bash` turns on `pipefail`, so a non-zero exit for findings would fail the step before the findings step runs. In that case don't use `continue-on-error`, which would also hide a failed or incomplete review. Instead, capture the status in this order: `set +e`, then the pipeline, then `rc=${PIPESTATUS[0]}`, then `set -e`, then write `rc` to `$GITHUB_OUTPUT`. Read `PIPESTATUS` on the line right after the pipeline, because any later command, `set -e` included, overwrites it. Without `set +e`, `bash -eo pipefail` ends the step at a failing pipeline before anything could read the status. Then have the findings step fail on any exit code other than the one for findings.
