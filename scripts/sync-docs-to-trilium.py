@@ -14,7 +14,8 @@ resolved links) differs from what was last written (`workspaceDocHash`), so
 unchanged docs don't pile up revisions. Relative Markdown links between synced
 docs become Trilium internal links; other relative Markdown links and images
 can't resolve in Trilium and are reported. Links inside raw HTML blocks are
-left as they are and not reported.
+left as they are and not reported. Use a leading / for repo-root links;
+other paths are relative to the document.
 
 The repo is the source of truth: doc notes carry `#readOnly`, and any edit made
 in Trilium is overwritten the next time that doc's rendering changes. Notes for
@@ -231,7 +232,13 @@ def rel_path(p: str) -> str:
     # whatever it points to.
     full = Path(os.path.abspath(p))
     if not full.is_relative_to(REPO_ROOT):
-        full = full.resolve()  # e.g. the repo reached through a symlinked dir
+        # Resolve the parent when the repo is reached through an alias, but
+        # preserve the final component if it is a symlinked document.
+        parent_resolved = full.parent.resolve() / full.name
+        if parent_resolved.is_relative_to(REPO_ROOT):
+            full = parent_resolved
+        elif full.is_dir():
+            full = full.resolve()  # the alias itself may name the repo root
     if not full.is_relative_to(REPO_ROOT):
         sys.exit(f"{p}: outside the repo")
     rel = full.relative_to(REPO_ROOT).as_posix()
@@ -400,11 +407,6 @@ class LinkRewriter(Treeprocessor):
             # A leading / means repo-root-relative, as GitHub renders it.
             base = "" if path.startswith("/") else posixpath.dirname(self.rel)
             target = posixpath.normpath(posixpath.join(base, path.lstrip("/")))
-            # Like check-markdown-links.py, accept a repo-root-relative path,
-            # but only when nothing exists at the file-relative one, so a link
-            # to a deleted or excluded doc is never redirected to another.
-            if not path.startswith("/") and not (REPO_ROOT / target).exists():
-                target = posixpath.normpath(path)
             target = "" if target == "." else target  # the repo root
             note_id = self.note_ids.get(target) if el.tag == "a" else None
             if note_id:
