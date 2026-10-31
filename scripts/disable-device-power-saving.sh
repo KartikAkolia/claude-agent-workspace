@@ -11,7 +11,9 @@
 # Requires the modconf hook in mkinitcpio presets for early-loaded modules.
 # Needs enough space under /var/lib to snapshot /boot before each run.
 # GRUB defaults must have one literal quoted assignment (no expansions).
-# Do not delete backup directories until their runs have been undone.
+# Do not delete backup directories until their runs have been undone. A run
+# directory holding an "aborted" file, or an empty one, failed before any
+# change and can go.
 # Failed installs restore config, profiles and existing /boot files. Backups
 # remain for recovery, including failed rollback. This is not power-loss atomic.
 set -euo pipefail
@@ -48,17 +50,40 @@ place() (
 	cp --preserve=all -- "$source" "$staged" || return
 	mv -fT -- "$staged" "$destination"
 )
+# Call only as a plain assignment (value=$(profile_value ...)) so errexit
+# propagates its die; inside [[ ]] or with || a failure would be masked.
 profile_value() {
-	local value
-	value=$(nmcli -g 802-11-wireless.powersave connection show uuid "$1")
-	value=${value%% *}
-	[[ $value =~ ^[0-3]$ ]] || return 1
+	local raw value rc=0
+	raw=$(LC_ALL=C nmcli -g 802-11-wireless.powersave connection show uuid "$1" </dev/null) || rc=$?
+	value=${raw%% *}
+	# nmcli 1.58 -g prints the enum name (e.g. "disable"). A leading number,
+	# as in "2 (disable)", is accepted too.
+	case $value in
+	default) value=0 ;;
+	ignore) value=1 ;;
+	disable) value=2 ;;
+	enable) value=3 ;;
+	esac
+	if ((rc)); then
+		printf 'nmcli failed (exit %d) reading %s\n' "$rc" "$1" >&2
+	elif [[ ! $value =~ ^[0-3]$ ]]; then
+		printf 'unrecognised nmcli powersave output for %s: %q\n' "$1" "$raw" >&2
+	fi
+	((rc == 0)) && [[ $value =~ ^[0-3]$ ]] || die "cannot read Wi-Fi policy for $1"
 	printf '%s\n' "$value"
+}
+# Die with a distinct message when the profile can't be read, so a parse
+# failure is never reported as a policy change.
+# Same rule as profile_value: call only as a plain command, never under || or if.
+require_disabled() {
+	local now
+	now=$(profile_value "$1")
+	[[ $now == 2 ]] || die "$2"
 }
 restore_profiles() {
 	local uuid value failed=0
 	while read -r uuid value; do
-		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave "$value" || failed=1
+		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave "$value" </dev/null || failed=1
 	done <"$1/profiles"
 	return "$failed"
 }
@@ -87,11 +112,15 @@ restore_cursor() {
 		rm -f -- "$STATE_ROOT/current"
 	fi
 }
-backup='' pending=false
+# phase: none, then snapshot once this invocation has created its own run
+# directory, then pending from just before the first managed write until the
+# run completes. finish restores on pending, and on snapshot drops the bulky
+# /boot copy, keeping the rest for diagnosis.
+backup='' phase=none
 finish() {
 	local status=$? failed=false
 	trap - EXIT INT TERM HUP
-	if $pending; then
+	if [[ $phase == pending ]]; then
 		echo "Installation failed; restoring from $backup" >&2
 		restore_files "$backup" || failed=true
 		restore_profiles "$backup" || failed=true
@@ -108,6 +137,12 @@ finish() {
 			echo "Previous config, profiles and boot files restored; backup: $backup" >&2
 		fi
 		status=1
+	elif [[ $status != 0 && $phase == snapshot ]]; then
+		if rm -rf -- "${backup:?}/boot" && rm -f -- "$backup/pending" && touch "$backup/aborted"; then
+			echo "Nothing was changed; partial run kept for diagnosis: $backup" >&2
+		else
+			echo "Nothing was changed; could not tidy partial run $backup" >&2
+		fi
 	fi
 	exit "$status"
 }
@@ -122,14 +157,14 @@ if [[ ${1:-} == --recover ]]; then
 	[[ $backup == "$STATE_ROOT"/run.* && -f $backup/before/3 && -d $backup/boot && -f $backup/profiles && -f $backup/parent && -f $backup/pending && ! -f $backup/complete ]] || die "not an incomplete recovery backup"
 	# Recovery restores whole snapshots; unlike undo, run this immediately,
 	# before making other changes. Reuse the normal error cleanup on failure.
-	pending=true
+	phase=pending
 	restore_files "$backup"
 	restore_profiles "$backup"
 	cp -a -- "$backup/boot/." "$BOOT_DIR/"
 	restore_cursor "$backup"
 	udevadm control --reload
 	nmcli general reload conf
-	pending=false
+	phase=none
 	rm -f -- "$backup/pending"
 	echo "Recovered $backup. Reboot before relying on device policy."
 	exit 0
@@ -152,16 +187,18 @@ if [[ ${1:-} == --undo ]]; then
 		cmp -s "${FILES[i]}" "$backup/after/$i" || die "${FILES[i]} changed; reconcile it before undo"
 	done
 	while read -r uuid value; do
-		[[ $(profile_value "$uuid") == 2 ]] || die "Wi-Fi profile $uuid changed; reconcile it before undo"
+		require_disabled "$uuid" "Wi-Fi profile $uuid changed; reconcile it before undo"
 	done <"$backup/profiles"
 	python3 "$HELPER" undo-grub "$GRUB_FILE" "$backup/before/3" >"$backup/undo-grub"
 	# An undo is itself recoverable. Snapshot its starting config and boot
 	# files before touching them; retain the original backup for retries.
 	source_backup=$backup
 	backup=$(mktemp -d "$STATE_ROOT/run.XXXXXX")
+	phase=snapshot
 else
 	[[ $# == 0 ]] || die "usage: $0 [--undo|--recover BACKUP_DIRECTORY]"
 	backup=$(mktemp -d "$STATE_ROOT/run.XXXXXX")
+	phase=snapshot
 fi
 : >"$backup/parent"
 [[ ! -L $STATE_ROOT/current ]] || readlink -f "$STATE_ROOT/current" >"$backup/parent"
@@ -177,10 +214,10 @@ done
 # Sufficient space is required; a failed snapshot precedes all managed writes.
 cp -a -- "$BOOT_DIR" "$backup/boot"
 : >"$backup/profiles"
-nmcli -t -f UUID,TYPE connection show >"$backup/profile-list"
+LC_ALL=C nmcli -t -f UUID,TYPE connection show </dev/null >"$backup/profile-list"
 while IFS=: read -r uuid type; do
 	[[ $type == 802-11-wireless || $type == wifi ]] || continue
-	value=$(profile_value "$uuid") || die "cannot read Wi-Fi policy for $uuid"
+	value=$(profile_value "$uuid")
 	printf '%s %s\n' "$uuid" "$value" >>"$backup/profiles"
 done <"$backup/profile-list"
 
@@ -193,8 +230,10 @@ fi
 cp --attributes-only --preserve=all "$GRUB_FILE" "$backup/new-grub"
 bash -n "$backup/new-grub"
 [[ -z ${source_backup:-} ]] || printf '%s\n' "$source_backup" >"$backup/undo-source"
+# Still snapshot while creating the marker: if touch fails, finish only tidies.
+# An exit between the two lines also tidies, removing the marker with /boot.
 touch "$backup/pending"
-pending=true
+phase=pending
 if [[ -n ${source_backup:-} ]]; then
 	for i in 0 1 2; do
 		if [[ -f $source_backup/before/$i ]]; then
@@ -231,8 +270,8 @@ EOF
 	modprobe --showconfig >"$backup/effective-modules"
 	python3 "$HELPER" modules <"$backup/effective-modules"
 	while read -r uuid value; do
-		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave 2
-		[[ $(profile_value "$uuid") == 2 ]] || die "Wi-Fi profile $uuid did not retain the policy"
+		nmcli connection modify uuid "$uuid" 802-11-wireless.powersave 2 </dev/null
+		require_disabled "$uuid" "Wi-Fi profile $uuid did not retain the policy"
 	done <"$backup/profiles"
 fi
 place "$backup/new-grub" "$GRUB_FILE"
@@ -257,7 +296,7 @@ else
 	touch "$backup/complete"
 	ln -sfnT "$backup" "$STATE_ROOT/current"
 fi
-pending=false
+phase=none
 rm -f -- "$backup/pending"
 
 if [[ -n ${source_backup:-} ]]; then

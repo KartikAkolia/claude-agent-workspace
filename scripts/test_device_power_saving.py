@@ -48,9 +48,19 @@ if name == 'nmcli':
         for uuid in profiles:
             print(uuid + ':802-11-wireless')
     elif args[:2] == ['-g', '802-11-wireless.powersave']:
-        print(str(profiles[args[-1]]) + ' (fixture)')
+        value = profiles[args[-1]]
+        label = ['default', 'ignore', 'disable', 'enable'][value]
+        if (root / 'blank-powersave').exists():
+            print('')
+        elif (root / 'blank-after-modify').exists() and (root / 'modified').exists():
+            print('')
+        elif (root / 'numeric-powersave').exists():
+            print(f'{value} ({label})')
+        else:
+            print(label)
     elif args[:2] == ['connection', 'modify']:
         profiles[args[3]] = int(args[-1])
+        (root / 'modified').write_text('')
         store.write_text(json.dumps(profiles))
 elif name == 'modprobe':
     print((root / 'etc/modprobe.d/no-power-saving.conf').read_text())
@@ -306,6 +316,72 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((original_run / "undone").exists())
         self.assertEqual(self.latest(), original_run)
         self.run_policy("--undo", original_run)
+
+    def test_numeric_powersave_output_is_accepted(self):
+        (self.root / "numeric-powersave").write_text("")
+        self.run_policy()
+        self.assertEqual(
+            json.loads((self.root / "wifi.json").read_text()),
+            {"111-aaa": 2, "222-bbb": 2},
+        )
+        self.run_policy("--undo", self.latest())
+        self.assertEqual(
+            json.loads((self.root / "wifi.json").read_text()),
+            {"111-aaa": 3, "222-bbb": 0},
+        )
+
+    def test_undo_reports_unreadable_profile(self):
+        self.run_policy()
+        self.tool("nmcli", "#!/bin/sh\nexit 0\n")
+        result = self.run_policy("--undo", self.latest(), success=False)
+        self.assertIn("cannot read Wi-Fi policy", result.stdout + result.stderr)
+
+    def test_install_reports_unreadable_profile(self):
+        before = self.originals()
+        (self.root / "blank-after-modify").write_text("")
+        result = self.run_policy(success=False)
+        self.assertIn("cannot read Wi-Fi policy", result.stderr)
+        self.assertIn("unrecognised nmcli powersave output", result.stderr)
+        self.assertIn("restored", result.stderr)
+        self.assertEqual(self.originals(), before)
+        self.assertEqual(
+            json.loads((self.root / "wifi.json").read_text()),
+            {"111-aaa": 3, "222-bbb": 0},
+        )
+
+    def test_early_failure_drops_boot_snapshot(self):
+        before = self.originals()
+        (self.root / "blank-powersave").write_text("")
+        result = self.run_policy(success=False)
+        self.assertIn("cannot read Wi-Fi policy", result.stderr)
+        self.assertEqual(self.originals(), before)
+        runs = list(self.state.glob("run.*"))
+        self.assertEqual(len(runs), 1)
+        self.assertFalse((runs[0] / "boot").exists())
+        self.assertTrue((runs[0] / "aborted").exists())
+        self.assertFalse((runs[0] / "pending").exists())
+        self.assertIn("partial run kept for diagnosis", result.stderr)
+        (self.root / "blank-powersave").unlink()
+        self.run_policy()  # an aborted run doesn't block the next install
+        self.assertTrue((runs[0] / "aborted").exists())
+        self.assertEqual(len(list(self.state.glob("run.*"))), 2)
+
+    def test_failed_undo_keeps_source_backup(self):
+        self.run_policy()
+        source = self.latest()
+        profiles = json.loads((self.root / "wifi.json").read_text())
+        profiles["333-ccc"] = 9  # the stub crashes reading this one
+        (self.root / "wifi.json").write_text(json.dumps(profiles))
+        result = self.run_policy("--undo", source, success=False)
+        self.assertIn("nmcli failed", result.stderr)
+        self.assertTrue((source / "complete").exists())
+        self.assertTrue((source / "boot").is_dir())
+        self.assertEqual(self.latest(), source)
+        aborted = [r for r in self.state.glob("run.*") if r != source]
+        self.assertEqual(len(aborted), 1)
+        self.assertTrue((aborted[0] / "aborted").exists())
+        self.assertFalse((aborted[0] / "boot").exists())
+        self.assertFalse((aborted[0] / "pending").exists())
 
     def test_undo_refuses_changed_profile(self):
         self.run_policy()
