@@ -93,7 +93,9 @@ FRONT_MATTER = re.compile(
     r"\A---[ \t]*\n(?:(.*?)\n)?(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.DOTALL
 )
 LEADING_COMMENTS = re.compile(r"\A(?:\s*<!--.*?-->)*", re.DOTALL)
-ATX_H1 = re.compile(r"\A(?:[ \t]*\n)*[ ]{0,3}#[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*(?:\n|\Z)")
+ATX_H1 = re.compile(
+    r"\A(?:[ \t]*\n)*[ ]{0,3}#(?!#)[ \t]*(.+?)(?:[ \t]+#+)?[ \t]*(?:\n|\Z)"
+)
 SETEXT_H1 = re.compile(r"\A(?:[ \t]*\n)*[ ]{0,3}(\S[^\n]*?)[ \t]*\n=+[ \t]*(?:\n|\Z)")
 
 
@@ -169,11 +171,15 @@ class Etapi:
         return results
 
     def create(self, parent: str, title: str, labels: dict[str, str]) -> str:
-        note_id = self.call(
+        created = self.call(
             "POST",
             "/create-note",
             {"parentNoteId": parent, "title": title, "type": "text", "content": ""},
-        )["note"]["noteId"]
+        )
+        try:
+            note_id = created["note"]["noteId"]
+        except (KeyError, TypeError) as err:
+            raise EtapiError(f"create-note: unexpected response {created!r}") from err
         # ETAPI can't label a note at creation. A note left without its
         # identifying label is invisible to later runs, so undo the create if
         # labelling fails or is interrupted, without hiding the original error.
@@ -241,7 +247,16 @@ def syncable_files() -> list[str]:
     try:
         listed = (
             subprocess.run(
-                ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                [
+                    "git",
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    "*.md",
+                ],
                 cwd=REPO_ROOT,
                 capture_output=True,
                 check=True,
@@ -259,7 +274,7 @@ def syncable_files() -> list[str]:
         {
             f
             for f in listed
-            if f.endswith(".md") and not excluded(f) and (REPO_ROOT / f).is_file()
+            if f.endswith(".md") and not excluded(f) and inside_repo(REPO_ROOT / f)
         }
     )
 
@@ -268,16 +283,29 @@ def in_scope(p: str, scope: list[str]) -> bool:
     return any(s == "" or p == s or p.startswith(s + "/") for s in scope)
 
 
-def collect_files(paths: list[str], every: list[str]) -> tuple[list[str], list[str]]:
+def inside_repo(path: Path) -> bool:
+    """A regular file whose real location (after symlinks) is in the repo, so
+    a symlink can't publish a private file from elsewhere."""
+    return path.is_file() and path.resolve().is_relative_to(REPO_ROOT)
+
+
+def collect_files(
+    paths: list[str], every: list[str], prune: bool
+) -> tuple[list[str], list[str]]:
     """Return (files, scope): the Markdown files to sync and the repo-relative
     paths they were collected from."""
     scope = [rel_path(p) for p in paths]
     files = [f for f in every if in_scope(f, scope)]
     for p, s in zip(paths, scope, strict=True):
-        # A deleted path, or a folder with no Markdown left, is allowed: its
-        # notes can still be pruned. Only an existing non-syncable file isn't.
-        if (REPO_ROOT / s).is_file() and s not in files:
-            sys.exit(f"{p}: not a syncable Markdown file (or excluded)")
+        full = REPO_ROOT / s
+        if s and excluded(s):
+            sys.exit(f"{p}: excluded from syncing (hidden, node_modules or a clone)")
+        if full.is_file() and s not in files:
+            sys.exit(f"{p}: not a syncable Markdown file")
+        # A deleted path can still have its notes pruned, so it's only an
+        # error (most likely a typo) without --prune.
+        if not full.exists() and not prune:
+            sys.exit(f"{p}: no such file or folder (use --prune to drop its notes)")
     return files, scope
 
 
@@ -370,6 +398,9 @@ class LinkRewriter(Treeprocessor):
             base = "" if path.startswith("/") else posixpath.dirname(self.rel)
             target = posixpath.normpath(posixpath.join(base, path.lstrip("/")))
             target = "" if target == "." else target  # the repo root
+            # Like check-markdown-links.py, fall back to repo-root-relative.
+            if target not in self.note_ids and not path.startswith("/"):
+                target = posixpath.normpath(path) if path else target
             note_id = self.note_ids.get(target) if el.tag == "a" else None
             if note_id:
                 el.set("href", f"#root/{note_id}")
@@ -457,13 +488,13 @@ def sync(
     for sub in sorted(wanted - set(files)):
         name = posixpath.basename(sub)
         folder = by_path.get(sub)
-        if folder:
+        if folder and in_scope(sub, scope):
             # Folder notes follow the repo too: name and #sorted.
             if folder["title"] != name:
                 api.call("PATCH", f"/notes/{folder['noteId']}", {"title": name})
             if not label(folder, "sorted"):
                 api.add_label(folder["noteId"], "sorted")
-        elif sub not in note_ids:
+        elif not folder and sub not in note_ids:
             print(f"+ folder {sub}/")
             note_ids[sub] = api.create(
                 note_ids[parent_dir(sub)], name, {PATH_LABEL: sub, "sorted": ""}
@@ -603,7 +634,7 @@ def main() -> None:
         sys.exit(f"No ETAPI token: set TRILIUM_ETAPI_TOKEN or write it to {TOKEN_FILE}")
 
     every = syncable_files()
-    files, scope = collect_files(args.paths, every)
+    files, scope = collect_files(args.paths, every, args.prune)
     # Read every in-scope file up front, so a bad one stops the run before any write.
     # utf-8-sig drops a BOM, and CRLF is normalised so headings still match.
     sources = {}
