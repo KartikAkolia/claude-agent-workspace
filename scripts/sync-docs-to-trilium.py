@@ -11,9 +11,10 @@ a folder note. Notes are matched to files by a `workspaceDocPath` label, not by
 title, so re-running the script updates notes in place. Every doc is rendered
 on each run, and its note is only rewritten when the final HTML (including
 resolved links) differs from what was last written (`workspaceDocHash`), so
-unchanged docs don't pile up revisions. Relative links between synced docs
-become Trilium internal links; other relative links and images can't resolve
-in Trilium and are reported.
+unchanged docs don't pile up revisions. Relative Markdown links between synced
+docs become Trilium internal links; other relative Markdown links and images
+can't resolve in Trilium and are reported. Links inside raw HTML blocks are
+left as they are and not reported.
 
 The repo is the source of truth: doc notes carry `#readOnly`, and any edit made
 in Trilium is overwritten the next time that doc's rendering changes. Notes for
@@ -60,17 +61,22 @@ ROOT_LABEL = "workspaceDocsRoot"
 PATH_LABEL = "workspaceDocPath"
 HASH_LABEL = "workspaceDocHash"
 ROOT_TITLE = "claude-agent-workspace docs"
-# Never synced: ChrisTitusTech's reference clones (AGENTS.md) and dependency trees.
-EXCLUDED_DIRS = {
-    "dwm-titus-main",
-    "linutil-main",
-    "titus-ai-main",
-    "website-master",
-    "winutil-main",
-    "node_modules",
-}
+
+
+def reference_clones() -> set[str]:
+    """ChrisTitusTech's read-only reference clones (AGENTS.md), read from
+    list-lint-files.sh so there's one list to keep up to date."""
+    lister = (REPO_ROOT / "list-lint-files.sh").read_text(encoding="utf-8")
+    match = re.search(r"^exclude_dirs=\(([^)]*)\)", lister, re.MULTILINE)
+    if not match or not match.group(1).split():
+        sys.exit("Can't read exclude_dirs from list-lint-files.sh")
+    return set(match.group(1).split())
+
+
+# Never synced: the reference clones and dependency trees.
+EXCLUDED_DIRS = reference_clones() | {"node_modules"}
 FRONT_MATTER = re.compile(
-    r"\A---[ \t]*\n(.*?)\n(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.DOTALL
+    r"\A---[ \t]*\n(?:(.*?)\n)?(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.DOTALL
 )
 LEADING_COMMENTS = re.compile(r"\A(?:\s*<!--.*?-->)*", re.DOTALL)
 ATX_H1 = re.compile(r"\A(?:[ \t]*\n)*[ ]{0,3}#[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*(?:\n|\Z)")
@@ -137,11 +143,10 @@ class Etapi:
         except json.JSONDecodeError as err:
             raise EtapiError(f"{method} {path}: response isn't JSON: {err}") from err
 
-    def search(self, query: str, ancestor: str | None = None) -> list[dict]:
-        # Archived notes are included: missing one would create a duplicate.
+    def search(self, query: str) -> list[dict]:
+        """Search the whole tree. Archived notes are included: missing one
+        would create a duplicate."""
         params = {"search": query, "limit": "10000", "includeArchivedNotes": "true"}
-        if ancestor:
-            params["ancestorNoteId"] = ancestor
         results = self.call("GET", "/notes?" + urllib.parse.urlencode(params))[
             "results"
         ]
@@ -289,17 +294,19 @@ def plain_title(md_title: str) -> str:
 def split_title(rel: str, text: str) -> tuple[str, str]:
     """Return (title, body). YAML front matter is dropped (its `title:` is used
     if there's no H1), and a leading H1 becomes the title, not body text."""
-    fallback = Path(rel).name
+    fallback = Path(rel).stem
     fm = FRONT_MATTER.match(text)
     # Only a block made entirely of YAML-looking lines (`key:`, indented
     # continuations, `- ` items) is front matter; a doc that opens with a
     # `---` rule keeps its first section.
     if fm and all(
         re.match(r"[A-Za-z0-9_-]+:|[ \t]|- ", line) or not line.strip()
-        for line in fm.group(1).splitlines()
+        for line in (fm.group(1) or "").splitlines()
     ):
         text = text[fm.end() :]
-        fm_title = re.search(r"^title:[ \t]*(.+?)[ \t]*$", fm.group(1), re.MULTILINE)
+        fm_title = re.search(
+            r"^title:[ \t]*(.+?)[ \t]*$", fm.group(1) or "", re.MULTILINE
+        )
         if fm_title:
             fallback = fm_title.group(1).strip("\"'")
     # HTML comments (e.g. markdownlint directives) may come before the H1.
@@ -392,13 +399,13 @@ def sync(
         )
     if roots:
         root_id = roots[0]["noteId"]
-        # The whole tree, not just under the root: a doc note moved elsewhere
-        # in Trilium is still found (and updated in place) instead of duplicated.
-        existing = api.search(f"#{PATH_LABEL}")
     else:
         print(f"Creating '{ROOT_TITLE}' under the Trilium root")
         root_id = api.create("root", ROOT_TITLE, {ROOT_LABEL: "", "sorted": ""})
-        existing = []
+    # Always the whole tree, even with a new root: doc notes moved elsewhere,
+    # or left behind when the root lost its label, are found and updated in
+    # place instead of duplicated.
+    existing = api.search(f"#{PATH_LABEL}")
 
     by_path: dict[str, dict] = {}
     for note in existing:
@@ -484,25 +491,40 @@ def sync(
     # on `docs/x.md` never touches the rest. A stale note under a stale
     # folder goes with its folder, so only the topmost ones are deleted.
     stale = sorted(p for p in by_path if p not in wanted and in_scope(p, scope))
-    # Deepest first, so a folder is judged after its stale children are gone.
     # A note is only deleted when nothing but already-deleted stale notes sit
     # under it, so a live doc or hand-made note moved there is never lost.
+    # Passes repeat (deepest paths first) until one deletes nothing, so the
+    # order notes really sit in Trilium doesn't matter. A note that also
+    # appears elsewhere (a clone) is never deleted: DELETE would remove it
+    # from every place it appears.
     pruned_ids: set[str] = set()
-    for rel in sorted(stale, key=lambda p: (-p.count("/"), p)):
-        nid = by_path[rel]["noteId"]
-        if not prune:
+    pending = sorted(stale, key=lambda p: (-p.count("/"), p))
+    if not prune:
+        for rel in pending:
             print(f"! {rel} is no longer in the repo (rerun with --prune to delete it)")
-            continue
-        keep = [c for c in api.descendants(nid) if c not in pruned_ids]
-        if keep:
-            print(
-                f"! {rel}: not pruned, it holds {len(keep)} note(s) that aren't "
-                "stale docs; move them out first"
-            )
-            continue
-        print(f"- {rel}")
-        api.call("DELETE", f"/notes/{nid}")
-        pruned_ids.add(nid)
+        pending = []
+    blocked: dict[str, str] = {}
+    progress = True
+    while pending and progress:
+        progress, blocked = False, {}
+        for rel in pending:
+            note = by_path[rel]
+            if len(note.get("parentNoteIds", [])) > 1:
+                blocked[rel] = (
+                    "it's cloned elsewhere in Trilium; remove the clones first"
+                )
+                continue
+            keep = [c for c in api.descendants(note["noteId"]) if c not in pruned_ids]
+            if keep:
+                blocked[rel] = f"it holds {len(keep)} note(s) that aren't stale docs"
+                continue
+            print(f"- {rel}")
+            api.call("DELETE", f"/notes/{note['noteId']}")
+            pruned_ids.add(note["noteId"])
+            progress = True
+        pending = [p for p in pending if p in blocked]
+    for rel, why in blocked.items():
+        print(f"! {rel}: not pruned, {why}")
     if (created or pruned_ids) and scope != [""]:
         print(
             "  Notes were created or pruned: docs outside this run's paths that "
