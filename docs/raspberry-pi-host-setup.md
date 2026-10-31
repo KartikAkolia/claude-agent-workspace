@@ -2,7 +2,8 @@
 
 This documents the Claude Code CLI environment on the Raspberry Pi 5 host
 (`raspberrypi`, `192.168.0.166`, Debian `forky/sid`, `aarch64`, user `pi`) —
-the same box that runs AdGuardHome (see `docs/archival.md`'s 2026-08-27 AdGuardHome Pi entry).
+the box that ran AdGuardHome until 2026-10-31 (see `docs/archival.md`'s 2026-08-27 AdGuardHome Pi entry
+and `docs/handoff.md`'s 2026-10-31 removal entry).
 It sits alongside `docs/debian-host-claude-setup.md`, the `dell-optiplex`
 Debian desktop (`apt` / x86-64, user `kartik`).
 
@@ -18,7 +19,7 @@ not assumed.
 | Model | Raspberry Pi 5 Model B Rev 1.0 (Cortex-A76 ×4, 8 GB RAM) |
 | OS | Debian GNU/Linux `forky/sid`, kernel `6.18.x-rpt-rpi-2712`, `aarch64` |
 | User / home | `pi` / `/home/pi` |
-| Also runs | AdGuardHome (DNS, port 853/DoH), Docker daemon |
+| Also runs | Docker daemon (rootless homelab stacks plus the rootful daemon). AdGuardHome was removed 2026-10-31 |
 | `sudo` | password required; one `NOPASSWD` rule only (a sysctl) — apt installs need Kartik's password |
 | Root FS | NVMe (`/dev/nvme0n1p2`), ~205 GB free |
 | `loginctl` linger | `Linger=yes` for `pi` — `--user` services run without an active login and survive reboot |

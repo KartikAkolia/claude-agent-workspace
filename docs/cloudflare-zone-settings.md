@@ -67,6 +67,10 @@ DNS regardless of any WAF/security-level settings on the proxied
 records — those only protect traffic that actually goes through
 Cloudflare's proxy. Flagged for awareness; no DNS records were changed.
 
+2026-10-31: AdGuardHome was removed from the Pi, so nothing listens behind
+`adguardhome.kartikpassbolt.org` any more. The record itself hasn't been
+deleted yet (open item 44 in `docs/handoff.md`).
+
 ## DNSSEC DS record (for reference)
 
 ```text
