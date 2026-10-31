@@ -178,6 +178,8 @@ class Etapi:
         )
         try:
             note_id = created["note"]["noteId"]
+            if not isinstance(note_id, str) or not note_id:
+                raise TypeError(note_id)
         except (KeyError, TypeError) as err:
             raise EtapiError(f"create-note: unexpected response {created!r}") from err
         # ETAPI can't label a note at creation. A note left without its
@@ -270,42 +272,39 @@ def syncable_files() -> list[str]:
             detail = detail.decode(errors="replace").strip()
         sys.exit(f"Can't list repo files with git: {detail}")
     # A set: during a merge conflict git lists a path once per stage.
-    return sorted(
-        {
-            f
-            for f in listed
-            if f.endswith(".md") and not excluded(f) and inside_repo(REPO_ROOT / f)
-        }
-    )
+    candidates = {f for f in listed if f and not excluded(f)}
+    return sorted(f for f in candidates if publishable(f, candidates))
 
 
 def in_scope(p: str, scope: list[str]) -> bool:
     return any(s == "" or p == s or p.startswith(s + "/") for s in scope)
 
 
-def inside_repo(path: Path) -> bool:
-    """A regular file whose real location (after symlinks) is in the repo, so
-    a symlink can't publish a private file from elsewhere."""
-    return path.is_file() and path.resolve().is_relative_to(REPO_ROOT)
+def publishable(rel: str, candidates: set[str]) -> bool:
+    """A regular file whose real location (after symlinks) is itself a
+    syncable repo file, so a symlink can't publish a private file from outside
+    the repo, a gitignored nested repo, a hidden folder or a clone."""
+    path = REPO_ROOT / rel
+    if not path.is_file():
+        return False
+    real = path.resolve()
+    if not real.is_relative_to(REPO_ROOT):
+        return False
+    return real.relative_to(REPO_ROOT).as_posix() in candidates
 
 
-def collect_files(
-    paths: list[str], every: list[str], prune: bool
-) -> tuple[list[str], list[str]]:
+def collect_files(paths: list[str], every: list[str]) -> tuple[list[str], list[str]]:
     """Return (files, scope): the Markdown files to sync and the repo-relative
     paths they were collected from."""
     scope = [rel_path(p) for p in paths]
     files = [f for f in every if in_scope(f, scope)]
     for p, s in zip(paths, scope, strict=True):
-        full = REPO_ROOT / s
         if s and excluded(s):
             sys.exit(f"{p}: excluded from syncing (hidden, node_modules or a clone)")
-        if full.is_file() and s not in files:
+        if (REPO_ROOT / s).is_file() and s not in files:
             sys.exit(f"{p}: not a syncable Markdown file")
-        # A deleted path can still have its notes pruned, so it's only an
-        # error (most likely a typo) without --prune.
-        if not full.exists() and not prune:
-            sys.exit(f"{p}: no such file or folder (use --prune to drop its notes)")
+    # A deleted path is fine here (its stale notes are listed, or pruned with
+    # --prune); a path matching nothing at all is caught after the run.
     return files, scope
 
 
@@ -398,9 +397,6 @@ class LinkRewriter(Treeprocessor):
             base = "" if path.startswith("/") else posixpath.dirname(self.rel)
             target = posixpath.normpath(posixpath.join(base, path.lstrip("/")))
             target = "" if target == "." else target  # the repo root
-            # Like check-markdown-links.py, fall back to repo-root-relative.
-            if target not in self.note_ids and not path.startswith("/"):
-                target = posixpath.normpath(path) if path else target
             note_id = self.note_ids.get(target) if el.tag == "a" else None
             if note_id:
                 el.set("href", f"#root/{note_id}")
@@ -603,6 +599,13 @@ def sync(
         f"{len(files)} docs, {updated} written, {len(files) - updated} unchanged, "
         f"{len(stale)} stale, {len(pruned_ids)} pruned"
     )
+    # A path that matched no doc and no stale note is most likely a typo, or a
+    # gitignored folder: say so rather than report a successful no-op.
+    unmatched = [
+        s for s in scope if not any(in_scope(p, [s]) for p in [*files, *stale])
+    ]
+    if unmatched:
+        sys.exit(f"Nothing to sync or prune under: {', '.join(unmatched)}")
 
 
 def main() -> None:
@@ -634,7 +637,7 @@ def main() -> None:
         sys.exit(f"No ETAPI token: set TRILIUM_ETAPI_TOKEN or write it to {TOKEN_FILE}")
 
     every = syncable_files()
-    files, scope = collect_files(args.paths, every, args.prune)
+    files, scope = collect_files(args.paths, every)
     # Read every in-scope file up front, so a bad one stops the run before any write.
     # utf-8-sig drops a BOM, and CRLF is normalised so headings still match.
     sources = {}
