@@ -25,7 +25,9 @@ Brave (`brave-origin-bin` 1.97.59, Chromium 155) showed YouTube with sound but n
 1. `/etc/environment` set `LIBVA_DRIVER_NAME=nvidia`, which forced NVIDIA's VA-API driver even though Brave renders on the AMD 780M. That line was removed (backup at `/etc/environment.bak`), so Mesa now picks `radeonsi` on its own. `vainfo` shows VP9 and AV1 decode on both GPUs. `MOZ_DISABLE_RDD_SANDBOX=1` was a Firefox-only leftover from the same NVIDIA VA-API setup. It was also removed (backup at `/etc/environment.bak2`), and after relogging it's confirmed `unset`. `/etc/environment` now contains only comments.
 2. Even with decoding on the AMD chip, Brave's default renderer (Wayland, ANGLE on OpenGL) failed to import decoded frames, logging `eglCreateImage failed with 0x00003009` (`EGL_BAD_MATCH`). `--disable-accelerated-video-decode` played fine, which pinned the fault on the hardware-decode handover. Vulkan isn't allowed under `--ozone-platform=wayland`; Chromium logs that the two aren't compatible.
 
-Working fix, verified 2026-10-18 by Kartik (playback works, `brave://gpu` shows Video Decode hardware accelerated): `~/.config/brave-origin-flags.conf`, which is the file `/usr/bin/brave-origin` reads, containing `--ozone-platform=x11`, `--use-angle=vulkan` and `--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan`, one per line. The trade-off is that Brave runs under XWayland. A Wayland-native alternative, `--disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL`, hasn't been tested.
+Working fix, verified 2026-10-18 by Kartik (playback works, `brave://gpu` shows Video Decode hardware accelerated): `~/.config/brave-origin-flags.conf`, the file `/usr/bin/brave-origin` reads. At that point the file contained `--ozone-platform=x11`, `--use-angle=vulkan` and `--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan`, one per line. The trade-off was that Brave ran under XWayland. The live file now holds the Wayland trial below.
+
+Wayland-native trial (2026-10-25, partly verified): the flags file now contains `--ozone-platform=wayland` and `--disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL`. The Vulkan flags were dropped because Chromium rejects Vulkan under Wayland. The working X11 version is saved as `~/.config/brave-origin-flags.conf.x11.bak`. To revert, run `cp ~/.config/brave-origin-flags.conf.x11.bak ~/.config/brave-origin-flags.conf` and restart Brave. A `brave://gpu` report saved at 08:45 on 2026-10-25, about 35 seconds after launch, confirms that both flags are on the command line. It shows Ozone platform `wayland`, Display type `ANGLE_OPENGL` on the 780M (radeonsi), Video Decode "Hardware accelerated", and VA-API decode profiles for H.264, VP9, HEVC and AV1. Its log has no `eglCreateImage` error, only a sandbox warning. A `brave://media-internals` dump saved at 08:47 shows every YouTube player that had video using `VaapiVideoDecoder` with `kIsPlatformVideoDecoder: true`, for AV1 at 640x360, 1280x720 and 1920x1080. One 1080p player was still in `kPlaying` after about 89 seconds. The dump contains no pipeline errors and no fallback to `Dav1dVideoDecoder`; the only "Cannot select" lines are normal decoder probing. Not yet confirmed: a `brave://gpu` log captured after playback still has no `eglCreateImage` error, since the 08:45 report came before the video played.
 
 Network (2026-10-18): Wi-Fi `wlp2s0` (Intel AX210, `iwlwifi`) is on NetworkManager profile `VM2411078` at `192.168.0.13/24`, gateway `192.168.0.1`. That profile was changed with `nmcli connection modify "VM2411078" ipv4.dns "1.1.1.1 1.0.0.1" ipv4.ignore-auto-dns yes ipv6.method disabled` and applied with `nmcli device reapply wlp2s0`. Verified: `IP4.DNS` shows only `1.1.1.1` and `1.0.0.1` (previously Virgin Media's `194.168.4.100` and `194.168.8.100`), `/etc/resolv.conf` matches, and there's no IPv6 address. This applies to that profile only, not to other networks or system-wide. It also bypasses the AdGuardHome Pi at `192.168.0.166`.
 
@@ -76,7 +78,7 @@ WordCraft (2026-10-18), PdfCraft and DeckCraft (2026-10-21) are built from sourc
 
 The machine uses CachyOS's optimized repositories on top of stock Arch. The three `znver4` repos (`cachyos-znver4`, `cachyos-core-znver4`, `cachyos-extra-znver4`) contain packages built for AMD Zen 4. They're listed ahead of `[cachyos]`, `[core]`, `[extra]`, and `[multilib]`, so for any package name found in more than one repo, the Zen 4 build wins. That's only safe on a Zen 4 CPU, or on a VM whose CPU model passes Zen 4 features through. On an older CPU, those packages fail with illegal-instruction errors.
 
-Other non-default settings: `Color`, `ILoveCandy`, `ParallelDownloads = 5`, `DownloadUser = alpm`, `[multilib]` turned on, and both testing repos left off. `SigLevel` and `LocalFileSigLevel` are set to stock Arch's values.
+Other non-default settings: `Architecture = x86_64 x86_64_v4` (needed for the CachyOS builds), `IgnorePkg = kwin kscreen libkscreen` (the Plasma flicker hold, see `docs/handoff.md`; drop it before taking Plasma 6.8.2 as a whole, or a partial upgrade can block on dependencies), `Color`, `ILoveCandy`, `ParallelDownloads = 5`, `DownloadUser = alpm`, `[multilib]` turned on, and both testing repos left off. `SigLevel` and `LocalFileSigLevel` are set to stock Arch's values.
 
 Not captured here: what's inside `/etc/pacman.d/cachyos-v4-mirrorlist` and `/etc/pacman.d/cachyos-mirrorlist`, and whether the CachyOS keyring is installed (`pacman -Q cachyos-keyring`).
 
@@ -97,6 +99,8 @@ LOGO=archlinux-logo
 ```
 
 ## `/etc/pacman.conf` (verbatim)
+
+Copied from the live file on 2026-10-31, after the Mesa and firmware holds were dropped.
 
 ```ini
 #
@@ -120,10 +124,10 @@ HoldPkg     = pacman glibc
 #XferCommand = /usr/bin/curl -L -C - -f -o %o %u
 #XferCommand = /usr/bin/wget --passive-ftp -c -O %o %u
 #CleanMethod = KeepInstalled
-Architecture = auto
+Architecture = x86_64 x86_64_v4
 
 # Pacman won't upgrade packages listed in IgnorePkg and members of IgnoreGroup
-#IgnorePkg   =
+IgnorePkg   = kwin kscreen libkscreen
 #IgnoreGroup =
 
 #NoUpgrade   =
@@ -132,12 +136,14 @@ Architecture = auto
 # Misc options
 #UseSyslog
 Color
-ILoveCandy
 #NoProgressBar
+#PrettyProgressBar
+ILoveCandy
 CheckSpace
 #VerbosePkgLists
 ParallelDownloads = 5
 DownloadUser = alpm
+#DisableSandbox
 #DisableSandboxFilesystem
 #DisableSandboxSyscalls
 
@@ -177,6 +183,7 @@ LocalFileSigLevel = Optional
 #[core-testing]
 #Include = /etc/pacman.d/mirrorlist
 
+# CachyOS repositories (znver4) - must stay above [core]
 [cachyos-znver4]
 Include = /etc/pacman.d/cachyos-v4-mirrorlist
 
