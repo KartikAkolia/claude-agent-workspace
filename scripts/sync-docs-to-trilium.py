@@ -37,6 +37,7 @@ With no PATH, the repo's docs/ folder is synced.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html as htmllib
 import http.client
@@ -44,6 +45,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import urllib.error
@@ -63,18 +65,30 @@ HASH_LABEL = "workspaceDocHash"
 ROOT_TITLE = "claude-agent-workspace docs"
 
 
-def reference_clones() -> set[str]:
+@functools.cache
+def reference_clones() -> frozenset[str]:
     """ChrisTitusTech's read-only reference clones (AGENTS.md), read from
-    list-lint-files.sh so there's one list to keep up to date."""
-    lister = (REPO_ROOT / "list-lint-files.sh").read_text(encoding="utf-8")
-    match = re.search(r"^exclude_dirs=\(([^)]*)\)", lister, re.MULTILINE)
-    if not match or not match.group(1).split():
-        sys.exit("Can't read exclude_dirs from list-lint-files.sh")
-    return set(match.group(1).split())
+    list-lint-files.sh's `exclude_dirs=( ... )` so there's one list to keep up
+    to date. Parsed with shell quoting and comment rules; anything that doesn't
+    come out as plain top-level directory names stops the run rather than
+    letting a clone through."""
+    try:
+        lister = (REPO_ROOT / "list-lint-files.sh").read_text(encoding="utf-8")
+    except OSError as err:
+        sys.exit(f"Can't read the reference-clone list: {err}")
+    match = re.search(r"^exclude_dirs=\((.*?)\)", lister, re.MULTILINE | re.DOTALL)
+    try:
+        names = shlex.split(match.group(1), comments=True) if match else []
+    except ValueError:
+        names = []
+    if not names or not all(re.fullmatch(r"[A-Za-z0-9._-]+", n) for n in names):
+        sys.exit("Can't parse exclude_dirs in list-lint-files.sh")
+    missing = [n for n in names if not (REPO_ROOT / n).is_dir()]
+    if missing:
+        print(f"warning: reference clones not on disk: {', '.join(missing)}")
+    return frozenset(names)
 
 
-# Never synced: the reference clones and dependency trees.
-EXCLUDED_DIRS = reference_clones() | {"node_modules"}
 FRONT_MATTER = re.compile(
     r"\A---[ \t]*\n(?:(.*?)\n)?(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.DOTALL
 )
@@ -213,7 +227,12 @@ def rel_path(p: str) -> str:
 
 
 def excluded(rel: str) -> bool:
-    return any(part.startswith(".") or part in EXCLUDED_DIRS for part in rel.split("/"))
+    """Reference clones are top-level folders, as in list-lint-files.sh;
+    hidden folders and node_modules are skipped at any depth."""
+    parts = rel.split("/")
+    if parts[0] in reference_clones():
+        return True
+    return any(part.startswith(".") or part == "node_modules" for part in parts)
 
 
 def syncable_files() -> list[str]:
@@ -296,11 +315,11 @@ def split_title(rel: str, text: str) -> tuple[str, str]:
     if there's no H1), and a leading H1 becomes the title, not body text."""
     fallback = Path(rel).stem
     fm = FRONT_MATTER.match(text)
-    # Only a block made entirely of YAML-looking lines (`key:`, indented
+    # Only a block made entirely of YAML-looking lines (lowercase `key:`, indented
     # continuations, `- ` items) is front matter; a doc that opens with a
     # `---` rule keeps its first section.
     if fm and all(
-        re.match(r"[A-Za-z0-9_-]+:|[ \t]|- ", line) or not line.strip()
+        re.match(r"[a-z0-9_-]+:(?:[ \t]|$)|[ \t]|- ", line) or not line.strip()
         for line in (fm.group(1) or "").splitlines()
     ):
         text = text[fm.end() :]
@@ -397,15 +416,19 @@ def sync(
             f"{len(roots)} notes carry #{ROOT_LABEL}; "
             "keep one and remove the label from the others"
         )
+    # The whole tree: a doc note moved elsewhere in Trilium is found and
+    # updated in place instead of duplicated.
+    existing = api.search(f"#{PATH_LABEL}")
     if roots:
         root_id = roots[0]["noteId"]
+    elif any(label(n, PATH_LABEL) for n in existing):
+        sys.exit(
+            f"Doc notes exist but no note carries #{ROOT_LABEL}. Add that label "
+            f"back to the '{ROOT_TITLE}' note, so its tree isn't split in two."
+        )
     else:
         print(f"Creating '{ROOT_TITLE}' under the Trilium root")
         root_id = api.create("root", ROOT_TITLE, {ROOT_LABEL: "", "sorted": ""})
-    # Always the whole tree, even with a new root: doc notes moved elsewhere,
-    # or left behind when the root lost its label, are found and updated in
-    # place instead of duplicated.
-    existing = api.search(f"#{PATH_LABEL}")
 
     by_path: dict[str, dict] = {}
     for note in existing:
@@ -430,17 +453,24 @@ def sync(
     # straight under the root note.
     # Sorting puts every folder before its subfolders.
     wanted = with_parents(files)
+    created = 0
     for sub in sorted(wanted - set(files)):
-        if sub not in note_ids:
+        name = posixpath.basename(sub)
+        folder = by_path.get(sub)
+        if folder:
+            # Folder notes follow the repo too: name and #sorted.
+            if folder["title"] != name:
+                api.call("PATCH", f"/notes/{folder['noteId']}", {"title": name})
+            if not label(folder, "sorted"):
+                api.add_label(folder["noteId"], "sorted")
+        elif sub not in note_ids:
             print(f"+ folder {sub}/")
             note_ids[sub] = api.create(
-                note_ids[parent_dir(sub)],
-                posixpath.basename(sub),
-                {PATH_LABEL: sub, "sorted": ""},
+                note_ids[parent_dir(sub)], name, {PATH_LABEL: sub, "sorted": ""}
             )
+            created += 1
 
     # Pass 1: make sure every file has a note, so links can point at it.
-    created = 0
     for rel in files:
         title = sources[rel][0]
         if rel not in note_ids:
@@ -504,17 +534,24 @@ def sync(
             print(f"! {rel} is no longer in the repo (rerun with --prune to delete it)")
         pending = []
     blocked: dict[str, str] = {}
+    subtree: dict[str, list[str]] = {}
     progress = True
     while pending and progress:
         progress, blocked = False, {}
         for rel in pending:
             note = by_path[rel]
-            if len(note.get("parentNoteIds", [])) > 1:
+            # System parents such as _share aren't clones.
+            parents = [
+                p for p in note.get("parentNoteIds", []) if not p.startswith("_")
+            ]
+            if len(parents) > 1:
                 blocked[rel] = (
                     "it's cloned elsewhere in Trilium; remove the clones first"
                 )
                 continue
-            keep = [c for c in api.descendants(note["noteId"]) if c not in pruned_ids]
+            if rel not in subtree:
+                subtree[rel] = api.descendants(note["noteId"])
+            keep = [c for c in subtree[rel] if c not in pruned_ids]
             if keep:
                 blocked[rel] = f"it holds {len(keep)} note(s) that aren't stale docs"
                 continue
