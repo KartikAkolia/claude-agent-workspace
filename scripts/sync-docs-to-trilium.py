@@ -179,7 +179,7 @@ class Etapi:
         try:
             note_id = created["note"]["noteId"]
             if not isinstance(note_id, str) or not note_id:
-                raise TypeError(note_id)
+                raise EtapiError(f"create-note: bad noteId in {created!r}")
         except (KeyError, TypeError) as err:
             raise EtapiError(f"create-note: unexpected response {created!r}") from err
         # ETAPI can't label a note at creation. A note left without its
@@ -227,7 +227,11 @@ def label(note: dict, name: str) -> dict | None:
 
 def rel_path(p: str) -> str:
     """Repo-relative POSIX path of a CLI argument; '' for the repo root."""
-    full = Path(p).resolve()
+    # abspath, not resolve(): a symlinked doc is synced as itself, not as
+    # whatever it points to.
+    full = Path(os.path.abspath(p))
+    if not full.is_relative_to(REPO_ROOT):
+        full = full.resolve()  # e.g. the repo reached through a symlinked dir
     if not full.is_relative_to(REPO_ROOT):
         sys.exit(f"{p}: outside the repo")
     rel = full.relative_to(REPO_ROOT).as_posix()
@@ -396,6 +400,11 @@ class LinkRewriter(Treeprocessor):
             # A leading / means repo-root-relative, as GitHub renders it.
             base = "" if path.startswith("/") else posixpath.dirname(self.rel)
             target = posixpath.normpath(posixpath.join(base, path.lstrip("/")))
+            # Like check-markdown-links.py, accept a repo-root-relative path,
+            # but only when nothing exists at the file-relative one, so a link
+            # to a deleted or excluded doc is never redirected to another.
+            if not path.startswith("/") and not (REPO_ROOT / target).exists():
+                target = posixpath.normpath(path)
             target = "" if target == "." else target  # the repo root
             note_id = self.note_ids.get(target) if el.tag == "a" else None
             if note_id:
@@ -446,17 +455,6 @@ def sync(
     # The whole tree: a doc note moved elsewhere in Trilium is found and
     # updated in place instead of duplicated.
     existing = api.search(f"#{PATH_LABEL}")
-    if roots:
-        root_id = roots[0]["noteId"]
-    elif any(label(n, PATH_LABEL) for n in existing):
-        sys.exit(
-            f"Doc notes exist but no note carries #{ROOT_LABEL}. Add that label "
-            f"back to the '{ROOT_TITLE}' note, so its tree isn't split in two."
-        )
-    else:
-        print(f"Creating '{ROOT_TITLE}' under the Trilium root")
-        root_id = api.create("root", ROOT_TITLE, {ROOT_LABEL: "", "sorted": ""})
-
     by_path: dict[str, dict] = {}
     for note in existing:
         attr = label(note, PATH_LABEL)
@@ -470,6 +468,29 @@ def sync(
             )
         by_path[path] = note
 
+    # Everything that can be checked before writing is checked here, so a bad
+    # run exits before touching Trilium.
+    wanted = with_parents(files)
+    stale = sorted(p for p in by_path if p not in wanted and in_scope(p, scope))
+    # A path that matched no doc and no stale note is most likely a typo, or a
+    # gitignored folder: say so rather than report a successful no-op.
+    unmatched = [
+        s for s in scope if not any(in_scope(p, [s]) for p in [*files, *stale])
+    ]
+    if unmatched:
+        sys.exit(f"Nothing to sync or prune under: {', '.join(unmatched)}")
+
+    if roots:
+        root_id = roots[0]["noteId"]
+    elif any(label(n, PATH_LABEL) for n in existing):
+        sys.exit(
+            f"Doc notes exist but no note carries #{ROOT_LABEL}. Add that label "
+            f"back to the '{ROOT_TITLE}' note, so its tree isn't split in two."
+        )
+    else:
+        print(f"Creating '{ROOT_TITLE}' under the Trilium root")
+        root_id = api.create("root", ROOT_TITLE, {ROOT_LABEL: "", "sorted": ""})
+
     # Known notes are link targets only while their path is still syncable,
     # in or out of this run's scope: a link to a deleted, ignored or excluded
     # doc is reported, not pointed at a note that --prune may remove.
@@ -479,7 +500,6 @@ def sync(
     # Folder notes first, so each file has a parent. Root-level files go
     # straight under the root note.
     # Sorting puts every folder before its subfolders.
-    wanted = with_parents(files)
     created = 0
     for sub in sorted(wanted - set(files)):
         name = posixpath.basename(sub)
@@ -547,7 +567,6 @@ def sync(
     # Stale: known paths inside this run's scope that no longer exist. A run
     # on `docs/x.md` never touches the rest. A stale note under a stale
     # folder goes with its folder, so only the topmost ones are deleted.
-    stale = sorted(p for p in by_path if p not in wanted and in_scope(p, scope))
     # A note is only deleted when nothing but already-deleted stale notes sit
     # under it, so a live doc or hand-made note moved there is never lost.
     # Passes repeat (deepest paths first) until one deletes nothing, so the
@@ -599,13 +618,6 @@ def sync(
         f"{len(files)} docs, {updated} written, {len(files) - updated} unchanged, "
         f"{len(stale)} stale, {len(pruned_ids)} pruned"
     )
-    # A path that matched no doc and no stale note is most likely a typo, or a
-    # gitignored folder: say so rather than report a successful no-op.
-    unmatched = [
-        s for s in scope if not any(in_scope(p, [s]) for p in [*files, *stale])
-    ]
-    if unmatched:
-        sys.exit(f"Nothing to sync or prune under: {', '.join(unmatched)}")
 
 
 def main() -> None:
