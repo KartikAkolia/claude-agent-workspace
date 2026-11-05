@@ -1,5 +1,7 @@
 # Laptop VFIO GPU Passthrough — NVIDIA RTX 4060 → Windows VM
 
+> **Current state (2026-11-05):** this host now runs CachyOS with the 4060 on `nvidia`. It has VFIO prep but no GPU stub: `iommu=pt`, early vfio modules, `kvm.conf` and the libvirt `isolated` network. See "CachyOS prep, no GPU stub (2026-11-05)" below. The status line that follows is from the Debian era.
+
 Status: **REVERTED to native host GPU use 2026-09-07 — see "Revert to native NVIDIA driver" section near the end. `win11`/Looking Glass/KVMFR are dormant, not deleted; the GPU currently runs `nvidia` for host-side use (PRIME render offload confirmed working) and the VM cannot start until the revert steps below are undone. Everything below this line describes the passthrough build as it stood before the revert — kept intact as the re-enable runbook.**
 
 > **Flag (2026-09-17, not yet reconciled):** the above status line's "OS: Debian" and "GPU already runs `nvidia`" claims don't match what a session found live on this host today — Arch Linux, dGPU bound to `nouveau`, zero `nvidia*` packages installed prior to that session. Either the host was reinstalled since 2026-09-07 (plausible, given the pre-existing Debian/Arch conflict this doc already flags against `docs/laptop-dual-boot-debian-setup.md` in the "Machine facts" section below), or this status line was already stale when written. That session installed `nvidia-open-dkms` fresh (see `docs/handoff.md`'s 2026-09-17 entry for the full command-by-command record) and left a reboot pending to complete it.
@@ -7,6 +9,40 @@ Status: **REVERTED to native host GPU use 2026-09-07 — see "Revert to native N
 > **Update (2026-09-17, post-reboot): driver switch verified working.** `lspci -k` on `01:00.0` → `Kernel driver in use: nvidia` (was `nouveau`); `nvidia-smi` reports the RTX 4060 Laptop GPU on driver `615.71.09`, active render clients (`Xorg`, `kwin_wayland`); `clinfo` shows one NVIDIA CUDA OpenCL platform populated on the same driver version; `dkms status` → `nvidia/615.71.09, 6.18.52-1-lts, x86_64: installed`. So this host is confirmed **Arch Linux**, on `nvidia-open-dkms` — the Debian/native-driver claims in the status line and "Machine facts" table below are stale (from the earlier, apparently different, host state) and still need reconciling, but the driver-install half of this flag is now resolved.
 >
 > **Update (2026-10-18):** this host now runs Arch Linux with CachyOS repos under the hostname `archlinux`. Identity was confirmed by Wi-Fi MAC `a4:f9:33:cb:70:be` at `192.168.0.13`. The RTX 4060 is on `nvidia` (`linux-cachyos-nvidia-open` 615.78.08, kernel `7.2.10-1-cachyos`), set up for Steam/PRIME gaming with a minimal Plasma desktop. Current host state lives in `docs/archlinux-pacman-config.md`. This doc's Debian-era network and VFIO details are history until re-verified against this install.
+
+## CachyOS prep, no GPU stub (2026-11-05)
+
+Kartik asked to set up this host for passthrough following part 1 of the [vfio-setup-docs wiki](https://github.com/HikariKnight/vfio-setup-docs/wiki/1.-Setting-everything-up). The wiki targets Debian/Ubuntu, so each step was adapted to Arch, mkinitcpio and GRUB. He chose to prepare everything except the GPU stub, because the RTX 4060 is in daily use on `nvidia`: it drives the HDMI monitor and runs CUDA and Steam. The 4060 stays on `nvidia`, and nothing in this section changes that.
+
+State checked first: UEFI boot, `svm` present, `/dev/kvm` present, and the AMD IOMMU already active with 31 groups and no kernel parameter. Group 13 still holds only `01:00.0` `[10de:28a0]` and `01:00.1` `[10de:22be]`. `qemu-desktop` 11.1.3, `libvirt` 12.9.0, `virt-manager` 5.1.0, `edk2-ovmf` 202608 and `swtpm` 0.10.2 were already installed. `kartik` is in `libvirt`. `win11` exists under `qemu:///system` with no `<hostdev>` and the `default` NAT network.
+
+Items 1–4 were done through one `pkexec` run of a reviewed script. Item 5 was done separately with `virsh` as `kartik`, without root:
+
+1. **`iommu=pt`** added to the end of `GRUB_CMDLINE_LINUX_DEFAULT`, then `grub-mkconfig -o /boot/grub/grub.cfg`. All three `linux` lines in `grub.cfg` carry it. Backups: `/etc/default/grub.bak-vfio-prep` and `/boot/grub/grub.cfg.bak-vfio-prep`. The wiki's `amd_iommu=on` was left out: the kernel's `kernel-parameters.txt` lists no `on` value for `amd_iommu=`, and the IOMMU is on by default. Takes effect at the next reboot.
+2. **`/usr/local/bin/ls-iommu`**, the wiki's script with a `sort -V` added so groups print in order.
+3. **`/etc/mkinitcpio.conf.d/vfio.conf`** with `MODULES+=(vfio_pci vfio vfio_iommu_type1)`, then `mkinitcpio -P`. Both initramfs images now contain the vfio modules. The wiki's `vfio_virqfd` no longer exists as a module (`modinfo` can't find it), because it was merged into `vfio`. No device IDs are bound, so this changes nothing at boot except loading the modules.
+4. **`/etc/modprobe.d/kvm.conf`** with `options kvm ignore_msrs=1 report_ignored_msrs=0`, also applied live through `/sys/module/kvm/parameters/` (reads `Y` and `N`).
+5. **libvirt `isolated` network** (no root needed): `10.10.10.1/24`, DHCP `.2`–`.254`, no `<forward>`, on bridge `virbr1`. It's active and set to autostart. `10.10.10.0/24` doesn't clash with the LAN (`192.168.0.0/24`) or `default` (`192.168.122.0/24`). To use it, add a virtio NIC on network `isolated` to a VM; the host is `10.10.10.1`.
+
+Skipped: the wiki's package install (already present) and its AppArmor step. AppArmor isn't running on this host (`/sys/kernel/security/lsm` is `capability,landlock,lockdown,yama,bpf`). If KVMFR comes back, its `/dev/kvmfr0` still needs the udev rule and `cgroup_device_acl` described under Phase 4 below.
+
+Rollback: `cp -a /etc/default/grub.bak-vfio-prep /etc/default/grub && grub-mkconfig -o /boot/grub/grub.cfg`, delete `/etc/mkinitcpio.conf.d/vfio.conf`, `/etc/modprobe.d/kvm.conf` and `/usr/local/bin/ls-iommu`, then run `mkinitcpio -P` once (the `modconf` hook copies `modprobe.d` into the image, so `kvm.conf` has to be gone before the rebuild), and run `virsh -c qemu:///system net-destroy isolated && virsh -c qemu:///system net-undefine isolated`.
+
+After the next reboot, check that `grep -o 'iommu=pt' /proc/cmdline` prints `iommu=pt` and `lspci -k -s 01:00` still shows `01:00.0` on `nvidia` and `01:00.1` on `snd_hda_intel`. Then check that `nvidia-smi -L` lists the 4060, the HDMI monitor works, `lsmod | grep -E '^vfio'` lists the vfio modules, `cat /sys/module/kvm/parameters/ignore_msrs` prints `Y`, and `virsh -c qemu:///system net-list` shows `isolated` active.
+
+**Stubbing later (not done).** When Kartik wants the 4060 in a VM, the remaining step is binding it to `vfio-pci` at boot. `nouveau` is in the initramfs (the `kms` hook adds it), so `vfio-pci` has to claim the card before `nouveau` or `nvidia` loads. The prep above already loads `vfio_pci` early. The stub itself:
+
+```bash
+# /etc/modprobe.d/vfio.conf
+options vfio-pci ids=10de:28a0,10de:22be
+softdep nvidia pre: vfio-pci
+softdep nouveau pre: vfio-pci
+softdep snd_hda_intel pre: vfio-pci
+```
+
+Add `vfio_pci.ids=10de:28a0,10de:22be` to `GRUB_CMDLINE_LINUX_DEFAULT`, then run `mkinitcpio -P && grub-mkconfig -o /boot/grub/grub.cfg` and reboot. Verify with `lspci -nnk -s 01:00` (both functions on `vfio-pci`). This loses the HDMI monitor, CUDA and dGPU gaming on Linux. The other option offered on 2026-11-05 avoids that: put only the GRUB parameter in a second boot entry (for example a `/etc/grub.d/40_custom` copy of the CachyOS entry with `vfio_pci.ids=` added), and leave the `options vfio-pci ids=` line out so the normal boot stays on `nvidia`. That variant hasn't been built or tested.
+
+Other settings aimed at the dGPU need attention when the stub goes in, because `nvidia` won't be loaded then. GRUB carries `nvidia.NVreg_PreserveVideoMemoryAllocations=1`, and `/etc/modprobe.d/no-power-saving.conf` sets `options nvidia NVreg_DynamicPowerManagement=0x00`. Both are inert without the module. The `nvidia-suspend`, `nvidia-hibernate` and `nvidia-resume` units and `nvidia-powerd` are a different matter: check them after the first stubbed boot and a suspend, and disable them if they fail. The `snd_hda_intel` softdep also makes the iGPU's HDMI audio and the onboard audio wait for `vfio-pci` to load, which only delays them slightly.
 
 Status (as of the 2026-08-28 passthrough build, before the 2026-09-07 revert): **Phase 1 (host isolation) done and verified after reboot 2026-08-28. Host Wi-Fi → NetworkManager migration done and verified after reboot 2026-08-28. Phase 3 (Windows 11 VM, `win11`) already built by Kartik outside this runbook's step-by-step, with GPU passthrough confirmed live via domain XML 2026-08-28 — see Phase 3 below for the actual config and where it deviates from the original plan. Phase 4 (Looking Glass) host-side chain fully built and verified live against the running VM 2026-08-28: client compiled + installed, KVMFR module loaded and persistent, IVSHMEM device attached and confirmed in the running QEMU process. Windows-side IDD install is the immediate next step. Phase 2 (vBIOS dump) status not verified this session — apparently not needed since passthrough already works without it.**
 

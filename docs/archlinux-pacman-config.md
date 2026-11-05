@@ -78,7 +78,7 @@ The XP-Pen driver (`xppen-tablet`, a local package from `scripts/xppen-tablet/`)
 
 The machine uses CachyOS's optimized repositories on top of stock Arch. The three `znver4` repos (`cachyos-znver4`, `cachyos-core-znver4`, `cachyos-extra-znver4`) contain packages built for AMD Zen 4. They're listed ahead of `[cachyos]`, `[core]`, `[extra]`, and `[multilib]`, so for any package name found in more than one repo, the Zen 4 build wins. That's only safe on a Zen 4 CPU, or on a VM whose CPU model passes Zen 4 features through. On an older CPU, those packages fail with illegal-instruction errors.
 
-Other non-default settings: `Architecture = x86_64 x86_64_v4` (needed for the CachyOS builds), `IgnorePkg = kwin kscreen libkscreen` (the Plasma flicker hold, see `docs/handoff.md`; drop it before taking Plasma 6.8.2 as a whole, or a partial upgrade can block on dependencies), `Color`, `ILoveCandy`, `ParallelDownloads = 5`, `DownloadUser = alpm`, `[multilib]` turned on, and both testing repos left off. `SigLevel` and `LocalFileSigLevel` are set to stock Arch's values.
+Other non-default settings: `Architecture = x86_64 x86_64_v4` (needed for the CachyOS builds), no active `IgnorePkg` (the last hold, `kwin kscreen libkscreen` for the Plasma flicker, was commented out on 2026-11-05, see `docs/handoff.md`; to hold a package again, uncomment the line and list it, because names added to the commented line are ignored), `Color`, `ILoveCandy`, `ParallelDownloads = 5`, `DownloadUser = alpm`, `[multilib]` turned on, and both testing repos left off. `SigLevel` and `LocalFileSigLevel` are set to stock Arch's values.
 
 Not captured here: what's inside `/etc/pacman.d/cachyos-v4-mirrorlist` and `/etc/pacman.d/cachyos-mirrorlist`, and whether the CachyOS keyring is installed (`pacman -Q cachyos-keyring`).
 
@@ -100,7 +100,7 @@ LOGO=archlinux-logo
 
 ## `/etc/pacman.conf` (verbatim)
 
-Copied from the live file on 2026-10-31, after the Mesa and firmware holds were dropped.
+Copied from the live file on 2026-10-31, after the Mesa and firmware holds were dropped. On 2026-11-05 the `IgnorePkg` line was commented out (`#IgnorePkg   =`); the copy below is updated to match.
 
 ```ini
 #
@@ -127,7 +127,7 @@ HoldPkg     = pacman glibc
 Architecture = x86_64 x86_64_v4
 
 # Pacman won't upgrade packages listed in IgnorePkg and members of IgnoreGroup
-IgnorePkg   = kwin kscreen libkscreen
+#IgnorePkg   =
 #IgnoreGroup =
 
 #NoUpgrade   =
