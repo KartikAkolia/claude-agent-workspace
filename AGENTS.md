@@ -24,6 +24,7 @@ Status, phase history, and timelines live in each project's own `ROADMAP.md`/`TA
 - `docs/vscode-integration-plan.md`: phase-by-phase status of the VS Code integration.
 - `docs/handoff.md`: Cowork session continuity — read this and the files it points to before resuming after a session gap.
 - `docs/archival.md`: session entries and closed open items archived out of `docs/handoff.md` (first split 2026-10-11). History only, not current state. When `docs/handoff.md` gets long again, move its older entries and closed items here verbatim rather than deleting them.
+- `docs/install-fedora.md`: usage, safety behaviour and validation for `scripts/install-fedora.sh`, the EL10/Fedora post-install script. Read it before changing the script. Hard constraint: never nest `if` statements in the script, the `~/.bashrc` block it writes, or its embedded Python. `scripts/test_install_fedora.py` enforces this in CI.
 - `docs/gemini/handoff.md`: gemini-cli's own continuity log, kept separate so each CLI's history stays in its own voice. `GEMINI.md` points gemini-cli at both this and `AGENTS.md`.
 
 ## Sources of Truth

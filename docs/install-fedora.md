@@ -1,8 +1,9 @@
-<!-- coderabbit-ai-generated:v1 -->
-
 # Fedora and EL10 post-install setup
 
-`scripts/install-fedora.sh` supports conventional DNF-based Fedora and Rocky, AlmaLinux, CentOS Stream and RHEL 10. Atomic/rpm-ostree systems are rejected. It changes the host, so first inspect its help and dry-run output.
+`scripts/install-fedora.sh` sets up a fresh DNF-based Fedora or Rocky,
+AlmaLinux, CentOS Stream or RHEL 10 machine, VM or bare metal. It replicates
+the `rocky10` VM setup from 2026-11-06. Atomic/rpm-ostree systems are
+rejected. It changes the host, so read `--help` and a dry run first.
 
 ## Usage
 
@@ -12,51 +13,102 @@ sudo bash scripts/install-fedora.sh --dry-run --user "$USER"
 sudo bash scripts/install-fedora.sh --user "$USER"
 ```
 
-Defaults retain the original requested setup: CachyOS kernel, SELinux disabled, firewalld stopped and masked, build tools, Java 25, CLI tools, fstrim and applicable VM tools. Use the documented flags to opt out. No reboot is performed automatically.
+By default it installs the CachyOS kernel, disables SELinux, stops and masks
+firewalld, and installs the build toolchain, OpenJDK 25, fzf, zoxide,
+starship, fstrim and the matching VM guest agent. Each default has an opt-out
+flag; Cockpit removal is opt-in (`--remove-cockpit`). It never reboots by
+itself.
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:b2ef96a4cec494ab4cd50aecc8f6680cd689b38dd45dc709979bbf6f0190c2b7 -->
-
-Before making changes, preflight checks required commands. Python 3 is required for atomic configuration edits; fallback downloads require curl, tar and sha256sum; user operations require runuser and setpriv. RHEL additionally needs subscription-manager and valid repository access. Missing prerequisites stop the script with a specific message. When a compatible CachyOS kernel needs installation or header repair, preflight also checks the matching COPR repository metadata over HTTPS before changing hostname or configuration. A missing or unreachable repository stops setup. Complete kernel installations avoid this network dependency on reruns.
-
-<!-- /coderabbit-ai-generated:v1 -->
+Exit status 0 means every step finished, 2 means some requested packages
+didn't install, and anything else is a fatal error or a signal. The summary,
+including any pending reboot, still prints after a failure or Ctrl-C, but not
+after SIGKILL. Output is appended to `/var/log/install-fedora.log`.
 
 ## Mandatory control-flow rule
 
-Never nest `if` statements in this installer, its generated Bash block or its embedded Python editors. Use guard clauses and small named helpers. `python3 scripts/test_install_fedora.py` checks shell syntax trees and embedded Python syntax trees. The Bash CI workflow runs this gate with the pinned shfmt version. The gate must stay enabled when changing the installer.
+Never nest `if` statements in this script, the Bash block it writes into
+`~/.bashrc`, or its embedded Python editors. Use guard clauses and small named
+helpers instead. `python3 scripts/test_install_fedora.py` enforces this: it
+parses the shell with `shfmt -tojson` and the embedded Python with `ast`, and
+the Bash CI workflow runs it, so a nested `if` fails CI. Keep the gate enabled
+when changing the installer.
 
-## Preserved state and failure behavior
+## Before it changes anything
 
-The script edits only its delimited `.bashrc` block. Content outside that block is retained, including existing tool initialization lines. Those lines may initialize a tool twice if a manual setup already exists; inspect them yourself before removing any. Reversed, nested and unmatched markers cause an error without rewriting the file. Symlinks and files not owned by the target user are rejected.
+Preflight checks for the commands each enabled step needs and stops with a
+specific message if one is missing: `dnf`, `rpm`, `python3`, `systemctl` and
+`flock` always; `grubby`, `getenforce` and `setenforce` to disable SELinux;
+`runuser`, `setpriv`, `curl`, `sha256sum` and `tar` for the CLI tools;
+`grubby` and `kernel-install` for the kernel; `subscription-manager` on RHEL.
+When the CachyOS kernel or its `-devel-matched` package still needs
+installing, preflight also confirms the COPR repository answers over HTTPS
+before touching the hostname or any config.
 
-Both `.bashrc` and `dnf.conf` use a temporary file in the destination directory, synchronize the file, preserve existing metadata, check for concurrent content changes, then replace atomically and synchronize the directory. The first existing original is backed up with `.bak.install-fedora`. Catchable termination cleans temporary files; SIGKILL or power loss can leave a harmless temporary file. <!-- coderabbit-ai-generated:v1 -->
+A lock on `/run/install-fedora.lock` rejects a second concurrent run. Next,
+`dnf check --dependencies --duplicates` must pass. Any existing RPM dependency
+or duplicate problem, even in an unrelated package, stops the run, typically
+after an interrupted DNF upgrade. Repair it first: DNF4 has
+`dnf remove --duplicates`; on DNF5 check `dnf remove --help`. Review the
+proposed transaction before accepting it. The check skips obsoletes because
+the COPR metapackage has a self-matching legacy Provide that DNF4 reports as a
+self-obsolete.
 
-<!-- coderabbit-ai-generated-section:v1:679ae27099eb2df384471341d8e1aa3829f790606bc5171b1983f85a9a988d73 -->
+## What it preserves
 
-No transaction rollback across package installations is promised. Before host changes, the installer checks RPM dependencies and duplicates under its lock. An interrupted DNF upgrade can leave duplicate system packages; setup then stops with recovery guidance. Review and repair that package-manager state before rerunning. DNF4 provides `dnf remove --duplicates`; DNF5 support depends on its version, so check `dnf remove --help` first. Review the proposed transaction before accepting recovery. The health gate excludes obsoletes checks because the current COPR metapackage has a self-matching legacy Provide that triggers a DNF4 self-obsoletes warning; dependency and duplicate checks still run.
+The script edits only its own delimited block in `~/.bashrc`, and only as the
+target user. Everything outside the block is kept, including tool
+initialization lines from a manual setup, which then run twice; remove those
+by hand if you want. Reversed, nested or unmatched markers, symlinks, and
+files the user doesn't own make it stop without rewriting anything.
 
-<!-- /coderabbit-ai-generated:v1 --> Concurrent script runs are rejected using flock.
+Only the `[main]` section of `/etc/dnf/dnf.conf` is tuned; per-repository
+settings stay. Both files are written to a temporary file in the same
+directory, synced, given the original's metadata, checked for concurrent
+changes, then swapped in atomically. The first original is kept as
+`*.bak.install-fedora`. A power cut or SIGKILL can leave a stray
+`.install-fedora-*` temporary file, which is safe to delete.
 
-Only the `[main]` DNF section is tuned; per-repository overrides remain intact. CentOS Stream and RHEL bootstrap EPEL using its official release RPM URL. DNF4 and DNF5 use their corresponding plugins and configuration commands.
+Package installs aren't rolled back as a transaction.
 
-CachyOS LTS and Server require x86-64-v2; CachyOS and RT require v3. CPUs below v2 retain the stock kernel. A v2 CPU requesting CachyOS or RT receives LTS. Secure Boot enabled or unknown prevents unsigned kernel installation. <!-- coderabbit-ai-generated:v1 -->
+## Kernel
 
-<!-- coderabbit-ai-generated-section:v1:adf11fd1ade39507fd5833a04c4dc11e891145529e54881eeb97255d3270fea5 -->
+CachyOS LTS and Server need an x86-64-v2 CPU; CachyOS and RT need v3. A v2 CPU
+asking for CachyOS or RT gets LTS, and a CPU below v2 keeps the stock kernel.
+If Secure Boot is enabled or its state can't be read, the unsigned COPR kernel
+is skipped.
 
-An existing kernel installation has its matching development package repaired on reruns, while its boot default is preserved to respect deliberate rollback. Missing initramfs files or boot entries after an interrupted RPM transaction are regenerated with kernel-install. Recovery preserves the existing default; inspect it and explicitly select the CachyOS kernel if desired.
+A freshly installed CachyOS kernel becomes the boot default. On reruns the
+current default is left alone, so a deliberate `grubby --set-default` rollback
+to the stock kernel sticks. A missing `-devel-matched` package is installed
+on rerun. If an interrupted RPM transaction left the kernel without its
+initramfs or boot entry, the script regenerates them with `kernel-install`
+and keeps the existing default; select the CachyOS kernel yourself afterwards
+if you want it.
 
-<!-- /coderabbit-ai-generated:v1 -->
+A reboot still pending from an earlier run is detected from the current boot
+default and SELinux state, and reported in the summary.
 
-Target accounts resolving to UID zero are rejected. User commands have a clean environment and inherit `no_new_privs`, preventing sudo/setuid elevation. Fallback installer scripts use versioned URLs and SHA-256 checks. Starship's release is pinned too; the pinned Zoxide installer still resolves its latest upstream binary. Downloads remain dependent on trusted upstream HTTPS services. Tools are checked in the target user's PATH.
+## Downloads and the target user
 
-Exit status 0 means processing completed, 2 means requested packages remain incomplete, and other nonzero statuses indicate fatal errors or signals. The EXIT handler prints completed work and known reboot requirements after failures and catchable interruption. Reboot requirements configured before a prior run are detected from current SELinux state. SIGKILL cannot print a summary.
+The target user comes from `--user` or `$SUDO_USER`; accounts with UID 0 are
+rejected. Commands run as that user with a clean environment and
+`no_new_privs`, so they can't escalate through sudo or setuid binaries.
 
-`--dry-run` avoids DNF repository queries and all writes. Repository availability is unresolved in this mode, so a CLI-tool download can be shown even if a normal run would select a distribution package. `OS_RELEASE_FILE` can override OS detection only during dry runs.
+zoxide (EL only; Fedora packages it) and starship (packaged nowhere) come
+from upstream install scripts pinned to a version and checked against a
+SHA-256 before they run. Updating either means changing its URL and checksum
+in the script. The pinned zoxide installer still downloads the latest zoxide
+binary. Both depend on trusting the upstream HTTPS services.
+
+`--dry-run` makes no writes and no DNF repository queries, so it can't tell
+whether a distro package exists. It may show an upstream download where a real
+run would use `dnf`. `OS_RELEASE_FILE` overrides OS detection, but only
+together with `--dry-run`.
 
 ## Validation
 
-Run the focused checks from the repository root with the versions in `.lint-versions`:
+Run these from the repository root with the linter versions in
+`.lint-versions`:
 
 ```bash
 ./lint-bash.sh scripts/install-fedora.sh
@@ -65,16 +117,10 @@ python3 scripts/test_install_fedora.py
 ./validate-config.sh .github/workflows/lint-bash.yml
 ```
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:6d5a8f41386f8f41cd1a4a9b33c50b6352eea555362ee8bc5f92d8fadf103cca -->
-
-The regression suite uses synthetic files and mocked package and boot commands. It does not install packages or change host configuration. Full package, service and reboot verification requires disposable Fedora and EL10 VMs. Keep their disk overlays, SSH keys and logs outside the repository. Exercise the default installation, rerun it, interrupt a run, rerun after the interruption, and reboot to check `uname -r`, `getenforce`, `grubby --default-kernel` and service state. Include CPUs below v2 and UEFI Secure Boot in additional platform coverage. The current sandbox runtime matrix uses Fedora Cloud 43 and CentOS Stream 10; other releases and distributions need separate verification. Under QEMU TCG, the supported guest setting `HARDLINK=no` in `/etc/sysconfig/kernel` avoids slow optional kernel-header deduplication. <!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:63e18e5f696b8302f65660a974c0a2a1ef7820f18ecff215328aab3f312a6b47 -->
-
-This is a disposable test-fixture setting; the installer does not change it. Additional pristine default-install fixtures set `hostonly="yes"` in `/etc/dracut.conf.d/99-audit-hostonly.conf` to reduce generic-driver image generation. The original recovery fixtures retain generic initramfs generation. Both configurations require real boot checks.
-
-<!-- /coderabbit-ai-generated:v1 --> Guests making outbound HTTPS downloads must trust the sandbox public proxy CA when applicable; keep TLS verification enabled.
-
-<!-- /coderabbit-ai-generated:v1 -->
+The regression suite uses synthetic files and mocked package and boot
+commands; it installs nothing and changes no host config. Package, service
+and reboot behaviour still needs a disposable Fedora and EL10 VM: run the
+default install, rerun it, interrupt a run and rerun, then reboot and check
+`uname -r`, `getenforce`, `sudo grubby --default-kernel` and service state.
+CPUs below x86-64-v2 and Secure Boot machines need separate coverage. As of
+2026-11-06 no real run on EL10 or Fedora has been recorded.
