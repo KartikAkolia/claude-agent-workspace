@@ -500,6 +500,11 @@ secure_boot_state() {
 		echo enabled
 		return 0
 		;;
+	*"doesn't support Secure Boot"*)
+		# mokutil's message when the firmware has no SecureBoot variable.
+		echo disabled
+		return 0
+		;;
 	*"SecureBoot disabled"* | *"EFI variables are not supported on this system"*)
 		# Only a BIOS boot independently proves Secure Boot is inapplicable.
 		efi_booted || {
@@ -517,12 +522,27 @@ secure_boot_state() {
 		return 0
 	}
 	var="$(compgen -G '/sys/firmware/efi/efivars/SecureBoot-*' | head -n1 || true)"
+	[[ -n "$var" ]] || {
+		missing_secure_boot_variable_state
+		return 0
+	}
 	value="$(od -An -t u1 -j4 -N1 "${var:-/nonexistent}" 2>/dev/null | tr -d ' ' || true)"
 	case "$value" in
 	1) echo enabled ;;
 	0) echo disabled ;;
 	*) echo unknown ;;
 	esac
+}
+
+# Firmware without Secure Boot support (e.g. OVMF_CODE.4m.fd, the non-secboot
+# OVMF build) never creates the SecureBoot variable. Trust its absence only
+# when other EFI variables are readable; an unreadable efivarfs stays unknown.
+missing_secure_boot_variable_state() {
+	compgen -G '/sys/firmware/efi/efivars/*-*' >/dev/null || {
+		echo unknown
+		return 0
+	}
+	echo disabled
 }
 
 cpu_supports_level() {

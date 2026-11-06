@@ -250,6 +250,23 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "unknown")
 
+    def test_firmware_without_secure_boot_support_is_disabled(self):
+        # Non-secboot OVMF (OVMF_CODE.4m.fd) has EFI variables but no SecureBoot.
+        result = self.ok(
+            "efi_booted() { return 0; }; have() { [[ $1 != mokutil ]]; }; "
+            'compgen() { [[ "$2" == *SecureBoot-* ]] && return 1; echo var; }; '
+            "secure_boot_state"
+        )
+        self.assertEqual(result.stdout.strip(), "disabled")
+
+    def test_mokutil_unsupported_message_is_disabled(self):
+        result = self.ok(
+            "efi_booted() { return 0; }; have() { return 0; }; "
+            'mokutil() { echo "This system doesn\'t support Secure Boot"; }; '
+            "secure_boot_state"
+        )
+        self.assertEqual(result.stdout.strip(), "disabled")
+
     def test_secure_boot_fallback(self):
         for value, expected in ((0, "disabled"), (1, "enabled")):
             result = self.ok(
