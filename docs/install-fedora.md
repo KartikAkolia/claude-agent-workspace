@@ -122,5 +122,13 @@ commands; it installs nothing and changes no host config. Package, service
 and reboot behaviour still needs a disposable Fedora and EL10 VM: run the
 default install, rerun it, interrupt a run and rerun, then reboot and check
 `uname -r`, `getenforce`, `sudo grubby --default-kernel` and service state.
-CPUs below x86-64-v2 and Secure Boot machines need separate coverage. As of
-2026-11-06 no real run on EL10 or Fedora has been recorded.
+CPUs below x86-64-v2 and Secure Boot machines need separate coverage.
+
+Real runs so far: on 2026-11-06 a fresh Rocky Linux 10.2 KVM guest
+(`rocky10`, non-secboot `OVMF_CODE.4m.fd`, `host-passthrough` CPU) was set
+up with the defaults. After the reboot, `uname -r` gave
+`7.3.1-1.cachyos1.el10.x86_64` and `getenforce` gave `Disabled`. That run
+found the Secure Boot bug fixed in `26db1b8`: firmware without Secure Boot
+support has no `SecureBoot` EFI variable, which the script had reported as
+"unknown" and so skipped the kernel. Fedora, bare metal and Secure Boot
+machines are still untested.
