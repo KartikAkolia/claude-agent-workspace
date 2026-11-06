@@ -30,6 +30,8 @@ Rollback: `cp -a /etc/default/grub.bak-vfio-prep /etc/default/grub && grub-mkcon
 
 After the next reboot, check that `grep -o 'iommu=pt' /proc/cmdline` prints `iommu=pt` and `lspci -k -s 01:00` still shows `01:00.0` on `nvidia` and `01:00.1` on `snd_hda_intel`. Then check that `nvidia-smi -L` lists the 4060, the HDMI monitor works, `lsmod | grep -E '^vfio'` lists the vfio modules, `cat /sys/module/kvm/parameters/ignore_msrs` prints `Y`, and `virsh -c qemu:///system net-list` shows `isolated` active.
 
+**Verified after the 2026-11-05 14:51 reboot:** all of the above passed, the kernel journal had no amdgpu, nvidia, vfio or IOMMU errors, and the 4060's IOMMU group 13 contains only `01:00.0` and `01:00.1`, so it can be passed through without an ACS override.
+
 **Stubbing later (not done).** When Kartik wants the 4060 in a VM, the remaining step is binding it to `vfio-pci` at boot. `nouveau` is in the initramfs (the `kms` hook adds it), so `vfio-pci` has to claim the card before `nouveau` or `nvidia` loads. The prep above already loads `vfio_pci` early. The stub itself:
 
 ```bash
