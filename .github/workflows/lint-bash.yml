@@ -16,12 +16,14 @@ on:
   push:
     paths:
       - "**.sh"
+      - "scripts/test_install_fedora.py"
       - ".githooks/pre-commit"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
   pull_request:
     paths:
       - "**.sh"
+      - "scripts/test_install_fedora.py"
       - ".githooks/pre-commit"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
@@ -65,3 +67,6 @@ jobs:
         run: |
           mapfile -t files < <(./list-lint-files.sh bash)
           ./lint-bash.sh "${files[@]}"
+
+      - name: Installer regression and mandatory no-nested-if checks
+        run: python3 scripts/test_install_fedora.py
