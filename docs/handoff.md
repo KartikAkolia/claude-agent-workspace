@@ -2,9 +2,13 @@
 
 Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read the files below before doing anything else, they carry the context this note doesn't repeat.
 
-## Where things stand (as of 2026-11-05)
+## Where things stand (as of 2026-11-09)
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Session entries since 2026-10-11 are kept below, newest first. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
+
+### This session's work (2026-11-09, on the CachyOS laptop): NVIDIA 620 on kernel 7.3.3; reboot verified
+
+Kartik asked for GPU-driver and gaming packages, plus the official CachyOS kernel instructions, researched with Firecrawl. The laptop had booted the `linux-lts` rescue kernel, so the 4060 was on `nouveau`. Arch's `nvidia-open-lts` (615.78.08) failed to install because the CachyOS repos already serve `nvidia-utils` and `lib32-nvidia-utils` at 620.70.06. Kartik installed `linux-cachyos`, `linux-cachyos-nvidia-open` and the matching userspace instead, then regenerated `grub.cfg` and rebooted. Afterwards, `7.3.3-1-cachyos` has `01:00.0` on `nvidia`, `nvidia-smi -L` lists the 4060, and `prime-run vulkaninfo` sees both GPUs. Everything was run by Kartik and checked from his pasted output. The full record is in `docs/archlinux-pacman-config.md`, in the 2026-11-09 paragraph of "Gaming setup". The gaming stack line (`steam lutris wine-staging …`) was suggested, but nothing shows it ran. `[multilib-testing]` was found enabled; see item 46.
 
 ### This session's work (2026-11-05, cont'd, on the CachyOS laptop): VFIO prep without a GPU stub; reboot verified
 
@@ -182,7 +186,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 46.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 47.
 
 - **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
@@ -202,6 +206,7 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
 - **42.** **CachyOS laptop: finish verifying Brave's Wayland trial.** (2026-10-25) `~/.config/brave-origin-flags.conf` uses `--ozone-platform=wayland` and `--disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL`. Hardware decode was confirmed in `brave://media-internals`, but the `brave://gpu` log hasn't been checked for an `eglCreateImage` error *after* playback. To revert, copy `brave-origin-flags.conf.x11.bak` over the live file. Details are in `docs/archlinux-pacman-config.md`.
 - **43.** **`scripts/disable-device-power-saving.sh`: three follow-ups from the 2026-10-31 review.** (2026-10-31) Kartik chose to commit without them. First, `--undo` can't skip a backed-up Wi-Fi profile that has since been deleted: it dies with "cannot read Wi-Fi policy" (see item 37's Wi-Fi drift note). Second, an install that fails but rolls back cleanly keeps its full `/boot` copy in `run.*`, and nothing marks that directory as safe to delete. Third, when the early-failure tidy itself fails, the directory keeps `/boot` with no `aborted` marker.
 - **44.** **AdGuardHome leftovers outside the Pi's filesystem.** (2026-10-31) Three things are still to do after the removal. First, Nginx Proxy Manager proxy host 7 (`adguardhome.kartikpassbolt.org` → `https://192.168.0.166:8443`, certificate `npm-17`) now has no backend. Delete it in the NPM UI, which also lets NPM drop the `npm-17` certificate. Second, the grey-cloud `adguardhome` DNS record in the `kartikpassbolt.org` Cloudflare zone points at nothing that's still running, and it exposes the origin IP (`docs/cloudflare-zone-settings.md`). Delete it. Third, any device or router set to use the Pi for DNS (plain DNS, DoT on 853 or DoH on `adguardhome.kartikpassbolt.org`) has to be switched to another resolver. This session couldn't see the router's DHCP DNS setting.
+- **46.** **CachyOS laptop: keep or disable `[multilib-testing]`?** (2026-11-09) `/etc/pacman.conf` now has `[multilib-testing]` enabled above `[multilib]`, but the 2026-10-18 snapshot in `docs/archlinux-pacman-config.md` has it commented out. While enabled, 32-bit packages come from Arch testing whenever testing is newer. If it wasn't deliberate, comment it out and run `sudo pacman -Syuu`.
 
 ## Notes
 
