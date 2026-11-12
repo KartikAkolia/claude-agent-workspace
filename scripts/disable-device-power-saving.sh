@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Disable device power saving on asus-vivobook (Arch, GRUB, mkinitcpio).
 # Keep this file beside device-power-saving-config.py. Requires Python 3,
-# NetworkManager, iw and kmod. Suspend, hibernate and lid policy are untouched.
+# NetworkManager, iw, kmod, pciutils and systemd. Suspend, hibernate and lid
+# policy are untouched. device-power-late.service runs a late boot pass that
+# re-forces power/control=on after drivers re-enable runtime PM and clears
+# PCIe ASPM that firmware keeps despite pcie_aspm.policy (ACPI FADT). It
+# re-runs after resume from suspend only; the hibernate targets are masked on
+# this host. Undo leaves the late pass's (empty) drop-in directories behind.
 # Run: scripts/disable-device-power-saving.sh
 # Undo: scripts/disable-device-power-saving.sh --undo BACKUP_DIRECTORY
 # Each successful run prints its private backup path. Undo runs in reverse order.
@@ -28,12 +33,17 @@ readonly BOOT_DIR=/boot
 # Presets writing outside /boot need their own backup before using this script.
 HELPER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/device-power-saving-config.py"
 readonly HELPER
-readonly FILES=(/etc/udev/rules.d/99-no-runtime-pm.rules /etc/modprobe.d/no-power-saving.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf "$GRUB_FILE")
+# GRUB stays at index 3; older backups predate indices 4-7 and lack them.
+readonly FILES=(/etc/udev/rules.d/99-no-runtime-pm.rules /etc/modprobe.d/no-power-saving.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf "$GRUB_FILE"
+	/etc/systemd/system/device-power-late.service /etc/systemd/system/multi-user.target.d/device-power-late.conf /usr/local/sbin/device-power-late
+	/etc/systemd/system/suspend.target.d/device-power-late.conf)
+# Whole-file managed entries (everything except GRUB).
+readonly MANAGED=(0 1 2 4 5 6 7)
 die() {
 	echo "error: $*" >&2
 	exit 1
 }
-for tool in python3 grub-mkconfig mkinitcpio modprobe nmcli iw udevadm flock; do
+for tool in python3 grub-mkconfig mkinitcpio modprobe nmcli iw udevadm flock setpci systemctl; do
 	command -v "$tool" >/dev/null || die "$tool not found"
 done
 [[ -f $HELPER ]] || die "missing $HELPER"
@@ -129,6 +139,7 @@ finish() {
 		cp -a -- "$backup/boot/." "$BOOT_DIR/" || failed=true
 		restore_cursor "$backup" || failed=true
 		udevadm control --reload || failed=true
+		systemctl daemon-reload || failed=true
 		nmcli general reload conf || failed=true
 		if $failed; then
 			echo "RECOVERY INCOMPLETE: do not reboot; retry: $0 --recover $backup" >&2
@@ -163,6 +174,7 @@ if [[ ${1:-} == --recover ]]; then
 	cp -a -- "$backup/boot/." "$BOOT_DIR/"
 	restore_cursor "$backup"
 	udevadm control --reload
+	systemctl daemon-reload
 	nmcli general reload conf
 	phase=none
 	rm -f -- "$backup/pending"
@@ -183,8 +195,13 @@ if [[ ${1:-} == --undo ]]; then
 	[[ $(readlink -f "$STATE_ROOT/current") == "$backup" ]] || die "undo the most recent run first"
 	# Refuse undo out of order and preserve later user edits rather than
 	# overwriting them with an old whole-file snapshot.
-	for i in 0 1 2; do
-		cmp -s "${FILES[i]}" "$backup/after/$i" || die "${FILES[i]} changed; reconcile it before undo"
+	for i in "${MANAGED[@]}"; do
+		if [[ -f $backup/after/$i ]]; then
+			cmp -s "${FILES[i]}" "$backup/after/$i" || die "${FILES[i]} changed; reconcile it before undo"
+		else
+			# A run from before this file was managed never installed it.
+			[[ ! -e ${FILES[i]} ]] || die "${FILES[i]} was not installed by this run; reconcile it before undo"
+		fi
 	done
 	while read -r uuid value; do
 		require_disabled "$uuid" "Wi-Fi profile $uuid changed; reconcile it before undo"
@@ -205,7 +222,8 @@ fi
 mkdir "$backup/before" "$backup/after"
 for i in "${!FILES[@]}"; do
 	file=${FILES[i]}
-	[[ -d $(dirname "$file") ]] || die "missing configuration directory for $file"
+	# Late-pass parents (indices 4+) may be absent; install creates them.
+	[[ -d $(dirname "$file") ]] || ((i > 3)) || die "missing configuration directory for $file"
 	[[ ! -L $file && (! -e $file || -f $file) ]] || die "refusing non-regular configuration: $file"
 	[[ ! -f $file ]] || cp -a -- "$file" "$backup/before/$i"
 done
@@ -235,7 +253,7 @@ bash -n "$backup/new-grub"
 touch "$backup/pending"
 phase=pending
 if [[ -n ${source_backup:-} ]]; then
-	for i in 0 1 2; do
+	for i in "${MANAGED[@]}"; do
 		if [[ -f $source_backup/before/$i ]]; then
 			place "$source_backup/before/$i" "${FILES[i]}"
 		else
@@ -244,6 +262,8 @@ if [[ -n ${source_backup:-} ]]; then
 	done
 	restore_profiles "$source_backup"
 else
+	# Late-pass parents may not exist yet; create them world-readable.
+	(umask 022 && for i in 4 5 6 7; do mkdir -p -- "$(dirname "${FILES[i]}")" || exit; done)
 	cat >"$backup/after/0" <<'EOF'
 # Installed by disable-device-power-saving.sh
 ACTION=="add|bind", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
@@ -253,18 +273,85 @@ EOF
 # Installed by disable-device-power-saving.sh
 options snd_hda_intel power_save=0 power_save_controller=N
 options nvidia NVreg_DynamicPowerManagement=0x00
-options iwlmvm power_scheme=1
+options mt7921e disable_aspm=Y
 EOF
 	cat >"$backup/after/2" <<'EOF'
 # Installed by disable-device-power-saving.sh
 [connection]
 wifi.powersave=2
 EOF
-	for i in 0 1 2; do
-		chmod 644 "$backup/after/$i"
+	cat >"$backup/after/4" <<'EOF'
+# Installed by disable-device-power-saving.sh
+[Unit]
+Description=Late device power policy pass (disable-device-power-saving.sh)
+# After=suspend.target plus the suspend.target drop-in re-runs it on resume.
+After=systemd-udev-trigger.service sound.target suspend.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/device-power-late
+EOF
+	cat >"$backup/after/5" <<'EOF'
+# Installed by disable-device-power-saving.sh
+[Unit]
+Wants=device-power-late.service
+EOF
+	cp -- "$backup/after/5" "$backup/after/7"
+	cat >"$backup/after/6" <<'EOF'
+#!/usr/bin/env bash
+# Installed by disable-device-power-saving.sh; run by device-power-late.service.
+# Drivers such as snd_hda_intel re-enable runtime PM after the udev bind rule,
+# and firmware that owns ASPM (ACPI FADT) keeps L0s/L1 on regardless of
+# pcie_aspm.policy. This pass runs once udev has settled, and after resume.
+set -u
+status=0
+force_on() {
+	local ctl
+	for ctl in /sys/bus/usb/devices/*/power/control /sys/bus/pci/devices/*/power/control; do
+		[[ -e $ctl && $(<"$ctl") != on ]] || continue
+		if echo on >"$ctl"; then
+			echo "$1: runtime PM forced off for ${ctl%/power/control}"
+		else
+			echo "warning: cannot write $ctl" >&2
+		fi
+	done
+}
+udevadm settle --timeout=30 || echo "udev queue not settled; continuing" >&2
+force_on pass
+# Drivers that finish probing asynchronously can re-enable runtime PM after
+# the first pass; the recheck catches and logs them.
+sleep 3
+force_on recheck
+# Clear Link Control ASPM bits 0-1, deepest functions first, so each endpoint
+# is disabled before its upstream bridge.
+mapfile -t devices < <(
+	for dev in /sys/bus/pci/devices/*; do
+		[[ -e $dev ]] || continue
+		path=$(readlink -f "$dev")
+		slashes=${path//[!\/]/}
+		printf '%d %s\n' "${#slashes}" "${dev##*/}"
+	done | sort -k1,1nr -k2,2 | cut -d' ' -f2
+)
+for dev in "${devices[@]}"; do
+	lnkctl=$(setpci -s "$dev" CAP_EXP+10.w 2>/dev/null) || continue
+	# ffff means the device isn't answering; a masked write would set Link Disable.
+	[[ $lnkctl =~ ^[0-9a-fA-F]{4}$ && ${lnkctl,,} != ffff ]] || continue
+	((0x$lnkctl & 3)) || continue
+	if setpci -s "$dev" CAP_EXP+10.w=0:3; then
+		echo "ASPM disabled on $dev (Link Control was $lnkctl)"
+	else
+		status=1
+	fi
+done
+exit "$status"
+EOF
+	chmod 644 "$backup"/after/{0,1,2,4,5,7}
+	for i in "${MANAGED[@]}"; do
 		if [[ -f $backup/before/$i ]]; then
 			cp --attributes-only --preserve=all "$backup/before/$i" "$backup/after/$i"
 		fi
+		# Keep the helper executable even when replacing a file with another mode.
+		[[ $i != 6 ]] || chmod 755 "$backup/after/6"
 		place "$backup/after/$i" "${FILES[i]}"
 	done
 	modprobe --showconfig >"$backup/effective-modules"
@@ -282,6 +369,7 @@ if [[ -z ${source_backup:-} ]]; then
 	python3 "$HELPER" boot <"$BOOT_DIR/grub/grub.cfg"
 fi
 udevadm control --reload
+systemctl daemon-reload
 nmcli general reload conf
 if [[ -n ${source_backup:-} ]]; then
 	touch "$source_backup/undone"
@@ -300,13 +388,11 @@ phase=none
 rm -f -- "$backup/pending"
 
 if [[ -n ${source_backup:-} ]]; then
+	systemctl reset-failed device-power-late.service 2>/dev/null || true
 	echo "Undo complete. Reboot to restore device policy, including loaded udev/sysfs and Wi-Fi state."
 else
 	# Live application is best effort. No new boot-time failure can follow it.
 	echo -1 >/sys/module/usbcore/parameters/autosuspend || true
-	for ctl in /sys/bus/usb/devices/*/power/control /sys/bus/pci/devices/*/power/control; do
-		[[ ! -e $ctl ]] || echo on >"$ctl" || true
-	done
 	echo performance >/sys/module/pcie_aspm/parameters/policy 2>/dev/null || true
 	for spec in power_save:0 power_save_controller:N; do
 		file=/sys/module/snd_hda_intel/parameters/${spec%:*}
@@ -317,5 +403,7 @@ else
 		iface=${dev%/wireless}
 		iw dev "${iface##*/}" set power_save off || echo "Reboot needed for Wi-Fi policy on ${iface##*/}" >&2
 	done
+	# The late pass also forces power/control on and clears firmware-held ASPM.
+	systemctl start device-power-late.service || echo "Late pass failed; see: journalctl -u device-power-late" >&2
 	echo "Done. Reboot for full device policy. Undo: $0 --undo $backup"
 fi

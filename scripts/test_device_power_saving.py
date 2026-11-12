@@ -18,7 +18,7 @@ POLICY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(POLICY)
 MODULES = """options snd_hda_intel power_save=0 power_save_controller=N
 options nvidia NVreg_DynamicPowerManagement=0x00
-options iwlmvm power_scheme=1
+options mt7921e disable_aspm=Y
 """
 STUB = r"""#!/usr/bin/env python3
 import json, os
@@ -62,6 +62,18 @@ if name == 'nmcli':
         profiles[args[3]] = int(args[-1])
         (root / 'modified').write_text('')
         store.write_text(json.dumps(profiles))
+elif name == 'setpci':
+    store = root / 'lnkctl.json'
+    links = json.loads(store.read_text()) if store.exists() else {}
+    if args[1] not in links:
+        sys.exit(1)
+    if args[2] == 'CAP_EXP+10.w':
+        print(links[args[1]])
+    elif args[2] == 'CAP_EXP+10.w=0:3':
+        if (root / 'fail-setpci').exists():
+            sys.exit(1)
+        links[args[1]] = format(int(links[args[1]], 16) & ~3, '04x')
+        store.write_text(json.dumps(links))
 elif name == 'modprobe':
     print((root / 'etc/modprobe.d/no-power-saving.conf').read_text())
     print((root / 'effective-modules').read_text())
@@ -137,7 +149,7 @@ class GrubTests(unittest.TestCase):
             "options nvidia NVreg_DynamicPowerManagement=0x03",
             "options snd-hda-intel power_save=10",
             "options snd_hda_intel power_save_controller=Y",
-            "options iwlmvm power_scheme=2",
+            "options mt7921e disable_aspm=N",
         ):
             with self.subTest(conflict=conflict), self.assertRaises(ValueError):
                 POLICY.modules(MODULES + conflict)
@@ -187,16 +199,25 @@ class InstallTests(unittest.TestCase):
             "grub-mkconfig",
             "udevadm",
             "iw",
+            "setpci",
+            "systemctl",
         ):
             self.tool(name, STUB)
+        self.tool("sleep", "#!/bin/sh\nexit 0\n")  # the late pass's recheck delay
         self.script = self.root / "disable-device-power-saving.sh"
         source = (SCRIPTS / self.script.name).read_text()
         source = source.replace("if ((EUID != 0)); then", "if false; then")
-        for prefix in ("/etc/", "/sys/", "/var/lib/"):
+        for prefix in ("/etc/", "/sys/", "/var/lib/", "/usr/local/"):
             source = source.replace(prefix, str(self.root) + prefix)
         source = source.replace("BOOT_DIR=/boot", "BOOT_DIR=" + str(self.root / "boot"))
         self.script.write_text(source)
         shutil.copy2(SCRIPTS / "device-power-saving-config.py", self.root)
+        self.late = [
+            self.root / "etc/systemd/system/device-power-late.service",
+            self.root / "etc/systemd/system/multi-user.target.d/device-power-late.conf",
+            self.root / "usr/local/sbin/device-power-late",
+            self.root / "etc/systemd/system/suspend.target.d/device-power-late.conf",
+        ]
         self.env = os.environ | {
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "HOST": str(self.root),
@@ -229,7 +250,7 @@ class InstallTests(unittest.TestCase):
                 path.read_bytes(),
                 path.stat().st_mode & 0o777,
             )
-            for parent in (("etc", "boot") if include_boot else ("etc",))
+            for parent in (("etc", "usr", "boot") if include_boot else ("etc", "usr"))
             for path in (self.root / parent).rglob("*")
             if path.is_file()
         }
@@ -245,7 +266,19 @@ class InstallTests(unittest.TestCase):
             {"111-aaa": 2, "222-bbb": 2},
         )
         self.assertEqual(self.modprobe.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            [path.stat().st_mode & 0o777 for path in self.late],
+            [0o644, 0o644, 0o755, 0o644],
+        )
+        self.assertIn("ExecStart=" + str(self.late[2]), self.late[0].read_text())
+        self.assertIn("Wants=device-power-late.service", self.late[1].read_text())
+        self.assertEqual(self.late[1].read_text(), self.late[3].read_text())
+        self.assertIn("suspend.target", self.late[0].read_text())
+        calls = (self.root / "calls").read_text()
+        self.assertIn('["systemctl", "daemon-reload"]', calls)
+        self.assertIn('["systemctl", "start", "device-power-late.service"]', calls)
         self.run_policy("--undo", self.latest())
+        self.assertFalse(any(path.exists() for path in self.late))
         self.assertEqual(self.originals(include_boot=False), before)
         self.assertEqual(
             json.loads((self.root / "wifi.json").read_text()),
@@ -276,6 +309,103 @@ class InstallTests(unittest.TestCase):
         self.assertIn("GRUB_TIMEOUT=9", self.grub.read_text())
         self.assertIn("usbcore.autosuspend=2", self.grub.read_text())
 
+    def test_undo_of_backup_predating_late_pass(self):
+        before = self.originals(include_boot=False)
+        self.run_policy()
+        run = self.latest()
+        for i in (4, 5, 6, 7):
+            (run / "after" / str(i)).unlink()
+        result = self.run_policy("--undo", run, success=False)
+        self.assertIn("was not installed by this run", result.stderr)
+        for path in self.late:
+            path.unlink()
+        self.run_policy("--undo", run)
+        self.assertEqual(self.originals(include_boot=False), before)
+
+    def late_fixture(self):
+        self.run_policy()
+        devices = self.root / "sys/devices/pci0000:00"
+        bus = self.root / "sys/bus/pci/devices"
+        for name, control in (
+            ("0000:00:02.4", "on"),
+            ("0000:00:02.4/0000:03:00.0", "auto"),
+            ("0000:00:08.0", "auto"),
+            ("0000:00:09.0", "on"),
+        ):
+            (devices / name / "power").mkdir(parents=True)
+            (devices / name / "power/control").write_text(control)
+            (bus / name.split("/")[-1]).symlink_to(devices / name)
+        links = {
+            "0000:00:02.4": "0042",
+            "0000:03:00.0": "0142",
+            "0000:00:08.0": "0040",
+            "0000:00:09.0": "ffff",
+        }
+        (self.root / "lnkctl.json").write_text(json.dumps(links))
+        (self.root / "calls").write_text("")
+        return bus
+
+    def run_late(self):
+        return subprocess.run(
+            [str(self.late[2])],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+
+    def test_late_pass_clears_aspm_downstream_first(self):
+        bus = self.late_fixture()
+        # An unwritable control only warns; it must not fail the unit.
+        (bus / "fixture/power/control").unlink()
+        (bus / "fixture/power/control").mkdir()
+        result = self.run_late()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: cannot write", result.stderr)
+        self.assertEqual(
+            json.loads((self.root / "lnkctl.json").read_text()),
+            {
+                "0000:00:02.4": "0040",
+                "0000:03:00.0": "0140",
+                "0000:00:08.0": "0040",
+                "0000:00:09.0": "ffff",
+            },
+        )
+        writes = [
+            json.loads(line)[2]
+            for line in (self.root / "calls").read_text().splitlines()
+            if line.endswith('"CAP_EXP+10.w=0:3"]')
+        ]
+        self.assertEqual(writes, ["0000:03:00.0", "0000:00:02.4"])
+        controls = {
+            path.read_text().strip()
+            for path in bus.glob("*/power/control")
+            if path.is_file()
+        }
+        self.assertEqual(controls, {"on"})
+
+    def test_late_pass_fails_on_aspm_write_error(self):
+        self.late_fixture()
+        (self.root / "fail-setpci").write_text("")
+        self.assertEqual(self.run_late().returncode, 1)
+
+    def test_failed_late_start_keeps_install(self):
+        self.tool("systemctl", '#!/bin/sh\n[ "$1" = start ] && exit 5\nexit 0\n')
+        result = self.run_policy()
+        self.assertIn("Late pass failed", result.stderr)
+        self.assertTrue((self.latest() / "complete").exists())
+
+    def test_existing_helper_mode_does_not_block_execution(self):
+        self.late[2].parent.mkdir(parents=True)
+        self.late[2].write_text("# old helper\n")
+        self.late[2].chmod(0o644)
+        before = self.originals(include_boot=False)
+        self.run_policy()
+        self.assertEqual(self.late[2].stat().st_mode & 0o777, 0o755)
+        self.run_policy("--undo", self.latest())
+        self.assertEqual(self.originals(include_boot=False), before)
+
     def test_undo_refuses_later_dropin_or_profile_changes(self):
         self.run_policy()
         self.modprobe.write_text("# changed by user")
@@ -284,7 +414,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.originals(), before)
 
     def test_build_and_reload_failures_restore_originals(self):
-        for command in ("mkinitcpio", "grub-mkconfig", "udevadm"):
+        for command in ("mkinitcpio", "grub-mkconfig", "udevadm", "systemctl"):
             with self.subTest(command=command):
                 before = self.originals()
                 (self.root / "fail").write_text(command)

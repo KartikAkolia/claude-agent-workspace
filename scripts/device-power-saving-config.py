@@ -62,7 +62,7 @@ def modules(text):
         ("snd_hda_intel", "power_save"): "0",
         ("snd_hda_intel", "power_save_controller"): "n",
         ("nvidia", "NVreg_DynamicPowerManagement"): "0",
-        ("iwlmvm", "power_scheme"): "1",
+        ("mt7921e", "disable_aspm"): "y",
     }
     effective = {}
     for line in text.splitlines():
@@ -78,6 +78,8 @@ def modules(text):
         value = effective.get(key, "").lower()
         if wanted == "n":
             valid = value in ("n", "no", "0", "false")
+        elif wanted == "y":
+            valid = value in ("y", "yes", "1", "true")
         else:
             try:
                 valid = int(value, 16 if value.startswith("0x") else 10) == int(wanted)
