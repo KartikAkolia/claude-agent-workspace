@@ -5,8 +5,9 @@
 Self-hosted [Vaultwarden](https://github.com/dani-garcia/vaultwarden) (Bitwarden-compatible server), reachable at `https://vault.kartikpassbolt.org`.
 
 - Host: Raspberry Pi 5, Raspberry Pi OS (forky/sid), aarch64. Local IP `192.168.0.166`.
-- SSH: `ssh pi` (alias already configured on the Windows side, key-based, no password prompt).
+- SSH: `ssh pi` (key-based alias configured on the Windows side, and on the CachyOS laptop since 2026-11-13). `sudo` on the Pi asks for a password.
 - Reverse proxy: `nginx-proxy-manager` container on the same host handles TLS/routing to Vaultwarden and its other sibling containers (`searxng`, `trilium`, `watchtower`).
+- Public access: since 2026-11-13, through the Cloudflare Tunnel `kartikpassbolt` (`cloudflared` service → `https://localhost:443`), with no router port-forward. See "Cloudflare Tunnel" in `cloudflare-zone-settings.md`.
 - Vaultwarden is its own Docker Compose project at `/home/pi/vaultwarden/docker-compose.yml` (project name `vaultwarden`, container name `vaultwarden`, data volume `vaultwarden_vaultwarden-data`).
 
 ## Current config (as of 2026-08-26)

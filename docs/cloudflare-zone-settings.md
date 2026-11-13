@@ -6,8 +6,10 @@ Single Cloudflare zone, `kartikpassbolt.org` (Free Website plan, zone ID
 `b1dcda9f5e18118679c33fde89472708`, account `Neerajakolia006@gmail.com's
 Account`). Hosts `loopwire.kartikpassbolt.org` (the `personal-website`
 Astro/Workers site) plus DNS records for other homelab services on the
-same domain: `search` (SearXNG), `trilium`, `vault` (Vaultwarden, see
-`vaultwarden-pi-setup.md`), and `adguardhome`.
+same domain: `search` (SearXNG), `trilium` and `vault` (Vaultwarden, see
+`vaultwarden-pi-setup.md`). The `adguardhome` record was removed by
+2026-11-13 (see the DNS record note below). Since 2026-11-13, `trilium`
+and `vault` reach the Pi through a Cloudflare Tunnel (see below).
 
 2026-08-26: full free-plan settings review and hardening pass done via
 the Cloudflare API MCP connector (`cloudflare-api` plugin), read-only
@@ -68,8 +70,88 @@ records — those only protect traffic that actually goes through
 Cloudflare's proxy. Flagged for awareness; no DNS records were changed.
 
 2026-10-31: AdGuardHome was removed from the Pi, so nothing listens behind
-`adguardhome.kartikpassbolt.org` any more. The record itself hasn't been
-deleted yet (open item 44 in `docs/handoff.md`).
+`adguardhome.kartikpassbolt.org` any more. The record itself was gone by
+2026-11-13 (`dig` returned no A record; open item 44 in `docs/handoff.md`).
+
+## Cloudflare Tunnel (2026-11-13)
+
+`vault` and `trilium` no longer reach the Pi through router port-forwards.
+A remotely managed tunnel, `kartikpassbolt`
+(`8ad0ab1c-1ac8-4543-9171-8ea59ac3075f`), runs as the `cloudflared`
+systemd service on the Pi. It was installed from `pkg.cloudflare.com` and
+runs with the token from the dashboard. Both DNS records are type `Tunnel`
+(a proxied CNAME to `<id>.cfargotunnel.com`), so they no longer point at
+the home IP.
+
+| Route | Service | Origin Server Name |
+|---|---|---|
+| `trilium.kartikpassbolt.org` | `https://localhost:443` | `trilium.kartikpassbolt.org` |
+| `vault.kartikpassbolt.org` | `https://localhost:443` | `vault.kartikpassbolt.org` |
+
+Both routes go to Nginx Proxy Manager, which still does TLS and routing.
+Setting the Origin Server Name keeps certificate checks on between
+`cloudflared` and NPM. Verified on 2026-11-13: NPM logs tunnel requests
+from `10.0.2.2` (the host as seen from rootless Docker), and
+`/.well-known/acme-challenge/` is reachable over plain HTTP through the
+tunnel, so the `webroot` certificate renewals don't need port 80
+forwarded. The router's TCP 80/443 forwards to the Pi were then removed.
+
+### How a request reaches the Pi
+
+```text
+Browser ──HTTPS──▶ Cloudflare edge ══ tunnel ══▶ cloudflared (Pi)
+                                                   │ https://localhost:443
+                                                   ▼
+                                         Nginx Proxy Manager
+                                                   │
+                                         ┌─────────┴─────────┐
+                                     vaultwarden          trilium
+```
+
+The direction of the connection is the key change. Before, Cloudflare
+connected in to the home IP through router port-forwards, and anyone who
+knew that IP could skip Cloudflare and connect the same way. Now
+`cloudflared` starts on boot and opens four outbound QUIC connections to
+nearby Cloudflare data centres (London, seen as `lhr*` in its log), then
+keeps them open. When a browser asks for `vault` or `trilium`, Cloudflare
+applies the zone's WAF and DDoS protection as before, then sends the
+request back down one of those connections. `cloudflared` passes it to
+NPM on `localhost:443` and checks NPM's certificate against the
+hostname. NPM picks the site by hostname and passes the request to
+Vaultwarden or Trilium as before.
+
+Because the connection starts inside the home network, the router
+forwards nothing for the websites, and public DNS no longer contains the
+home IP for these two names. There is nothing at home for an outsider to
+connect to.
+
+### Day to day
+
+- **Adding an app:** add another published application route to the
+  tunnel in the dashboard (Networking → Tunnels → `kartikpassbolt` →
+  Routes). The route config lives in Cloudflare, not in a file on the Pi,
+  and needs no router or DNS work.
+- **If both sites show a Cloudflare `1033`/`530` error page:**
+  `cloudflared` is down or disconnected. Check `systemctl status
+  cloudflared` on the Pi, then try `sudo systemctl restart cloudflared`.
+  It reconnects by itself after internet drops.
+- **Updates:** `cloudflared` comes from Cloudflare's apt repo, so normal
+  `apt` upgrades keep it current.
+- **The token:** whoever has it can run this tunnel. It's stored on the
+  Pi by `cloudflared service install`. If it might have leaked, rotate it
+  in the dashboard and reinstall the service with the new one.
+- **From home:** nothing changes. LAN devices still reach the sites
+  through Cloudflare, and NPM admin is at `http://192.168.0.166:81`.
+
+The Pi's `ufw` was turned on the same day: it allows TCP 22, 80, 443 and
+81 and UDP 5353 from `192.168.0.0/24` only. `cloudflared` reaches NPM over
+loopback, which `ufw` always allows, so the tunnel doesn't need a rule.
+
+Rollback: run `sudo ufw disable` on the Pi (or add a public allow for TCP
+80 and 443), re-add the router forwards for TCP 80 and 443 to
+`192.168.0.166`, then replace each `Tunnel` record with a proxied `A`
+record to the home IP. Remaining checks are open item 55 in
+`docs/handoff.md`.
 
 ## DNSSEC DS record (for reference)
 
