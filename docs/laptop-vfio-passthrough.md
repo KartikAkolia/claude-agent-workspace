@@ -1,6 +1,8 @@
 # Laptop VFIO GPU Passthrough — NVIDIA RTX 4060 → Windows VM
 
 > **Current state (2026-11-05):** this host now runs CachyOS with the 4060 on `nvidia`. It has VFIO prep but no GPU stub: `iommu=pt`, early vfio modules, `kvm.conf` and the libvirt `isolated` network. See "CachyOS prep, no GPU stub (2026-11-05)" below. The status line that follows is from the Debian era.
+>
+> **Update (2026-11-10):** the host was reinstalled on 2026-11-09 (new root UUID `4b9860d5-…`), and the 2026-11-05 prep below is gone: no `iommu=pt` in GRUB, and no `vfio.conf`, `kvm.conf` or `ls-iommu`. The `isolated` libvirt network wasn't checked. The default "Arch Linux" GRUB entry boots `linux-lts`, which has no NVIDIA module, so `01:00.0` had no driver and the HDMI monitor stayed dark. `GRUB_DEFAULT` now points at the `linux-cachyos` entry; reboot-verified 2026-11-12 (4060 on `nvidia`, HDMI connected). See `docs/handoff.md`'s 2026-11-10 entry and open item 48.
 
 Status: **REVERTED to native host GPU use 2026-09-07 — see "Revert to native NVIDIA driver" section near the end. `win11`/Looking Glass/KVMFR are dormant, not deleted; the GPU currently runs `nvidia` for host-side use (PRIME render offload confirmed working) and the VM cannot start until the revert steps below are undone. Everything below this line describes the passthrough build as it stood before the revert — kept intact as the re-enable runbook.**
 
