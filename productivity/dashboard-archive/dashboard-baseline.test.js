@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { readDashboardSource, extractFunction } = require('./test-helpers/extract-source');
-const { createFakeDocument, findAll, findByClass } = require('./test-helpers/dom-stub');
+const { createFakeDocument, findAll, findByClass, actionTargetsFromHtml } = require('./test-helpers/dom-stub');
 
 const source = readDashboardSource();
 
@@ -127,18 +127,61 @@ test('createCard: dragstart/dragend toggle the dragging class', () => {
   assert.equal(card.classList.contains('dragging'), false);
 });
 
+// The data-action names createCard's click handler compares against, read
+// from its real source, so the next test can check them against the markup.
+function handledActions() {
+  const fn = extractFunction(source, 'createCard');
+  return new Set([...fn.matchAll(/action === '([\w-]+)'/g)].map((m) => m[1]));
+}
+
+// The element createCard actually rendered with that data-action (the nth
+// one), carrying only the data-* attributes the template gave it.
+function renderedTarget(card, action, nth = 0) {
+  const found = actionTargetsFromHtml(card.innerHTML).filter((t) => t.dataset.action === action);
+  assert.ok(
+    found.length > nth,
+    `createCard rendered ${found.length} data-action="${action}" element(s); the test needs #${nth + 1}`
+  );
+  return found[nth];
+}
+
+test('createCard: rendered markup carries exactly the data-actions its click handler dispatches on', () => {
+  const { api } = makeHarness();
+  // With and without subtasks: the template renders different markup for each.
+  const rendered = new Set(
+    [
+      api.createCard(makeTask({ subtasks: [{ text: 'a', checked: false }] })),
+      api.createCard(makeTask({ subtasks: [] })),
+    ].flatMap((card) => actionTargetsFromHtml(card.innerHTML).map((t) => t.dataset.action))
+  );
+  const handled = handledActions();
+  assert.ok(handled.size > 0, "found no `action === '...'` branches in createCard; has the handler changed shape?");
+  assert.deepEqual([...rendered].sort(), [...handled].sort());
+});
+
+test('createCard: every per-subtask data-action carries its subtask index as data-idx', () => {
+  const { api } = makeHarness();
+  const card = api.createCard(makeTask({ subtasks: [{ text: 'a', checked: false }, { text: 'b', checked: true }] }));
+  for (const action of ['toggle-sub', 'edit-subtask']) {
+    const idxs = actionTargetsFromHtml(card.innerHTML)
+      .filter((t) => t.dataset.action === action)
+      .map((t) => t.dataset.idx);
+    assert.deepEqual(idxs, ['0', '1'], `data-idx on data-action="${action}"`);
+  }
+});
+
 test('createCard: delegated click dispatches to the right handler per data-action', () => {
   const { api, calls } = makeHarness();
-  const task = makeTask({ subtasks: [{ text: 'a', checked: false }] });
+  const task = makeTask({ subtasks: [{ text: 'a', checked: false }, { text: 'b', checked: false }] });
   const card = api.createCard(task);
 
-  card.dispatch('click', { target: { dataset: { action: 'toggle' } } });
+  card.dispatch('click', { target: renderedTarget(card, 'toggle') });
   assert.deepEqual(calls.toggleTaskChecked.at(-1), [task]);
 
-  card.dispatch('click', { target: { dataset: { action: 'toggle-sub', idx: '0' } } });
-  assert.deepEqual(calls.toggleSubtaskChecked.at(-1), [task, 0]);
+  card.dispatch('click', { target: renderedTarget(card, 'toggle-sub', 1) });
+  assert.deepEqual(calls.toggleSubtaskChecked.at(-1), [task, 1]);
 
-  card.dispatch('click', { target: { dataset: { action: 'delete' } } });
+  card.dispatch('click', { target: renderedTarget(card, 'delete') });
   assert.deepEqual(calls.deleteTask.at(-1), [task]);
 });
 

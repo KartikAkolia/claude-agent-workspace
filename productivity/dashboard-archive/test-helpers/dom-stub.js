@@ -128,6 +128,28 @@ function matches(root, selector) {
   return findAll(root, (el) => el !== root && el.tagName.toLowerCase() === tag)[0];
 }
 
+// createCard (board view) builds its markup as one innerHTML string and
+// delegates clicks on e.target.dataset.action, so its click tests need targets
+// carrying exactly the data-* attributes that markup renders, not a dataset
+// written by hand in the test. Returns one FakeElement per opening tag that
+// has a data-action, in document order, with dataset mirroring that tag's
+// data-* attributes (data-foo-bar -> dataset.fooBar, as in a browser). Handles
+// double-quoted attribute values only, which is all createCard's template uses.
+function actionTargetsFromHtml(html) {
+  const targets = [];
+  for (const [, tag, attrs] of html.matchAll(/<([a-zA-Z][\w-]*)([^>]*)>/g)) {
+    const dataset = {};
+    for (const [, name, value] of attrs.matchAll(/\sdata-([\w-]+)="([^"]*)"/g)) {
+      dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
+    }
+    if (!('action' in dataset)) continue;
+    const el = new FakeElement(tag);
+    Object.assign(el.dataset, dataset);
+    targets.push(el);
+  }
+  return targets;
+}
+
 function createFakeDocument() {
   return {
     createElement: (tag) => new FakeElement(tag),
@@ -148,4 +170,4 @@ function findByClass(root, className) {
   return findAll(root, el => el.classList.contains(className));
 }
 
-module.exports = { FakeElement, createFakeDocument, findAll, findByClass };
+module.exports = { FakeElement, createFakeDocument, findAll, findByClass, actionTargetsFromHtml };

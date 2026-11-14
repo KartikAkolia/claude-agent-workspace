@@ -182,16 +182,31 @@ test('startAddingItemSubtask: empty commit does not append', () => {
   assert.deepEqual(task.subtasks, []);
 });
 
-test('Escape cancels without committing, for every helper', () => {
-  const { api, calls } = makeHarness();
-  const task = makeTask({ title: 'unchanged' });
-  const anchor = captureAnchor();
-  api.startEditingItemTitle(anchor, task, BOARD_STYLE);
-  anchor.captured.value = 'should not stick';
-  anchor.captured.dispatch('keydown', { key: 'Escape' });
-  assert.equal(task.title, 'unchanged');
-  assert.equal(calls.markChanged.length, 0);
-  assert.equal(calls.renderTasks.length, 1);
+// All four go through startInlineEdit's shared Escape branch, so each should
+// cancel the same way. The blur after Escape stands in for the browser's: the
+// re-render removes the input, which blurs it, and that must not commit either.
+test('Escape cancels without committing, for every helper', async (t) => {
+  const starts = {
+    startEditingItemTitle: (api, anchor, task) => api.startEditingItemTitle(anchor, task, BOARD_STYLE),
+    startEditingItemNote: (api, anchor, task) => api.startEditingItemNote(anchor, task, BOARD_STYLE),
+    startEditingItemSubtask: (api, anchor, task) => api.startEditingItemSubtask(anchor, task, 0, BOARD_STYLE),
+    startAddingItemSubtask: (api, anchor, task) => api.startAddingItemSubtask(anchor, task, BOARD_STYLE),
+  };
+  for (const [name, start] of Object.entries(starts)) {
+    await t.test(name, () => {
+      const { api, calls } = makeHarness();
+      const task = makeTask({ title: 'unchanged', note: 'unchanged', subtasks: [{ text: 'unchanged', checked: false }] });
+      const before = structuredClone(task);
+      const anchor = captureAnchor();
+      start(api, anchor, task);
+      anchor.captured.value = 'should not stick';
+      anchor.captured.dispatch('keydown', { key: 'Escape' });
+      anchor.captured.dispatch('blur');
+      assert.deepEqual(task, before);
+      assert.equal(calls.markChanged.length, 0);
+      assert.equal(calls.renderTasks.length, 1);
+    });
+  }
 });
 
 test('blur commits the same way Enter does (shared startInlineEdit behavior)', () => {

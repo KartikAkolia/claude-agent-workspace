@@ -11,6 +11,13 @@ download needed.
 
 Usage:
     .venv/bin/python mathsisfun-algebra-render.py urls.txt out_dir [profile_dir]
+
+A page counts as failed if navigation errors or times out, or if the server
+answers with a non-2xx status other than 304 Not Modified, which is the
+profile's cache revalidating a page it holds (page.goto doesn't raise on
+404/500, so that's checked explicitly). A URL whose slug another URL already took this run is
+also failed rather than overwriting that PDF; a repeated identical URL is
+just skipped. Failures are listed at the end and make the exit status 1.
 """
 
 import re
@@ -23,6 +30,10 @@ DEFAULT_PROFILE = Path.home() / ".cache" / "mathsisfun-algebra-pdf" / "chrome-pr
 
 
 def slugify(url: str) -> str:
+    # mathsisfun-algebra-merge.sh's slugify() must stay identical to this, or
+    # the merge looks for PDFs under names this script never wrote. The rule
+    # is lossy (a/b.html and a-b.html both become a-b), so main() refuses a
+    # second URL that lands on a slug already used this run.
     path = re.sub(r"^https?://[^/]+", "", url)
     path = re.sub(
         r"^/[^/]+/", "", path
@@ -76,15 +87,51 @@ def dismiss_cookie_banner(page, timeout: int) -> None:
         pass
 
 
+def render_page(page, url: str, dest: Path) -> str | None:
+    """Load url and print it to dest. Returns why it failed, or None."""
+    try:
+        resp = page.goto(url, wait_until="networkidle", timeout=30000)
+        if resp is None:
+            return "no response"
+        # 304 is the persistent profile's cache revalidating a page it already
+        # holds: the page rendered is the cached 200 body, so it's a success
+        # even though Response.ok only covers 200-299.
+        if not resp.ok and resp.status != 304:
+            return f"HTTP {resp.status}"
+        # Short timeout per page: consent is sticky (shouldn't reappear) and
+        # the cookie banner, when it shows at all, tends to render within ~1s.
+        dismiss_consent_modal(page, timeout=1000)
+        dismiss_cookie_banner(page, timeout=2500)
+        page.pdf(
+            path=str(dest),
+            format="A4",
+            print_background=True,
+            margin={"top": "12mm", "bottom": "12mm", "left": "10mm", "right": "10mm"},
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad page shouldn't kill the whole run
+        return str(exc)
+    return None
+
+
 def main() -> int:
     urls_file = Path(sys.argv[1] if len(sys.argv) > 1 else "urls.txt")
     out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "pdfs")
     profile = Path(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_PROFILE
+    try:
+        lines = urls_file.read_text().splitlines()
+    except OSError as exc:
+        print(f"cannot read {urls_file}: {exc}", file=sys.stderr)
+        return 1
+    urls = [u.strip() for u in lines if u.strip()]
+    if not urls:
+        print(f"no URLs in {urls_file}, nothing to render", file=sys.stderr)
+        return 1
     out_dir.mkdir(parents=True, exist_ok=True)
     profile.mkdir(parents=True, exist_ok=True)
-    urls = [u.strip() for u in urls_file.read_text().splitlines() if u.strip()]
 
-    fail = 0
+    ok = 0
+    failed: list[tuple[str, str]] = []
+    slug_owner: dict[str, str] = {}  # slug -> first URL that claimed it
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(profile), channel="chrome", headless=True
@@ -93,43 +140,51 @@ def main() -> int:
 
         # Prime consent once up front. Generous timeout here since it's a
         # one-time cost and the modal can take a couple seconds to load.
-        page.goto(urls[0], wait_until="networkidle")
-        dismiss_consent_modal(page, timeout=8000)
-        dismiss_cookie_banner(page, timeout=3000)
+        # Not fatal: if this page won't load, the loop below still tries to
+        # dismiss the modal on every page, just with a shorter wait.
+        try:
+            page.goto(urls[0], wait_until="networkidle", timeout=30000)
+            dismiss_consent_modal(page, timeout=8000)
+            dismiss_cookie_banner(page, timeout=3000)
+        except Exception as exc:  # noqa: BLE001 — priming is best-effort
+            print(
+                f"consent priming on {urls[0]} failed ({exc}), continuing",
+                file=sys.stderr,
+                flush=True,
+            )
 
         for i, url in enumerate(urls, 1):
-            dest = out_dir / f"{slugify(url)}.pdf"
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                # Short timeout per page: consent is sticky (shouldn't
-                # reappear) and the cookie banner, when it shows at all,
-                # tends to render within ~1s.
-                dismiss_consent_modal(page, timeout=1000)
-                dismiss_cookie_banner(page, timeout=2500)
-                page.pdf(
-                    path=str(dest),
-                    format="A4",
-                    print_background=True,
-                    margin={
-                        "top": "12mm",
-                        "bottom": "12mm",
-                        "left": "10mm",
-                        "right": "10mm",
-                    },
+            tag = f"[{i}/{len(urls)}]"
+            slug = slugify(url)
+            owner = slug_owner.get(slug)
+            if owner == url:
+                print(f"{tag} skip, listed twice: {url}", flush=True)
+                continue
+            if owner is None:
+                # Claimed even if the render below fails, so the merge (which
+                # also takes the first URL per slug) never pairs this
+                # position in the book with another URL's PDF.
+                slug_owner[slug] = url
+                reason = render_page(page, url, out_dir / f"{slug}.pdf")
+            else:
+                reason = (
+                    f"slug {slug!r} already used by {owner}, not overwriting its PDF"
                 )
-                print(f"[{i}/{len(urls)}] ok: {url}", flush=True)
-            except Exception as exc:  # noqa: BLE001 — one bad page shouldn't kill the whole run
-                print(
-                    f"[{i}/{len(urls)}] FAILED: {url}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                fail += 1
+            if reason is None:
+                ok += 1
+                print(f"{tag} ok: {url}", flush=True)
+            else:
+                print(f"{tag} FAILED: {url}: {reason}", file=sys.stderr, flush=True)
+                failed.append((url, reason))
 
         ctx.close()
 
-    print(f"done, {fail} failure(s)")
-    return 1 if fail else 0
+    print(f"done, {ok} ok, {len(failed)} failure(s)", flush=True)
+    if failed:
+        print("failed pages (not rendered this run):", file=sys.stderr)
+        for url, reason in failed:
+            print(f"  {url}: {reason}", file=sys.stderr)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

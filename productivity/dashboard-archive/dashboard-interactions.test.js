@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { readDashboardSource, extractFunction } = require('./test-helpers/extract-source');
-const { createFakeDocument, findByClass } = require('./test-helpers/dom-stub');
+const { createFakeDocument, findByClass, actionTargetsFromHtml } = require('./test-helpers/dom-stub');
 
 const source = readDashboardSource();
 
@@ -53,20 +53,25 @@ function makeTask(overrides = {}) {
   return { id: 't1', title: 'Title', note: '', checked: false, subtasks: [], ...overrides };
 }
 
-// Board view (createCard) delegates through data-action on the click target;
-// simulate the click carrying a real fake element as e.target, the same way
-// the browser would when the click lands on the innerHTML-templated span.
-function fakeActionTarget(action, extra = {}) {
-  const target = { dataset: { action, ...extra } };
-  target.replaceWith = (el) => { target.captured = el; };
-  return target;
+// Board view (createCard) delegates through data-action on the click target.
+// The target is the nth element createCard actually rendered with that
+// data-action, carrying every data-* attribute the template gave it (and only
+// those), so renaming or dropping a data-action/data-idx in the template fails
+// here rather than being papered over by a dataset written in the test.
+function renderedTarget(card, action, nth = 0) {
+  const found = actionTargetsFromHtml(card.innerHTML).filter((t) => t.dataset.action === action);
+  assert.ok(
+    found.length > nth,
+    `createCard rendered ${found.length} data-action="${action}" element(s); the test needs #${nth + 1}`
+  );
+  return captureReplace(found[nth]);
 }
 
 test('board view: click -> edit title -> Enter commits the new title', () => {
   const { api, calls } = makeHarness();
   const task = makeTask({ title: 'old' });
   const card = api.createCard(task);
-  const target = fakeActionTarget('edit-title');
+  const target = renderedTarget(card, 'edit-title');
   card.dispatch('click', { target });
   target.captured.value = 'new title';
   target.captured.dispatch('keydown', { key: 'Enter' });
@@ -79,29 +84,31 @@ test('board view: click -> edit note -> Enter commits the new note', () => {
   const { api } = makeHarness();
   const task = makeTask({ note: '' });
   const card = api.createCard(task);
-  const target = fakeActionTarget('edit-note');
+  const target = renderedTarget(card, 'edit-note');
   card.dispatch('click', { target });
   target.captured.value = 'a note';
   target.captured.dispatch('keydown', { key: 'Enter' });
   assert.equal(task.note, 'a note');
 });
 
+// Two subtasks, clicking the second, so the rendered data-idx has to be the
+// right one, not just present.
 test('board view: click -> edit subtask idx -> Enter commits the new text', () => {
   const { api } = makeHarness();
-  const task = makeTask({ subtasks: [{ text: 'a', checked: false }] });
+  const task = makeTask({ subtasks: [{ text: 'a', checked: false }, { text: 'b', checked: false }] });
   const card = api.createCard(task);
-  const target = fakeActionTarget('edit-subtask', { idx: '0' });
+  const target = renderedTarget(card, 'edit-subtask', 1);
   card.dispatch('click', { target });
-  target.captured.value = 'a-edited';
+  target.captured.value = 'b-edited';
   target.captured.dispatch('keydown', { key: 'Enter' });
-  assert.equal(task.subtasks[0].text, 'a-edited');
+  assert.deepEqual(task.subtasks.map((s) => s.text), ['a', 'b-edited']);
 });
 
 test('board view: click -> add subtask -> Enter appends it', () => {
   const { api } = makeHarness();
   const task = makeTask({ subtasks: [] });
   const card = api.createCard(task);
-  const target = fakeActionTarget('add-subtask');
+  const target = renderedTarget(card, 'add-subtask');
   card.dispatch('click', { target });
   target.captured.value = 'new one';
   target.captured.dispatch('keydown', { key: 'Enter' });
@@ -112,7 +119,7 @@ test('board view: click -> toggle checkbox flips task.checked and re-renders', (
   const { api, calls } = makeHarness();
   const task = makeTask({ checked: false });
   const card = api.createCard(task);
-  card.dispatch('click', { target: fakeActionTarget('toggle') });
+  card.dispatch('click', { target: renderedTarget(card, 'toggle') });
   assert.equal(task.checked, true);
   assert.equal(calls.markChanged.length, 1);
   assert.equal(calls.renderTasks.length, 1);
@@ -120,26 +127,26 @@ test('board view: click -> toggle checkbox flips task.checked and re-renders', (
 
 test('board view: click -> toggle subtask checkbox flips subtasks[idx].checked', () => {
   const { api } = makeHarness();
-  const task = makeTask({ subtasks: [{ text: 'a', checked: false }] });
+  const task = makeTask({ subtasks: [{ text: 'a', checked: false }, { text: 'b', checked: false }] });
   const card = api.createCard(task);
-  card.dispatch('click', { target: fakeActionTarget('toggle-sub', { idx: '0' }) });
-  assert.equal(task.subtasks[0].checked, true);
+  card.dispatch('click', { target: renderedTarget(card, 'toggle-sub', 1) });
+  assert.deepEqual(task.subtasks.map((s) => s.checked), [false, true]);
 });
 
 test('board view: click -> delete calls deleteTask with the task', () => {
   const { api, calls } = makeHarness();
   const task = makeTask();
   const card = api.createCard(task);
-  card.dispatch('click', { target: fakeActionTarget('delete') });
+  card.dispatch('click', { target: renderedTarget(card, 'delete') });
   assert.deepEqual(calls.deleteTask.at(-1), [task]);
 });
 
 // List view (createListItem) attaches real listeners to real child elements,
-// so these dispatch directly on the real DOM nodes instead of a synthetic target.
-// startInlineEdit swaps the clicked element out via el.replaceWith(input)
-// (dashboard.html:1366) rather than returning it, so wrap the real element's
-// replaceWith to capture the input it gets handed, the same way captureAnchor
-// does for synthetic targets.
+// so these dispatch directly on the real DOM nodes instead of a markup-derived
+// target. startInlineEdit swaps the clicked element out via
+// el.replaceWith(input) (dashboard.html:1366) rather than returning it, so wrap
+// the element's replaceWith to capture the input it gets handed (renderedTarget
+// above uses this for the board view's targets too).
 function captureReplace(el) {
   const original = el.replaceWith.bind(el);
   el.replaceWith = (newEl) => { el.captured = newEl; original(newEl); };
@@ -220,7 +227,7 @@ test('both views: title editing styleCss differs (board 14px vs list 15px font-s
   const { api: boardApi } = makeHarness();
   const { api: listApi } = makeHarness();
   const boardCard = boardApi.createCard(makeTask());
-  const target = fakeActionTarget('edit-title');
+  const target = renderedTarget(boardCard, 'edit-title');
   boardCard.dispatch('click', { target });
 
   const listItem = listApi.createListItem(makeTask());
