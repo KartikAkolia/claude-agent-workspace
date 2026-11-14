@@ -15,6 +15,9 @@
     With -CommonOnly, copies just the usual Microsoft and Office families (Segoe, Calibri,
     Consolas, Arial, Times, Aptos...).
 
+    The zip is written beside the -Destination folder and named after it (D:\fonts gives
+    D:\fonts.zip), so -Destination can't be a drive root.
+
     On Linux afterwards:
         unzip WindowsFonts.zip -d ~/.local/share/fonts/WindowsFonts && fc-cache -f
 
@@ -35,6 +38,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Work from the full, normalised path: resolved against PowerShell's current location (a .NET
+# method alone would use the process's working directory, which PowerShell doesn't keep in step),
+# with . and .. segments collapsed and any trailing separator dropped. Otherwise
+# '-Destination D:\fonts\' would put the zip inside the folder as 'D:\fonts\.zip', and
+# '-Destination .' would name it '..zip'.
+$Destination = [System.IO.Path]::GetFullPath($PSCmdlet.GetUnresolvedProviderPathFromPSPath($Destination))
+$root = [System.IO.Path]::GetPathRoot($Destination)
+if ($Destination.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+    throw "-Destination can't be a drive or share root ($Destination): the zip goes beside the folder. Use a folder such as $(Join-Path $root 'WindowsFonts')."
+}
+$Destination = $Destination.TrimEnd('\', '/')
 
 $sources = @(
     (Join-Path $env:WINDIR 'Fonts'),
@@ -112,6 +127,7 @@ foreach ($font in $fonts) {
 # Zip only this run's files, so leftovers from an earlier run in $Destination aren't swept in.
 $copied = @($fonts | ForEach-Object { Join-Path $Destination $_.Name } | Sort-Object -Unique)
 
+# Beside the folder, named after it: D:\fonts -> D:\fonts.zip.
 $zip = "$Destination.zip"
 Compress-Archive -LiteralPath $copied -DestinationPath $zip -Force
 

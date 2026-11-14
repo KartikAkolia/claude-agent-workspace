@@ -14,7 +14,8 @@
 # edits. Reboot after install OR undo; live sysfs values persist until reboot.
 # Recovery after an incomplete rollback: --recover BACKUP_DIRECTORY.
 # Requires the modconf hook in mkinitcpio presets for early-loaded modules.
-# Needs enough space under /var/lib to snapshot /boot before each run.
+# Needs enough space under /var/lib to snapshot /boot before each run. Only a
+# failed run keeps that snapshot; a successful install or undo deletes it.
 # GRUB defaults must have one literal quoted assignment (no expansions).
 # Do not delete backup directories until their runs have been undone. A run
 # directory holding an "aborted" file, or an empty one, failed before any
@@ -39,6 +40,10 @@ readonly FILES=(/etc/udev/rules.d/99-no-runtime-pm.rules /etc/modprobe.d/no-powe
 	/etc/systemd/system/suspend.target.d/device-power-late.conf)
 # Whole-file managed entries (everything except GRUB).
 readonly MANAGED=(0 1 2 4 5 6 7)
+# cp flags that keep mode, owner, ACLs, xattrs and SELinux labels but give the
+# copy a fresh mtime, so a rewritten file reads as changed now. "all" keeps
+# label and xattr failures non-fatal; an explicit "context" fails without SELinux.
+readonly KEEP_ATTRS=(--preserve=all --no-preserve=timestamps)
 die() {
 	echo "error: $*" >&2
 	exit 1
@@ -51,13 +56,13 @@ mkdir -p "$STATE_ROOT"
 exec 9>"$STATE_ROOT/lock"
 flock -n 9 || die "another power-policy operation is running"
 
-# Copy beside a destination, retaining metadata, then rename. Failed staging
+# Copy beside a destination, retaining KEEP_ATTRS, then rename. Failed staging
 # never truncates a live file; EXIT cleans abandoned sibling staging files.
 place() (
 	local source=$1 destination=$2 staged
 	staged=$(mktemp "$(dirname "$destination")/.device-power.XXXXXX") || return
 	trap 'rm -f -- "$staged"' EXIT
-	cp --preserve=all -- "$source" "$staged" || return
+	cp "${KEEP_ATTRS[@]}" -- "$source" "$staged" || return
 	mv -fT -- "$staged" "$destination"
 )
 # Call only as a plain assignment (value=$(profile_value ...)) so errexit
@@ -125,7 +130,8 @@ restore_cursor() {
 # phase: none, then snapshot once this invocation has created its own run
 # directory, then pending from just before the first managed write until the
 # run completes. finish restores on pending, and on snapshot drops the bulky
-# /boot copy, keeping the rest for diagnosis.
+# /boot copy, keeping the rest for diagnosis. A run that succeeds drops that
+# copy too, once pending is gone; a failed or pending run keeps it.
 backup='' phase=none
 finish() {
 	local status=$? failed=false
@@ -245,7 +251,7 @@ else
 	python3 "$HELPER" grub "$GRUB_FILE" >"$backup/new-grub"
 fi
 # Retain permissions, owner and labels of the GRUB defaults.
-cp --attributes-only --preserve=all "$GRUB_FILE" "$backup/new-grub"
+cp --attributes-only "${KEEP_ATTRS[@]}" -- "$GRUB_FILE" "$backup/new-grub"
 bash -n "$backup/new-grub"
 [[ -z ${source_backup:-} ]] || printf '%s\n' "$source_backup" >"$backup/undo-source"
 # Still snapshot while creating the marker: if touch fails, finish only tidies.
@@ -348,7 +354,7 @@ EOF
 	chmod 644 "$backup"/after/{0,1,2,4,5,7}
 	for i in "${MANAGED[@]}"; do
 		if [[ -f $backup/before/$i ]]; then
-			cp --attributes-only --preserve=all "$backup/before/$i" "$backup/after/$i"
+			cp --attributes-only "${KEEP_ATTRS[@]}" -- "$backup/before/$i" "$backup/after/$i"
 		fi
 		# Keep the helper executable even when replacing a file with another mode.
 		[[ $i != 6 ]] || chmod 755 "$backup/after/6"
@@ -386,6 +392,12 @@ else
 fi
 phase=none
 rm -f -- "$backup/pending"
+# Nothing reads a finished run's /boot copy: --recover only takes runs still
+# marked pending, and an undo snapshots /boot afresh. Removal must follow the
+# pending marker, so an interrupted rm never leaves a recoverable partial copy.
+if [[ $backup == "$STATE_ROOT"/run.?* ]]; then
+	rm -rf -- "${backup:?}/boot" || echo "warning: could not remove $backup/boot; it is no longer needed" >&2
+fi
 
 if [[ -n ${source_backup:-} ]]; then
 	systemctl reset-failed device-power-late.service 2>/dev/null || true

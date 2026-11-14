@@ -1,9 +1,11 @@
 # Local package of the official XP-Pen Linux driver (prebuilt binary).
+# Group allowed to change the driver's settings; the desktop user must be in it.
+_confgroup=wheel
 pkgname=xppen-tablet
 _pkgver=4.0.15
 _build=260422
 pkgver=${_pkgver}.${_build}
-pkgrel=2
+pkgrel=3
 pkgdesc="XP-Pen official Linux tablet driver (PenTablet)"
 arch=('x86_64')
 url="https://www.xp-pen.com/download"
@@ -12,6 +14,8 @@ depends=('dbus' 'fontconfig' 'freetype2' 'glib2' 'libglvnd' 'libice' 'libpng'
 	'libsm' 'libusb' 'libx11' 'libxcb' 'libxext' 'libxi' 'libxrandr'
 	'libxrender' 'libxtst' 'systemd-libs' 'zlib')
 options=('!strip' '!debug')
+# Resets the config folder's permissions after every install and upgrade.
+install=xppen-tablet.install
 # The binary hardcodes its writable config under /usr/lib/pentablet/conf/xppen.
 backup=('usr/lib/pentablet/conf/xppen/config.xml'
 	'usr/lib/pentablet/conf/xppen/dialogpos.ini'
@@ -19,8 +23,10 @@ backup=('usr/lib/pentablet/conf/xppen/config.xml'
 	'usr/lib/pentablet/conf/xppen/name_config.ini')
 source=("XPPenLinux${_pkgver}-${_build}.tar.gz"
 	'70-xppen-tablet.rules'
-	'xppentablet')
+	'xppentablet'
+	'xppen-tablet.install')
 sha256sums=('25a772fa96ea9f399532e334228e3f684e41edda8d94328fb27463fc56e59fa5'
+	'SKIP'
 	'SKIP'
 	'SKIP')
 
@@ -32,9 +38,20 @@ package() {
 	chmod 0755 "${pkgdir}/usr/lib/pentablet/PenTablet.sh" \
 		"${pkgdir}/usr/lib/pentablet/PenTablet"
 
-	# Same permissions the vendor installer applies, so the GUI can save settings.
-	chmod 0777 "${pkgdir}/usr/lib/pentablet/conf/xppen"
-	chmod 0666 "${pkgdir}/usr/lib/pentablet/conf/xppen/"{config.xml,*.ini}
+	# The GUI saves into this folder, so it must be writable, but only by
+	# $_confgroup rather than the vendor's 0777/0666 for everyone. No sticky
+	# bit, so members can rename a temp file over the root-owned files (Qt's
+	# atomic save); setgid keeps those temp files in the group.
+	local conf="${pkgdir}/usr/lib/pentablet/conf/xppen"
+	chgrp "${_confgroup}" "${conf}" "${conf}/"{config.xml,*.ini}
+	chmod 2775 "${conf}"
+	chmod 0664 "${conf}/"{config.xml,*.ini}
+	# The .install reapplies these on install and upgrade with its own copy of
+	# the group (makepkg ships that file as-is), so the two must agree.
+	grep -qx "_xppen_confgroup=${_confgroup}" "${srcdir}/${install}" || {
+		echo "${install}: set _xppen_confgroup=${_confgroup} to match _confgroup" >&2
+		return 1
+	}
 
 	install -Dm755 "${srcdir}/xppentablet" "${pkgdir}/usr/bin/xppentablet"
 

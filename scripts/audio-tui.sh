@@ -15,37 +15,27 @@
 # menu, not something a blanket -e should abort the whole TUI over.
 set -uo pipefail
 
-readonly PROG="${0##*/}"
-
-# ---------------------------------------------------------------------------
-# Setup / preflight
-# ---------------------------------------------------------------------------
-
-require_tools() {
-	local missing=() cmd
-	for cmd in whiptail pactl jq; do
-		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-	done
-	if [ "${#missing[@]}" -gt 0 ]; then
-		printf 'error: missing required tool(s): %s\n' "${missing[*]}" >&2
-		exit 1
-	fi
-}
-
-die() {
-	printf 'error: %s\n' "$1" >&2
+# PROG, die, require_tools and wt (the whiptail wrapper, which draws
+# display-only dialogs on /dev/tty) come from lib/tui.sh, shared with the
+# other TUIs. It's found beside this script's real path, so a symlink to
+# the script still works.
+tui_lib="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/tui.sh"
+if [ ! -r "$tui_lib" ]; then
+	printf 'error: %s is missing; run %s from the repo checkout, or keep scripts/lib/ beside it\n' "$tui_lib" "${0##*/}" >&2
 	exit 1
-}
+fi
+# Linted on its own, so not followed here.
+# shellcheck source=/dev/null
+. "$tui_lib"
 
-# whiptail wrapper. This whiptail build (newt, no dialog compat layer) has
-# no top-level --height/--width option — only --menu/--msgbox/etc. accept
-# height/width, positionally, after the text. Every call site below passes
-# "0 0[ 0]" for those, which newt auto-sizes to fit the content; do not
-# add --height/--width flags here, they're silently rejected ("--height:
-# unknown option") and whiptail exits without drawing anything.
-wt() {
-	whiptail --backtitle "$PROG" "$@"
-}
+# Volume step for "up"/"down", and the ceiling no change made here raises a
+# volume past, "up" steps included — see action_volume(). VOL_NORM is
+# PA_VOLUME_NORM, the raw pa_volume_t value pactl reports for 100%.
+readonly VOL_STEP_PCT=5 VOL_CAP_PCT=150 VOL_NORM=65536
+
+# Run a pactl change, surfacing a failure in a msgbox (lib/tui.sh's
+# run_or_report).
+run_pactl() { run_or_report "pactl $1 failed" pactl "$@"; }
 
 # ---------------------------------------------------------------------------
 # Data helpers — thin wrappers over `pactl -f json`, one jq filter each so
@@ -63,6 +53,10 @@ default_source_name() { pactl get-default-source 2>/dev/null; }
 # ---------------------------------------------------------------------------
 # Pickers — build a whiptail --menu from pactl JSON, return the chosen
 # object's `name` field on stdout. Empty stdout + nonzero exit = cancelled.
+#
+# Callers always run these as x=$(pick_...), so stdout is the capture, not
+# the terminal. Any msgbox here relies on wt drawing it on /dev/tty (see wt
+# above); never call whiptail directly from one.
 # ---------------------------------------------------------------------------
 
 pick_sink() {
@@ -132,14 +126,14 @@ action_default_sink() {
 	local sink
 	sink=$(pick_sink "Set default output device") || return 0
 	[ -z "$sink" ] && return 0
-	pactl set-default-sink "$sink" && wt --msgbox "Default output set to:\n$sink" 8 60
+	run_pactl set-default-sink "$sink" && wt --msgbox "Default output set to:\n$sink" 8 60
 }
 
 action_default_source() {
 	local source
 	source=$(pick_source "Set default input device") || return 0
 	[ -z "$source" ] && return 0
-	pactl set-default-source "$source" && wt --msgbox "Default input set to:\n$source" 8 60
+	run_pactl set-default-source "$source" && wt --msgbox "Default input set to:\n$source" 8 60
 }
 
 # Per-app playback routing: pavucontrol's "Playback" tab, but keyboard-only
@@ -163,7 +157,7 @@ action_route_playback() {
 	local sink
 	sink=$(pick_sink "Move stream $stream_id to which output?") || return 0
 	[ -z "$sink" ] && return 0
-	pactl move-sink-input "$stream_id" "$sink" && wt --msgbox "Moved." 6 30
+	run_pactl move-sink-input "$stream_id" "$sink" && wt --msgbox "Moved." 6 30
 }
 
 # Per-app recording routing: pavucontrol's "Recording" tab equivalent.
@@ -186,11 +180,58 @@ action_route_recording() {
 	local source
 	source=$(pick_source "Move stream $stream_id to which input?") || return 0
 	[ -z "$source" ] && return 0
-	pactl move-source-output "$stream_id" "$source" && wt --msgbox "Moved." 6 30
+	run_pactl move-source-output "$stream_id" "$source" && wt --msgbox "Moved." 6 30
+}
+
+# "up" for action_volume: +VOL_STEP_PCT, but no channel ends above
+# VOL_CAP_PCT. pactl's own relative "+5%" has no ceiling, so this reads the
+# raw per-channel volumes and sets absolute ones instead: every channel
+# rises by the same amount (an L/R balance survives), and the step shrinks
+# so the loudest channel stops exactly at the cap.
+volume_up_capped() {
+	local kind="$1" name="$2" fields v max=0 step
+	# inc is rounded, not truncated (3277 for 5%), so ten steps from 100%
+	# land on the cap rather than 8 units short of it.
+	local cap=$((VOL_CAP_PCT * VOL_NORM / 100)) inc=$(((VOL_STEP_PCT * VOL_NORM + 50) / 100))
+	local cur=() new=()
+	# First field: the channel count from channel_map, to check the values
+	# line up with it (pactl's JSON keys volumes by channel position, so a
+	# map with a repeated position would collapse two channels into one).
+	fields=$(pa_json "${kind}s" | jq -r --arg n "$name" '.[] | select(.name==$n) |
+		[(.channel_map // "" | split(",") | length), ((.volume // {})[] | .value)] | @tsv')
+	read -r -a cur <<<"$fields"
+	local nch="${cur[0]:-0}"
+	cur=("${cur[@]:1}")
+	for v in "${cur[@]}"; do
+		if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+			cur=()
+			break
+		fi
+		[ "$v" -gt "$max" ] && max="$v"
+	done
+	if [ "${#cur[@]}" -eq 0 ]; then
+		wt --msgbox "Could not read the current volume of:\n$name" 8 60
+		return 1
+	fi
+
+	step=$((cap - max))
+	[ "$step" -gt "$inc" ] && step="$inc"
+	if [ "$step" -le 0 ]; then
+		wt --msgbox "Already at or above the ${VOL_CAP_PCT}% cap:\n$name" 8 60
+		return 0
+	fi
+	if [ "${#cur[@]}" -eq "$nch" ]; then
+		for v in "${cur[@]}"; do new+=("$((v + step))"); done
+	else
+		new=("$((max + step))") # can't match values to channels: move them together
+	fi
+	run_pactl "set-${kind}-volume" "$name" "${new[@]}"
 }
 
 # Volume/mute for one device, looped so +/- steps and mute-toggle can be
-# applied repeatedly without re-picking the device each time.
+# applied repeatedly without re-picking the device each time. The menu
+# reopens on the last action (--default-item), so a repeated Enter repeats
+# it rather than jumping back to "up".
 action_volume() {
 	local kind="$1" # "sink" or "source"
 	local name
@@ -201,32 +242,38 @@ action_volume() {
 	fi
 	[ -z "$name" ] && return 0
 
+	local choice="up" vol vol_num mute status
 	while true; do
-		local vol vol_num mute status choice
-		vol=$(pa_json "${kind}s" | jq -r --arg n "$name" \
-			'.[] | select(.name==$n) | .volume | to_entries[0].value.value_percent')
-		# pactl's JSON reports this as e.g. "90%" (with the literal '%'); strip
-		# it for use as a plain-number inputbox default.
-		vol_num="${vol%\%}"
-		mute=$(pa_json "${kind}s" | jq -r --arg n "$name" \
-			'.[] | select(.name==$n) | .mute')
+		# One value per line: every channel's percentage (joined only when
+		# they differ), the loudest channel as a plain number for the
+		# inputbox default (pactl reports e.g. "90%", with the literal '%'),
+		# and the mute state.
+		vol="" vol_num="" mute=""
+		{
+			read -r vol
+			read -r vol_num
+			read -r mute
+		} < <(pa_json "${kind}s" | jq -r --arg n "$name" '
+			.[] | select(.name==$n) | [(.volume // {})[] | .value_percent] as $p |
+			($p | if (unique | length) > 1 then join(" / ") else .[0] // "" end),
+			($p | map(rtrimstr("%") | tonumber?) | max // ""), .mute')
 		status="volume: ${vol:-?}  muted: ${mute:-?}"
 
-		choice=$(wt --menu "$name\n$status" 0 0 0 \
-			"up" "Volume +5%" \
-			"down" "Volume -5%" \
+		choice=$(wt --default-item "$choice" --menu "$name\n$status" 0 0 0 \
+			"up" "Volume +${VOL_STEP_PCT}% (stops at ${VOL_CAP_PCT}%)" \
+			"down" "Volume -${VOL_STEP_PCT}%" \
 			"mute" "Toggle mute" \
 			"set" "Set exact volume %" \
 			"back" "Back to main menu" \
 			3>&1 1>&2 2>&3) || return 0
 
 		case "$choice" in
-		up) pactl "set-${kind}-volume" "$name" +5% ;;
-		down) pactl "set-${kind}-volume" "$name" -5% ;;
-		mute) pactl "set-${kind}-mute" "$name" toggle ;;
+		up) volume_up_capped "$kind" "$name" ;;
+		down) run_pactl "set-${kind}-volume" "$name" "-${VOL_STEP_PCT}%" ;;
+		mute) run_pactl "set-${kind}-mute" "$name" toggle ;;
 		set)
 			local pct
-			pct=$(wt --inputbox "Volume percent (0-150):" 8 40 "${vol_num:-100}" 3>&1 1>&2 2>&3) || continue
+			pct=$(wt --inputbox "Volume percent (0-${VOL_CAP_PCT}):" 8 40 "${vol_num:-100}" 3>&1 1>&2 2>&3) || continue
 			pct="${pct%\%}" # tolerate a trailing '%' if the user kept/typed one
 			case "$pct" in
 			'' | *[!0-9]*)
@@ -234,16 +281,19 @@ action_volume() {
 				continue
 				;;
 			esac
+			pct=$(normalize_int "$pct") # "0150" is 150, not octal
 			# The prompt says 0-150; actually enforce it. (pactl/PipeWire
 			# themselves accept much higher — pavucontrol's own slider caps
 			# at PA_VOLUME_UI_MAX, ~355% of normal — but 150% is a more
 			# conservative ceiling for unattended speaker/hearing safety,
-			# chosen deliberately rather than matching that.)
-			if [ "$pct" -gt 150 ]; then
-				wt --msgbox "$pct% is above the 150% cap." 6 40
+			# chosen deliberately rather than matching that. "up" honours
+			# the same cap; see volume_up_capped.) int_le compares as
+			# strings, so a number too big for 64 bits can't overflow it.
+			if ! int_le "$pct" "$VOL_CAP_PCT"; then
+				wt --msgbox "$pct% is above the ${VOL_CAP_PCT}% cap." 6 40
 				continue
 			fi
-			pactl "set-${kind}-volume" "$name" "${pct}%"
+			run_pactl "set-${kind}-volume" "$name" "${pct}%"
 			;;
 		back | "") return 0 ;;
 		esac
@@ -275,7 +325,7 @@ action_card_profile() {
 	local profile
 	profile=$(wt --menu "Profile for $card" 0 0 0 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 0
 	[ -z "$profile" ] && return 0
-	pactl set-card-profile "$card" "$profile" && wt --msgbox "Profile set to:\n$profile" 8 60
+	run_pactl set-card-profile "$card" "$profile" && wt --msgbox "Profile set to:\n$profile" 8 60
 }
 
 # Active port on one device — the same jack-vs-speaker or line-vs-mic
@@ -314,7 +364,7 @@ action_port() {
 	local port
 	port=$(wt --menu "Port for $name" 0 0 0 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 0
 	[ -z "$port" ] && return 0
-	pactl "set-${kind}-port" "$name" "$port" && wt --msgbox "Port set." 6 30
+	run_pactl "set-${kind}-port" "$name" "$port" && wt --msgbox "Port set." 6 30
 }
 
 # ---------------------------------------------------------------------------
@@ -332,10 +382,11 @@ action_port() {
 # Main menu
 # ---------------------------------------------------------------------------
 
+# Reopens on the last item picked (--default-item), like action_volume.
 main_menu() {
+	local choice="1"
 	while true; do
-		local choice
-		choice=$(wt --menu "Audio device manager" 0 0 0 \
+		choice=$(wt --default-item "$choice" --menu "Audio device manager" 0 0 0 \
 			"1" "Default output device" \
 			"2" "Default input device" \
 			"3" "Move a playback stream (per-app)" \
@@ -364,7 +415,7 @@ main_menu() {
 }
 
 main() {
-	require_tools
+	require_tools whiptail pactl jq
 	pactl info >/dev/null 2>&1 || die "pactl can't reach the sound server (is PipeWire/PulseAudio running?)"
 	main_menu
 }

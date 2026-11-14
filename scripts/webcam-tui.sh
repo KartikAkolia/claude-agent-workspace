@@ -23,40 +23,22 @@
 # not something a blanket -e should abort the whole TUI over.
 set -uo pipefail
 
-readonly PROG="${0##*/}"
+# PROG, die, require_tools and wt (the whiptail wrapper, which draws
+# display-only dialogs on /dev/tty) come from lib/tui.sh, shared with the
+# other TUIs. It's found beside this script's real path, so a symlink to
+# the script still works.
+tui_lib="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/tui.sh"
+if [ ! -r "$tui_lib" ]; then
+	printf 'error: %s is missing; run %s from the repo checkout, or keep scripts/lib/ beside it\n' "$tui_lib" "${0##*/}" >&2
+	exit 1
+fi
+# Linted on its own, so not followed here.
+# shellcheck source=/dev/null
+. "$tui_lib"
+
 readonly PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/webcam-tui/profiles"
 # See set_ctrl_settled().
 readonly SETTLE_SECS=2 SETTLE_TRIES=3
-
-# ---------------------------------------------------------------------------
-# Setup / preflight
-# ---------------------------------------------------------------------------
-
-require_tools() {
-	local missing=() cmd
-	for cmd in whiptail v4l2-ctl awk grep; do
-		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-	done
-	if [ "${#missing[@]}" -gt 0 ]; then
-		printf 'error: missing required tool(s): %s\n' "${missing[*]}" >&2
-		exit 1
-	fi
-}
-
-die() {
-	printf 'error: %s\n' "$1" >&2
-	exit 1
-}
-
-# whiptail wrapper. This whiptail build (newt, no dialog compat layer) has
-# no top-level --height/--width option — only --menu/--msgbox/etc. accept
-# height/width, positionally, after the text. Every call site below passes
-# "0 0[ 0]" for those, which newt auto-sizes to fit the content; do not add
-# --height/--width flags here (see scripts/audio-tui.sh for how that broke
-# rendering entirely the first time around).
-wt() {
-	whiptail --backtitle "$PROG" "$@"
-}
 
 # ---------------------------------------------------------------------------
 # Device discovery — `v4l2-ctl --list-devices` lists every /dev/videoN node
@@ -92,6 +74,9 @@ list_capture_devices() {
 	done < <(v4l2-ctl --list-devices 2>/dev/null)
 }
 
+# Always called as dev=$(pick_device ...), so stdout is the capture, not the
+# terminal. Its msgbox relies on wt drawing it on /dev/tty (see wt above);
+# never call whiptail directly from here.
 pick_device() {
 	local title="$1" menu_args=() node name
 	while IFS=$'\t' read -r node name; do
@@ -185,11 +170,8 @@ set_ctrl() {
 # Same, but surfaces a failure interactively — for the single explicit
 # edits a user makes from a menu, where silence would look like a no-op.
 run_v4l2_set() {
-	local dev="$1" name="$2" val="$3" err status
-	err=$(v4l2-ctl -d "$dev" --set-ctrl="${name}=${val}" 2>&1 >/dev/null)
-	status=$?
-	[ "$status" -ne 0 ] && wt --msgbox "v4l2-ctl failed setting $name=$val:\n${err:-exit status $status}" 12 70
-	return "$status"
+	local dev="$1" name="$2" val="$3"
+	run_or_report "v4l2-ctl failed setting $name=$val" v4l2-ctl -d "$dev" --set-ctrl="${name}=${val}"
 }
 
 # Current value only, as v4l2-ctl -C reports it ("name: 1 (Manual Mode)"
@@ -205,10 +187,12 @@ ctrl_cur() {
 # 156) - an immediate read-back misses that. Skipped while the control is
 # inactive (its auto mode still on): the camera ignores the value then, so
 # it would never settle - edit_ctrl's prompt already warns about that.
+# Returns 0 if the value held, 1 if the set failed, 2 if the camera kept
+# moving it, 3 if it was set but the control is inactive (not verified).
 set_ctrl_settled() {
 	local dev="$1" name="$2" val="$3" try cur
-	run_v4l2_set "$dev" "$name" "$val" || return
-	parse_ctrl "$dev" "$name" && [ "$CTRL_INACTIVE" -eq 1 ] && return 0
+	run_v4l2_set "$dev" "$name" "$val" || return 1
+	parse_ctrl "$dev" "$name" && [ "$CTRL_INACTIVE" -eq 1 ] && return 3
 	for ((try = 1; try <= SETTLE_TRIES; try++)); do
 		sleep "$SETTLE_SECS"
 		cur=$(ctrl_cur "$dev" "$name")
@@ -216,25 +200,48 @@ set_ctrl_settled() {
 		[ "$try" -lt "$SETTLE_TRIES" ] && set_ctrl "$dev" "$name" "$val"
 	done
 	wt --msgbox "$name was set to $val but the camera keeps moving it (now ${cur:-unreadable}).\nTry again in a few seconds, or pick a different value." 10 70
+	return 2
+}
+
+# Validates the typed int in the variable named $2 against the int control
+# parse_ctrl last loaded ($1 is only for the message), showing why it's
+# rejected. First runs that variable through normalize_int in place, so
+# every typed value is normalised here rather than at each prompt. The range
+# check goes through int_le, so int64 values up to the control's real
+# min..max are accepted and anything longer is rejected, never overflowed.
+# Only a value inside min..max (so inside int64) reaches arithmetic. Checks
+# step as well: drivers may round or reject an off-step value (the C920's
+# focus_absolute only takes multiples of 5). The step test takes each side
+# modulo step first, since val - min itself can exceed int64. The locals
+# are prefixed because the nameref resolves by name: a local "val" here
+# would shadow the caller's.
+check_int_value() {
+	local -n civ_ref="$2"
+	civ_ref=$(normalize_int "$civ_ref")
+	local civ_name="$1" civ_val="$civ_ref" civ_step="${CTRL_STEP:-1}" civ_err=""
+	if ! [[ "$civ_val" =~ ^-?[0-9]+$ ]]; then
+		civ_err="Not a number: $civ_val"
+	elif ! int_le "$CTRL_MIN" "$civ_val" || ! int_le "$civ_val" "$CTRL_MAX"; then
+		civ_err="$civ_val is outside $civ_name's range ($CTRL_MIN-$CTRL_MAX)."
+	elif [ "$civ_step" -gt 1 ] && [ $(((civ_val % civ_step - CTRL_MIN % civ_step) % civ_step)) -ne 0 ]; then
+		civ_err="$civ_val isn't a valid $civ_name value: it must be $CTRL_MIN plus a multiple of $civ_step."
+	fi
+	[ -z "$civ_err" ] && return 0
+	wt --msgbox "$civ_err" 8 60
 	return 1
 }
 
-# Validates $2 against the int control parse_ctrl last loaded ($1 is only
-# for the message), showing why it's rejected. Checks step as well as
-# range: drivers may round or reject an off-step value (the C920's
-# focus_absolute only takes multiples of 5).
-check_int_value() {
-	local name="$1" val="$2" step="${CTRL_STEP:-1}" err=""
-	if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
-		err="Not a number: $val"
-	elif [ "$val" -lt "$CTRL_MIN" ] || [ "$val" -gt "$CTRL_MAX" ]; then
-		err="$val is outside $name's range ($CTRL_MIN-$CTRL_MAX)."
-	elif [ "$step" -gt 1 ] && [ $(((val - CTRL_MIN) % step)) -ne 0 ]; then
-		err="$val isn't a valid $name value: it must be $CTRL_MIN plus a multiple of $step."
-	fi
-	[ -z "$err" ] && return 0
-	wt --msgbox "$err" 8 60
-	return 1
+# A profile's settings as "name=value" lines, with blank and '#' lines
+# dropped and each value through normalize_int (a hand-edited "0250" means
+# 250, not octal). Every read of a profile goes through here, so all of
+# action_load_profile's passes see the same normalised values.
+profile_entries() {
+	local name val
+	while IFS='=' read -r name val; do
+		[ -z "$name" ] && continue
+		case "$name" in '#'*) continue ;; esac
+		printf '%s=%s\n' "$name" "$(normalize_int "$val")"
+	done <"$1"
 }
 
 # One control, editor appropriate to its type. Returns 1 on cancel/no-op.
@@ -277,7 +284,7 @@ edit_ctrl() {
 	int | int64)
 		local val
 		val=$(wt --inputbox "$name (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, default=$CTRL_DEFAULT).$hint" 10 70 "$CTRL_VALUE" 3>&1 1>&2 2>&3) || return 1
-		check_int_value "$name" "$val" || return 1
+		check_int_value "$name" val || return 1
 		"$setter" "$dev" "$name" "$val"
 		;;
 	bitmask | string | rect | *)
@@ -311,12 +318,15 @@ action_show_info() {
 
 # Browse every control the driver reports and edit any of them, one at a
 # time, re-reading values after each edit — same "pick device once, loop a
-# submenu" shape as audio-tui.sh's action_volume.
+# submenu" shape as audio-tui.sh's action_volume. The list reopens on the
+# control just edited (--default-item), not the first one, so a repeated
+# Enter can't toggle the first bool control by accident.
 action_browse_ctrls() {
 	local dev
 	dev=$(pick_device "Choose a camera to browse controls") || return 0
 	[ -z "$dev" ] && return 0
 
+	local choice=""
 	while true; do
 		local items=() name status
 		while IFS= read -r name; do
@@ -333,8 +343,7 @@ action_browse_ctrls() {
 			return 0
 		}
 
-		local choice
-		choice=$(wt --menu "Controls on $dev" 0 0 0 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
+		choice=$(wt --default-item "${choice:-${items[0]}}" --menu "Controls on $dev" 0 0 0 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
 		[ -z "$choice" ] && return 0
 		edit_ctrl "$dev" "$choice"
 	done
@@ -359,6 +368,10 @@ action_exposure_focus() {
 		return 0
 	fi
 
+	# Reopens on the last action (--default-item). Without that it jumped
+	# back to "stable", and an Enter after "auto" switched exposure straight
+	# back to manual.
+	local choice="stable"
 	while true; do
 		local status=""
 		[ -n "$exp_auto" ] && {
@@ -378,8 +391,7 @@ action_exposure_focus() {
 			status="$status\nfocus:         $CTRL_VALUE (range $CTRL_MIN-$CTRL_MAX)"
 		}
 
-		local choice
-		choice=$(wt --menu "$dev$status" 0 0 0 \
+		choice=$(wt --default-item "$choice" --menu "$dev$status" 0 0 0 \
 			"stable" "Manual preset: lock exposure + focus (video calls/streaming)" \
 			"auto" "Auto preset: revert to the camera's own auto-hunting" \
 			"exposure" "Set exposure value only" \
@@ -409,42 +421,90 @@ action_exposure_focus() {
 	done
 }
 
+# What went short of plan while applying a preset, one "\n- ..." line per
+# control, so the closing summary reports it instead of a blanket
+# "applied". Reset at the start of each preset.
+PRESET_NOTES=""
+
+# Preset step for a menu/bool switch: run_v4l2_set already shows the
+# error, this records it for the summary.
+preset_set() {
+	local dev="$1" name="$2" val="$3"
+	run_v4l2_set "$dev" "$name" "$val" || PRESET_NOTES+="\n- $name: could not be set to $val"
+}
+
+# Preset step for an int value: prompt (prefilled with the current value),
+# validate, and apply with set_ctrl_settled, recording any shortfall.
+preset_value() {
+	local dev="$1" name="$2" what="$3" extra="$4" val
+	if ! parse_ctrl "$dev" "$name"; then
+		PRESET_NOTES+="\n- $name: could not be read, left unchanged"
+		return
+	fi
+	val=$(wt --inputbox "Fixed $what value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}$extra):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3) || val=""
+	if [ -z "$val" ]; then
+		PRESET_NOTES+="\n- $name: no value entered, left unchanged"
+		return
+	fi
+	if ! check_int_value "$name" val; then
+		PRESET_NOTES+="\n- $name: $val rejected, left unchanged"
+		return
+	fi
+	set_ctrl_settled "$dev" "$name" "$val"
+	case $? in
+	0) ;;
+	2) PRESET_NOTES+="\n- $name: set to $val, but the camera keeps moving it" ;;
+	3) PRESET_NOTES+="\n- $name: set to $val, but still inactive (its auto mode is on), so the camera may ignore it" ;;
+	*) PRESET_NOTES+="\n- $name: could not be set to $val" ;;
+	esac
+}
+
+# Closing summary for a preset: "applied" only if nothing was noted.
+preset_summary() {
+	local label="$1"
+	if [ -z "$PRESET_NOTES" ]; then
+		wt --msgbox "$label preset applied." 6 40
+	else
+		wt --msgbox "$label preset not fully applied:$PRESET_NOTES" 16 76
+	fi
+}
+
 action_apply_manual_preset() {
 	local dev="$1" exp_auto="$2" exp_abs="$3" foc_auto="$4" foc_abs="$5"
+	PRESET_NOTES=""
 
 	if [ -n "$exp_auto" ]; then
 		local manual_idx
 		manual_idx=$(ctrl_menu_items "$dev" "$exp_auto" | grep -i 'manual' | head -1 |
 			sed -E 's/^[[:space:]]*([0-9]+):.*/\1/')
-		[ -n "$manual_idx" ] && run_v4l2_set "$dev" "$exp_auto" "$manual_idx"
+		if [ -n "$manual_idx" ]; then
+			preset_set "$dev" "$exp_auto" "$manual_idx"
+		else
+			PRESET_NOTES+="\n- $exp_auto: no manual mode in its menu, left unchanged"
+		fi
 	fi
-	if [ -n "$exp_abs" ]; then
-		parse_ctrl "$dev" "$exp_abs"
-		local val
-		val=$(wt --inputbox "Fixed exposure value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[ -n "${val:-}" ] && check_int_value "$exp_abs" "$val" && set_ctrl_settled "$dev" "$exp_abs" "$val"
-	fi
-	[ -n "$foc_auto" ] && run_v4l2_set "$dev" "$foc_auto" 0
-	if [ -n "$foc_abs" ]; then
-		parse_ctrl "$dev" "$foc_abs"
-		local val
-		val=$(wt --inputbox "Fixed focus value (min=$CTRL_MIN max=$CTRL_MAX step=${CTRL_STEP:-1}, 0=infinity):" 8 60 "$CTRL_VALUE" 3>&1 1>&2 2>&3)
-		[ -n "${val:-}" ] && check_int_value "$foc_abs" "$val" && set_ctrl_settled "$dev" "$foc_abs" "$val"
-	fi
-	wt --msgbox "Manual preset applied." 6 40
+	[ -n "$exp_abs" ] && preset_value "$dev" "$exp_abs" exposure ""
+	[ -n "$foc_auto" ] && preset_set "$dev" "$foc_auto" 0
+	[ -n "$foc_abs" ] && preset_value "$dev" "$foc_abs" focus ", 0=infinity"
+	preset_summary Manual
 }
 
 action_apply_auto_preset() {
 	local dev="$1" exp_auto="$2" foc_auto="$3"
+	PRESET_NOTES=""
 
 	if [ -n "$exp_auto" ]; then
 		local auto_idx
 		auto_idx=$(ctrl_menu_items "$dev" "$exp_auto" | grep -iE 'aperture|auto' | head -1 |
 			sed -E 's/^[[:space:]]*([0-9]+):.*/\1/')
-		[ -n "$auto_idx" ] && run_v4l2_set "$dev" "$exp_auto" "$auto_idx"
+		if [ -n "$auto_idx" ]; then
+			preset_set "$dev" "$exp_auto" "$auto_idx"
+		else
+			PRESET_NOTES+="\n- $exp_auto: no auto mode in its menu, left unchanged"
+		fi
 	fi
-	[ -n "$foc_auto" ] && run_v4l2_set "$dev" "$foc_auto" 1
-	wt --msgbox "Auto preset applied." 6 40
+	[ -n "$foc_auto" ] && preset_set "$dev" "$foc_auto" 1
+	preset_summary Auto
 }
 
 # Reset every writable control back to the driver-reported default — the
@@ -483,23 +543,70 @@ action_save_profile() {
 
 	local pname
 	pname=$(wt --inputbox "Profile name (e.g. 'video-call', 'daylight'):" 8 60 3>&1 1>&2 2>&3) || return 0
-	[ -z "$pname" ] && return 0
-
-	mkdir -p "$PROFILE_DIR" || {
-		wt --msgbox "Could not create $PROFILE_DIR." 8 60
+	# One plain file name: no '/', which would point into a subdirectory
+	# that doesn't exist; no leading '.', hidden from the load menu's glob;
+	# no leading '-', which whiptail would parse as an option there.
+	case "$pname" in
+	'' | */* | .* | -*)
+		wt --msgbox "Not a usable profile name: '$pname'\nIt can't be empty, contain '/', or start with '.' or '-'." 9 70
 		return 1
-	}
+		;;
+	esac
+
+	local err
+	if ! err=$(mkdir -p "$PROFILE_DIR" 2>&1); then
+		wt --msgbox "Could not create $PROFILE_DIR:\n$err" 10 70
+		return 1
+	fi
 	local file="$PROFILE_DIR/${pname}.conf"
-	: >"$file"
-	local name
-	while IFS= read -r name; do
-		[ -z "$name" ] && continue
-		parse_ctrl "$dev" "$name"
-		case "$CTRL_TYPE" in
-		int | int64 | bool | menu | bitmask) printf '%s=%s\n' "$name" "$CTRL_VALUE" >>"$file" ;;
-		esac
-	done < <(ctrl_names "$dev")
-	wt --msgbox "Saved:\n$file" 8 60
+	if [ -e "$file" ] && [ ! -f "$file" ]; then
+		wt --msgbox "$file exists and isn't a regular file; pick another name." 8 70
+		return 1
+	fi
+	if [ -e "$file" ]; then
+		wt --defaultno --yesno "Profile '$pname' already exists. Overwrite it?" 8 60 || return 0
+	fi
+
+	# Written to a temp file beside it and renamed into place only once
+	# complete, so a failed write never truncates an existing profile. The
+	# dot prefix keeps a leftover (e.g. after Ctrl-C) out of the load menu.
+	local tmp
+	if ! tmp=$(mktemp "$PROFILE_DIR/.save.XXXXXX" 2>&1); then
+		wt --msgbox "Could not create a temporary file in $PROFILE_DIR:\n$tmp" 10 70
+		return 1
+	fi
+	local name count=0 write_ok=1
+	{
+		while IFS= read -r name; do
+			[ -z "$name" ] && continue
+			parse_ctrl "$dev" "$name" || continue
+			case "$CTRL_TYPE" in
+			int | int64 | bool | menu | bitmask)
+				printf '%s=%s\n' "$name" "$CTRL_VALUE" || write_ok=0
+				count=$((count + 1))
+				;;
+			esac
+		done < <(ctrl_names "$dev")
+	} 2>/dev/null >"$tmp" || write_ok=0
+	if [ "$write_ok" -eq 0 ]; then
+		rm -f "$tmp"
+		wt --msgbox "Could not write the profile (disk full or read-only?).\nNothing saved; $file is unchanged." 9 70
+		return 1
+	fi
+	if [ "$count" -eq 0 ]; then
+		rm -f "$tmp"
+		wt --msgbox "$dev reported no controls that can be saved. Nothing saved." 8 70
+		return 1
+	fi
+	# mktemp creates 0600; give the profile the umask-based mode a plain
+	# redirect would have (umask prints octal, e.g. 0022 -> 644).
+	chmod "$(printf '%o' "$((0666 & ~$(umask)))")" "$tmp" 2>/dev/null
+	if ! err=$(mv -f "$tmp" "$file" 2>&1); then
+		rm -f "$tmp"
+		wt --msgbox "Could not save $file:\n$err" 10 70
+		return 1
+	fi
+	wt --msgbox "Saved $count control(s) to:\n$file" 8 70
 }
 
 action_load_profile() {
@@ -507,17 +614,20 @@ action_load_profile() {
 	dev=$(pick_device "Choose a camera to apply a profile to") || return 0
 	[ -z "$dev" ] && return 0
 
-	if [ ! -d "$PROFILE_DIR" ] || [ -z "$(ls -A "$PROFILE_DIR" 2>/dev/null)" ]; then
-		wt --msgbox "No saved profiles in $PROFILE_DIR yet." 8 60
-		return 0
-	fi
-
 	local menu_args=() f base
 	for f in "$PROFILE_DIR"/*.conf; do
 		[ -e "$f" ] || continue
 		base="${f##*/}"
 		menu_args+=("$base" "")
 	done
+	# Checked on the *.conf matches, not on the directory being non-empty:
+	# a leftover .save.* temp file (see action_save_profile) alone would
+	# otherwise reach whiptail as an empty --menu, which it rejects with
+	# its usage text.
+	if [ "${#menu_args[@]}" -eq 0 ]; then
+		wt --msgbox "No saved profiles in $PROFILE_DIR yet." 8 60
+		return 0
+	fi
 	local chosen
 	chosen=$(wt --menu "Apply which profile to $dev?" 0 0 0 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 0
 	[ -z "$chosen" ] && return 0
@@ -529,8 +639,6 @@ action_load_profile() {
 	local pass name val kind applied=0 skipped=0 drifted=0
 	for pass in auto manual; do
 		while IFS='=' read -r name val; do
-			[ -z "$name" ] && continue
-			case "$name" in '#'*) continue ;; esac
 			[[ "$name" == *auto* ]] && kind=auto || kind=manual
 			[ "$kind" = "$pass" ] || continue
 			if set_ctrl "$dev" "$name" "$val"; then
@@ -538,20 +646,20 @@ action_load_profile() {
 			else
 				skipped=$((skipped + 1))
 			fi
-		done <"$PROFILE_DIR/$chosen"
+		done < <(profile_entries "$PROFILE_DIR/$chosen")
 	done
 	# One settle-and-reapply pass for exposure/focus values - see
 	# set_ctrl_settled() for why an immediate read-back isn't enough.
 	sleep "$SETTLE_SECS"
 	while IFS='=' read -r name val; do
-		case "$name" in '#'* | *auto*) continue ;; *exposure* | *focus*) ;; *) continue ;; esac
+		case "$name" in *auto*) continue ;; *exposure* | *focus*) ;; *) continue ;; esac
 		# Not a control here (already counted as skipped), or inactive
 		# because the profile left its auto mode on: nothing to settle.
 		parse_ctrl "$dev" "$name" && [ "$CTRL_INACTIVE" -eq 0 ] || continue
 		[ "$CTRL_VALUE" = "$val" ] && continue
 		set_ctrl "$dev" "$name" "$val"
 		drifted=$((drifted + 1))
-	done <"$PROFILE_DIR/$chosen"
+	done < <(profile_entries "$PROFILE_DIR/$chosen")
 	wt --msgbox "Applied $applied setting(s), skipped $skipped (unsupported on this camera/mode), re-applied $drifted that drifted." 8 70
 }
 
@@ -568,10 +676,11 @@ action_load_profile() {
 # Main menu
 # ---------------------------------------------------------------------------
 
+# Reopens on the last item picked (--default-item), like the submenus.
 main_menu() {
+	local choice="1"
 	while true; do
-		local choice
-		choice=$(wt --menu "Webcam control (v4l2)" 0 0 0 \
+		choice=$(wt --default-item "$choice" --menu "Webcam control (v4l2)" 0 0 0 \
 			"1" "Camera info & current control values" \
 			"2" "Exposure & focus quick setup" \
 			"3" "Browse & edit all controls" \
@@ -594,7 +703,7 @@ main_menu() {
 }
 
 main() {
-	require_tools
+	require_tools whiptail v4l2-ctl awk grep
 	v4l2-ctl --list-devices >/dev/null 2>&1 || die "v4l2-ctl can't enumerate devices (no /dev/video* nodes, or v4l-utils not installed properly)"
 	main_menu
 }

@@ -3,35 +3,20 @@ name: Lint Markdown
 # Runs mdl plus check-markdown-links.py (catches local cross-references to
 # files that no longer exist) against every tracked markdown file, skipping
 # the five read-only reference clones (see AGENTS.md non-negotiable #1).
-# Path-filtered so a bash/Python/config-only change doesn't also trigger
-# this -- split out of the single lint.yml (2026-09-03), see SPEC.md's
-# Testing & CI section for why. Backstop for the local pre-commit hook
-# (.githooks/pre-commit): catches a --no-verify bypass or a commit pushed
-# from a machine where the hook wasn't wired up
-# (git config core.hooksPath .githooks).
+# Backstop for the local pre-commit hook (.githooks/pre-commit): catches a
+# --no-verify bypass or a commit pushed from a machine where the hook wasn't
+# wired up (git config core.hooksPath .githooks). Split out of the single
+# lint.yml (2026-09-03), see SPEC.md's Testing & CI section for why.
+#
+# It runs on every push and pull request, not behind a path filter, because
+# deleting or renaming ANY file (a script a doc names, say) can break a
+# link, and a filter can only see the paths a change touches. The first
+# step then decides, from the diff against the base, what's worth running
+# -- mdl, the link check, both or neither -- so an unrelated change stays a
+# few seconds' job.
 on:
   push:
-    paths:
-      - "**.md"
-      - "check-markdown-links.py"
-      - "list-lint-files.sh"
-      - "reference-clones.tsv"
-      - ".mdlrc"
-      - ".mdl_style.rb"
-      - ".lint-versions"
-      - "lint-versions.sh"
-      - ".github/workflows/lint-markdown.yml"
   pull_request:
-    paths:
-      - "**.md"
-      - "check-markdown-links.py"
-      - "list-lint-files.sh"
-      - "reference-clones.tsv"
-      - ".mdlrc"
-      - ".mdl_style.rb"
-      - ".lint-versions"
-      - "lint-versions.sh"
-      - ".github/workflows/lint-markdown.yml"
 
 # bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
 defaults:
@@ -47,60 +32,65 @@ jobs:
           # The commit and its parent, for the scope check below.
           fetch-depth: 2
 
-      - name: Check whether markdown linting applies
-        # The path filter above fires on any .lint-versions change, but only
-        # its mdl line matters here -- not the hook's automatic
-        # shellcheck/shfmt bumps or a hand-set ruff -- and a filter can't
-        # read a file's lines. So: run unless every changed file that
-        # matches a path filter (read from this file, so the two can't
-        # drift) is .lint-versions with its mdl version unchanged. Anything
-        # uncertain -- another event, no base commit (a new branch), one
-        # that can't be fetched (a force push), a git or parse failure --
-        # means a full run.
+      - name: Check what this change needs
+        # mdl runs for a changed markdown file or mdl input, including the
+        # mdl= line of .lint-versions (not the hook's automatic
+        # shellcheck/shfmt bumps, or ruff). The link check runs for a changed
+        # markdown file or link-check input -- and for any file deleted or
+        # renamed, since any doc may point at it (--no-renames, so a rename
+        # shows its old path as a deletion). Anything uncertain -- another
+        # event, no base commit (a new branch), one that can't be fetched (a
+        # force push), a git failure -- means a full run.
         id: scope
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
         run: |
-          run=true
+          mdl=true
+          links=true
           base=""
           case "$EVENT" in
           push) base=$BEFORE ;;
           pull_request) base=$(git rev-parse -q --verify 'HEAD^1') || base="" ;;
           esac
           changed="$RUNNER_TEMP/changed-files"
+          deleted="$RUNNER_TEMP/deleted-files"
           if [ -n "$base" ] && [ "$base" != 0000000000000000000000000000000000000000 ] &&
             { git cat-file -e "$base^{commit}" 2>/dev/null ||
               git fetch -q --no-tags --depth=1 origin "$base"; } &&
-            git -c core.quotePath=false diff --name-only -z "$base" HEAD -- >"$changed" &&
-            filters=$(ruby -ryaml -e 'w = YAML.safe_load(File.read(ARGV[0])); puts (w["on"] || w[true])["push"]["paths"]' \
-              .github/workflows/lint-markdown.yml) && [ -n "$filters" ]; then
-            run=false
+            git -c core.quotePath=false diff --no-renames --name-only -z "$base" HEAD -- >"$changed" &&
+            git -c core.quotePath=false diff --no-renames --diff-filter=D --name-only -z "$base" HEAD -- >"$deleted"; then
+            mdl=false
+            links=false
             # shellcheck source=/dev/null
             source ./lint-versions.sh
             while IFS= read -r -d '' f; do
-              while IFS= read -r pattern; do
-                # Bash's * also matches /, so this can only over-match.
-                # shellcheck disable=SC2053
-                [[ $f == $pattern ]] || continue
-                if [ "$f" = .lint-versions ]; then
-                  old=$(git show "$base:.lint-versions" 2>/dev/null | lv_parse mdl) || old=""
-                  new=$(lv_parse mdl <.lint-versions) || new=""
-                  if [ -n "$old" ] && [ "$old" = "$new" ]; then
-                    continue
-                  fi
+              case "$f" in
+              *.md | list-lint-files.sh | reference-clones.tsv | .github/workflows/lint-markdown.yml)
+                mdl=true
+                links=true
+                ;;
+              .mdlrc | .mdl_style.rb | lint-versions.sh) mdl=true ;;
+              check-markdown-links.py | .gitignore | */.gitignore) links=true ;;
+              .lint-versions)
+                old=$(git show "$base:.lint-versions" 2>/dev/null | lv_parse mdl) || old=""
+                new=$(lv_parse mdl <.lint-versions) || new=""
+                if [ -z "$old" ] || [ "$old" != "$new" ]; then
+                  mdl=true
                 fi
-                run=true
-              done <<<"$filters"
+                ;;
+              esac
             done <"$changed"
+            if [ -s "$deleted" ]; then
+              links=true
+            fi
           fi
-          echo "run=$run" >>"$GITHUB_OUTPUT"
-          if [ "$run" = false ]; then
-            echo "No markdown-relevant change (only non-mdl lines of .lint-versions) -- skipping the markdown checks."
-          fi
+          echo "mdl=$mdl" >>"$GITHUB_OUTPUT"
+          echo "links=$links" >>"$GITHUB_OUTPUT"
+          echo "mdl: $mdl, link check: $links"
 
       - name: Install mdl at the version in .lint-versions
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.mdl == 'true'
         # --user-install: the runner's system gem dir isn't writable by the
         # non-root runner user. The version is set by hand in .lint-versions,
         # like ruff's, so CI and the hook run the same mdl.
@@ -116,19 +106,19 @@ jobs:
           echo "$gem_bin" >> "$GITHUB_PATH"
 
       - name: List the markdown files
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.mdl == 'true' || steps.scope.outputs.links == 'true'
         # NUL-separated, via a file so a lister failure fails the step (it
         # also fails on an empty list rather than lint nothing).
         run: ./list-lint-files.sh -z markdown >"$RUNNER_TEMP/markdown-files"
 
       - name: mdl
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.mdl == 'true'
         run: |
           mapfile -d '' -t files <"$RUNNER_TEMP/markdown-files"
           mdl "${files[@]}"
 
       - name: check-markdown-links.py
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.links == 'true'
         run: |
           mapfile -d '' -t files <"$RUNNER_TEMP/markdown-files"
           python3 check-markdown-links.py "${files[@]}"
