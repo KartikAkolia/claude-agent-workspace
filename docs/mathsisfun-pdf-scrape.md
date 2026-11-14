@@ -48,9 +48,13 @@ VENV=~/.venvs/mathsisfun-pdf   # adjust bin/ vs Scripts/ for your OS
 ./mathsisfun-algebra-merge.sh urls.txt /path/to/pdfs /path/to/combined.pdf
 ```
 
+Each step exits nonzero when something went wrong, so check `$?` rather than trusting the output alone. `discover.py` lists only pages that fetched successfully, normalised to `https://www.mathsisfun.com/<path>` with no query or fragment, so the `http://`, bare-domain and `?query` spellings of one page appear once. It prints the failed fetches to stderr, along with a summary at the end, and exits 1, because anything linked only from a failed page is missing too. Its 1s delay follows failed requests as well as successful ones. `render.py` counts a page as failed on a navigation error or timeout and on any non-2xx HTTP status, since Playwright's `page.goto` doesn't raise on a 404 or 500. A 304 Not Modified still counts as success, because it means the persistent Chrome profile's cache revalidated a page it already held, and that cached copy is what gets printed. It lists failures at the end and exits 1. An empty `urls.txt` exits 1 with a message, and a failed consent-priming load is logged rather than fatal. `merge.sh` stops without writing the book if any URL has no non-empty PDF, naming each one. Pass `--allow-missing` before the positional arguments to merge the rest anyway. Its closing line gives both the file count and the real page count from `pdfinfo`.
+
 The script filenames still say "algebra" (not renamed, to keep this low-churn) but all three are section-agnostic now: `discover.py` takes the start URL as an argument and derives the crawl prefix from it; `render.py` and `merge.sh` strip whichever leading path segment the URL has, not a hardcoded `/algebra/`. Use a separate `profile_dir` per section (e.g. `~/.cache/mathsisfun-data-pdf/chrome-profile`) so consent-priming for one section doesn't get mixed up with another.
 
-Re-running step 2 is idempotent by *filename* (same URL → same slug → same destination file gets overwritten), but the script doesn't currently skip already-rendered pages — every run redoes all of them. Fine for occasional refreshes; if this becomes routine, add a skip-if-exists check.
+Re-running step 2 is idempotent by *filename* (same URL → same slug → same destination file gets overwritten), but the script doesn't currently skip already-rendered pages — every run redoes all of them. Fine for occasional refreshes; if this becomes routine, add a skip-if-exists check. A failed page keeps whatever PDF an earlier run left under its slug, so after a run with failures, re-render those pages before merging, or that stale copy goes into the book.
+
+The slug rule (drop the section and `.html`, turn every run of non-alphanumerics into one `-`) is lossy: `a/b.html` and `a-b.html` both become `a-b.pdf`. `render.py` and `merge.sh` each implement it, and the two must stay identical. The first URL in `urls.txt` to reach a slug owns it. `render.py` fails any later URL that lands on the same slug rather than overwriting its PDF, and `merge.sh` counts that URL as missing. The same URL listed twice is rendered and merged once.
 
 ## The gotchas (why this isn't a one-liner)
 
@@ -68,7 +72,7 @@ It's also *not* sticky the way the big modal is — no cookie/localStorage gets 
 
 Fix: `dismiss_cookie_banner()` uses a CSS locator (`#cookOK .btn`) instead of a role-based one, waits for it to appear before clicking (same async-timing issue as gotcha #2, though this one seems to render faster, ~1s), and force-hides the leftover empty `#cookOK` div via `page.evaluate()` afterward.
 
-**Verification approach that caught #2 and #3**: don't trust "0 failures" alone — the script "succeeds" on every page regardless, because a rendered-but-wrong PDF isn't a script failure. Render actual sample pages to PNG (`pdftoppm -png -r 100 -f N -l N file.pdf`) and look at them — several points through the book, not just the first page (gotcha #3's residual banner is easy to miss on a single glance since it's a small corner artifact, and gotcha #2 was intermittent enough that a single spot-check could pass by chance).
+**Verification approach that caught #2 and #3**: don't trust "0 failures" alone. HTTP errors now count as failures, but a page that loads fine and renders with a modal or banner baked in still "succeeds", because a rendered-but-wrong PDF isn't a script failure. Render actual sample pages to PNG (`pdftoppm -png -r 100 -f N -l N file.pdf`) and look at them — several points through the book, not just the first page (gotcha #3's residual banner is easy to miss on a single glance since it's a small corner artifact, and gotcha #2 was intermittent enough that a single spot-check could pass by chance).
 
 ## Linting
 
@@ -85,4 +89,4 @@ All four scripts (three Python-driven pipeline steps plus the shell merge step) 
 
 - `scripts/mathsisfun-algebra-discover.py` — crawler, outputs one URL per line. Takes an optional start-URL argument to crawl a different section.
 - `scripts/mathsisfun-algebra-render.py` — renders each URL to a PDF (needs the venv above). Takes an optional profile-dir argument; use a distinct one per section.
-- `scripts/mathsisfun-algebra-merge.sh` — `pdfunite`s the per-page PDFs into one book, in crawl order.
+- `scripts/mathsisfun-algebra-merge.sh` — `pdfunite`s the per-page PDFs into one book, in crawl order. Refuses if any are missing unless given `--allow-missing`.
