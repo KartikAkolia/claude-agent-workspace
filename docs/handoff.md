@@ -6,6 +6,69 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Session entries since 2026-10-11 are kept below, newest first. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
 
+### This session's work (2026-11-14, evening, on the CachyOS laptop): dwm-titus Arch port reviewed, fixed and squash-merged into private `KartikAkolia/dwm-titus-arch`
+
+Kartik asked to continue the skeptic port from the entry below, with every agent and review at xhigh effort. One fixer agent edited `~/dwm-titus`. Two read-only agents ran alongside it: a Plasma-safety audit and a hybrid-GPU investigation. The GPU agent then built a reverse-PRIME patch in an isolated copy, which the fixer merged. Three `/code-review xhigh` passes ran between fix rounds, and each returned 15 findings.
+
+1. **Plasma-safety audit:** it found three ways the port could harm Plasma.
+   - A second login as the same user (`startx`) would stop `graphical-session.target` at dwm logout. `plasma-workspace.target` has `BindsTo=` on that target, so KWin and plasmashell would stop too.
+   - An unclean dwm exit would leave `QT_QPA_PLATFORM=xcb`, `QT_QPA_PLATFORMTHEME=qt6ct` and `XCURSOR_*` in the user manager Plasma shares.
+   - The installer seeded a picom autostart entry that Plasma would run.
+
+   All three are fixed. Ownership checks now count every active or online x11/wayland session of the user, shared mode never imports the Qt and cursor variables, a crash watcher runs autostop once the X connection closes, and picom is seeded `Hidden=true`.
+2. **Hybrid GPU:** this is from the SDDM greeter's `/var/log/Xorg.0.log` and SDDM 0.21's source. A dwm login reuses the greeter's X server. That server makes the AMD iGPU primary (`card1`, `boot_vga=1`) and lights only `eDP-1`. The 4060 comes up as the sink `NVIDIA-G0`, with HDMI connected but on `mode "NULL"`.
+   - **New helper:** `dwm-reverse-prime` runs from autostart, on Arch only, before picom and Quickshell start. It binds the sink and turns on its connected, unlit outputs to the right of the panel. It affects the dwm session only and writes no config; `DWM_REVERSE_PRIME=0` turns it off.
+   - **`dwm-display-setup`:** it misdetected NVIDIA as the primary driver. It now reads screen 0's driver. It refuses to save `ForceFullCompositionPipeline` for a sink, or a layout that turns the panel off, because the SDDM X11 greeter reads `/etc/X11/xorg.conf.d`.
+   - Nothing was changed for `PrimaryGPU`, in `xorg.conf.d`, or in SDDM.
+3. **Scope cut (Kartik's decision):** shared-desktop mode is now Arch-only. On Fedora, `--shared-desktop` is rejected before any change, and the Fedora shared-mode code is deleted. `tests/test-fedora-unchanged.sh` compares Fedora install plans and user files against `main`. The `dwm-display-setup` hybrid fix is the one deliberate change Fedora users will see.
+4. **Review stop (Kartik's decision):** after the third review, Kartik stopped the review loop. That review's findings, the Fedora cut and the reverse-PRIME merge were fixed and tested, but had no further independent review. This replaces AGENTS.md non-negotiable 7's repeat-until-clean for this change only.
+5. **Verified by Claude before the merge:**
+   - **Build and lint:** a clean `make` with no warnings, and the rebuilt `dwm` is byte-identical to the installed one. shfmt is clean on all 44 touched shell files, and `check-shell` passes.
+   - **Tests:** under `env -i` with guard wrappers, these pass: `check-reverse-prime`, `check-shared-desktop`, `check-display-setup`, `check-arch-packages`, `check-session-guards`, `check-quickshell-controlcenter` and `check-xdg-autostart`. `check-app-themes` fails only because `xvfb-run` is missing.
+   - **Live state:** the installed files match the repo, and the live manager environment's hash was unchanged across the runs. The manager has no `X-DWM`, `QT_QPA` or `XCURSOR` variables, picom isn't running, and `~/.config/quickshell` doesn't exist.
+   - **The agent's full isolated suite** gave 59 pass and 28 fail, against `main`'s 55 and 29. The failures need Xvfb, dnf, ksvalidator or PackageKit, or are upstream shfmt drift. `check-session-guards` is flaky only in the sequential run, on `main` too. This corrects the entry below, which said only four Fedora-host tests fail.
+6. **Repo:** Claude created private `KartikAkolia/dwm-titus-arch` with Actions disabled. Upstream's CodeQL cron would fail on a private repo without Advanced Security.
+   - **Remotes:** `~/dwm-titus` has `origin` (upstream, never pushed to) and `kartik`.
+   - **Merge:** the port went in as squash-merged PR #2, commit `429b7b6` on `main`, 60 files, +6128/−388. Local `main` tracks `kartik/main`, the working tree is clean, and `arch-port` is deleted.
+   - **Dependabot:** it opened PR #1 (codeql-action 4.39.1 to 4.39.3) from upstream's `.github/dependabot.yml` on the first push. The auto-mode classifier blocked Claude from closing it, so it is still open (item 57).
+7. **Host state:** the port was installed with `pkexec make install DATADIR=/usr/share` from the final tree: 80 commands, including `dwm-reverse-prime`.
+   - **Terminal:** Super+X now runs `dwm-terminal`, using dwm-only configs in `~/.config/dwm-titus/{alacritty,kitty}`.
+   - **Leftover:** `~/.config/alacritty` is byte-identical to the port's defaults from the first install, and is no longer updated. The port also installed alacritty itself, on 2026-11-14. Remove that folder if nothing outside dwm uses it.
+8. **Known issues, deferred:**
+   - **Reverse PRIME** is untested on real hardware: the HDMI output's name, whether `--auto` picks 180 Hz, PRIME Synchronization, and picom pacing. picom v13 paces from whichever display sits at 0,0, so it runs at the panel's 144 Hz unless HDMI moves there. The Arch Wiki also reports Vulkan FIFO hangs under reverse PRIME. A display plugged in mid-session needs `dwm-reverse-prime` run again.
+   - **Shared-mode gaps:** `dwm-xdg-autostart` copies freeze vendor entries for other desktops too (`reset <id>` undoes that). `dwm-default-apps` refuses to run in shared mode rather than writing a dwm-only mimeapps list. Reinstalling as standalone during a live shared session leaves its environment snapshot pending.
+   - **After the first reboot:** `alsa-restore` may run `alsactl init`, since `/var/lib/alsa` has no saved state. That can reset mixer controls WirePlumber doesn't manage, such as mic boost.
+   - **Fonts (cosmetic):** the Nerd Font packages now rank second in `fc-match -s monospace` fallback.
+   - **Agent incidents,** neither of which affected the host: the audit agent briefly ran `pkexec true` at about 13:30, which was killed with no authentication given, and the fixer's temp cleanup deleted the GPU agent's `/tmp/claude-1000/dwt-gpu/` workspace, though the patch survived in the scratchpad.
+
+### This session's work (2026-11-14, later, on the CachyOS laptop): dwm-titus ported to Arch as an extra SDDM session beside Plasma; first pass, later reviewed and merged (entry above)
+
+Kartik asked for a skeptic agent to audit `~/dwm-titus`, a clean clone of upstream `ChrisTitusTech/dwm-titus` (Fedora-only). It is not the read-only `dwm-titus-main/` mirror in this repo, so editing it is allowed. The agent was to make it run on this host without breaking Plasma 6.8.2 on Wayland under SDDM. One high-effort agent did the audit, the port and three rounds of fixes; three `/code-review` passes ran between them.
+
+1. **Code (`~/dwm-titus`, branch `arch-port`, nothing committed or pushed):** 27 tracked files changed, +1166/−150. New untracked files: `scripts/dwm-session-env`, `dwm-session-lib.sh`, `dwm-quickshell-config`, `dwm-migrate-quickshell-path`, `make-resolve-mode`, and five `tests/test-*.sh`. The core is a **shared-desktop mode**. The installer turns it on automatically on Arch when another session file exists. The Makefile works it out on its own and records it in the marker `~/.config/dwm-titus/shared-desktop`, so a plain `make install` stays in shared mode. In shared mode:
+   - **Display manager:** no LightDM, and no display-manager change.
+   - **Autostart and environment:** no XDG autostart entries, and no global GTK, GSettings or env writes.
+   - **Portal and Quickshell:** the portal config goes in as `dwm-portals.conf`, and Quickshell runs from `~/.config/dwm-titus/quickshell`, not `~/.config/quickshell`.
+   - **Packages:** pacman installs only what's missing, and refuses when `pacman -Qu` shows pending updates. Packages that would act inside Plasma (picom, thunar, gnome-keyring, blueman, mate-polkit, light-locker, xdg-user-dirs) are skipped.
+   - **Logout:** `autostop` always unsets per-session X11 variables. SDDM's `Xsession` imports `DISPLAY` and `XAUTHORITY` before dwm starts, so those are unset rather than restored. Only `XDG_DATA_DIRS`, `QT_QPA_PLATFORMTHEME` and `XCURSOR_*` are restored from a pre-session snapshot.
+   - **Known limitations,** documented in the repo's README (Arch section) and SPEC §4.1: switching an existing standalone install to shared mode doesn't clean up what it wrote; GTK dark/light preference doesn't reach GTK apps inside dwm; the Update Center and `dev-sync-install` are Fedora-only; `xkbset` and the Arc, Yaru and Numix GTK themes are AUR-only and not installed; and the Meslo fontconfig alias, used only by dwm's `kitty.conf`, is skipped.
+2. **Installed (`pkexec`):**
+   - **Packages:** 36 added and 0 removed against the session's `pacman -Q` baseline. They are the agent's 32 (`alacritty`, `qt6ct`, `i3lock`, `xorg-server-xephyr`, …), `picom` 13-2.1, and `ttf-meslo-nerd`, `ttf-jetbrains-mono-nerd` and `ttf-cascadia-code-nerd` (all 3.5.1-2, in place of the Nerd Fonts v3.5.1 zips Kartik linked).
+   - **System files:** the session file `/usr/share/xsessions/dwm.desktop` (`Name=dwm-titus`, `Exec=/usr/local/bin/dwm`); `/usr/local/bin/dwm` and its helpers, plus `/usr/local/libexec/dwm-titus/`; and the `/usr/share/themes/Dwm-*` themes, the `Capitaine-Cursors` icon themes and the qt5ct/qt6ct colour files.
+   - **User files:** `~/.xinitrc`, `~/.local/share/dwm-titus`, and the `dwm-titus`, `alacritty`, `kitty`, `Thunar`, `starship`, `dwmterm` and `qt6ct` folders in `~/.config`. Also `~/.config/xdg-desktop-portal/dwm-portals.conf` and `~/.config/systemd/user/wm-graphical-session.service` (no `[Install]` section).
+3. **Host changes made directly in this session:**
+   - **Picom autostart:** `~/.config/autostart/picom.desktop` with `Hidden=true` keeps the package's `/etc/xdg/autostart/picom.desktop` from starting picom in Plasma. dwm starts picom itself. Checked with `dex -a -d` and an offline run of `systemd-xdg-autostart-generator`; without the override, the generator makes `app-picom@autostart.service`.
+   - **Picom config:** `~/.config/picom/picom.conf` is a copy of `/etc/xdg/picom.conf` with line 295 set to `match = "window_type = 'tooltip' && name != 'quickshell'";`, upstream's Quickshell opacity tweak in picom 13 syntax. `/etc/xdg/picom.conf` itself is untouched.
+   - **Fonts:** the hand-installed `~/.local/share/fonts/MesloLGS Nerd Font Mono/` (72 TTFs, all also in `ttf-meslo-nerd`) was moved to the Trash, the Trash emptied, and the empty `~/.local/share/fonts` removed. The Quickshell menu needs only `MesloLGS Nerd Font Mono`, which now resolves to `/usr/share/fonts/TTF/`.
+4. **Verified:**
+   - **Build and lint:** clean `make` with no warnings; `shellcheck` and `shfmt -d` clean on every edited script.
+   - **Tests:** the repo's checks pass, apart from four that need a Fedora host and fail the same way on `main`. Each new test was confirmed to fail with its fix reverted.
+   - **Nested sessions:** several Xephyr runs of the installed session showed one picom, the Quickshell panel from the new path in Meslo, and no portal fallback.
+   - **Plasma intact:** SDDM is still enabled and active, and `plasma.desktop` is unchanged. The user manager still reads `XDG_CURRENT_DESKTOP=KDE`, with no `QT_QPA_PLATFORMTHEME`, and flatpak's `XDG_DATA_DIRS` is intact. `DISPLAY=:1` belongs to Plasma's own Xwayland. GTK, mimeapps, fontconfig and KDE config hashes are unchanged; the only change to `plasma-org.kde.plasma.desktop-appletsrc` came from System Settings.
+   - **Not verified:** a real SDDM login into dwm-titus.
+5. **Review status:** the first three `/code-review` rounds' actionable findings were all fixed. A fourth review of the round-3 fixes was stopped at Kartik's request before it reported anything. That means the Quickshell path move, the session-env rewrite, the strict `pacman -Qu` preflight and the Makefile resolver have had no independent review.
+6. **Ephemeral evidence:** the before/after snapshots, install logs and test logs were in the session scratchpad (`/tmp/claude-1000/…/scratchpad/`). A reboot clears them, so the only durable baseline is the `pacman.log` for 2026-11-14.
+
 ### This session's work (2026-11-13, from the CachyOS laptop, on the Raspberry Pi): `vault` and `trilium` moved onto a Cloudflare Tunnel; router 80/443 forwards removed
 
 Kartik chose a Cloudflare Tunnel over restricting the Pi's firewall to Cloudflare's IP ranges. The full record is in `docs/cloudflare-zone-settings.md` under "Cloudflare Tunnel".
@@ -301,7 +364,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 57.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 58.
 
 - **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
@@ -332,6 +395,17 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
 - **54.** **CachyOS laptop: after the next reboot, confirm the gaming tuning persists.** (2026-11-12) zram swap, zswap off, `kyber` on NVMe and the `80-gaming.conf` sysctls are applied and verified live, but persistence is config inspected only. The checks and the rollback are in items 4 and 5 of the 2026-11-12 "gaming tuning" entry. Also confirm that Steam's shader pre-caching uses more threads after its next start.
 - **55.** **Raspberry Pi: finish the Cloudflare Tunnel move.** (2026-11-13) First, the outside check: Kartik confirmed on 2026-11-13 that it works from outside his network. Done. Second, the optional hardening: `ufw` turned on with LAN-only rules and the idle rootful Docker disabled, both done and verified live on 2026-11-13 (entry items 7 and 8). After the Pi's next reboot, check that `sudo ufw status` reads `active`, `systemctl is-active docker.service containerd.service` reads `inactive` for both, and both sites load. Third, after the first `npm-5`/`npm-6` renewal (due around January 2027), check that NPM shows the new expiry dates. Details are in the 2026-11-13 entry.
 - **56.** **CachyOS laptop: keep or disable `[multilib-testing]`?** (2026-11-09) `/etc/pacman.conf` now has `[multilib-testing]` enabled above `[multilib]`, but the 2026-10-18 snapshot in `docs/archlinux-pacman-config.md` has it commented out. While enabled, 32-bit packages come from Arch testing whenever testing is newer. If it wasn't deliberate, comment it out and run `sudo pacman -Syuu`. This item was numbered 46 in commit `27218d0` and renumbered when that commit was merged on 2026-11-13, because 46 was already taken. `[multilib-testing]` was still enabled on 2026-11-13.
+- **57.** **CachyOS laptop: run topgrade, then do the first real dwm-titus login.** (2026-11-14, updated the same evening) The port is merged into private `KartikAkolia/dwm-titus-arch` `main` (`429b7b6`) and installed from it (2026-11-14 evening entry).
+  1. **Update:** run `topgrade`; 71 updates were pending. Reboot if it updated the kernel or NVIDIA driver.
+  2. **Check the binary:** `ldd /usr/local/bin/dwm | grep 'not found' || echo OK`. If anything is missing, run `make -C ~/dwm-titus && pkexec make -C ~/dwm-titus install DATADIR=/usr/share`.
+  3. **Log in:** keep the lid open, log out and pick **dwm-titus** in SDDM. `pgrep -c -x picom` should print `1`, `pgrep -af quickshell` should show `--path …/.config/dwm-titus/quickshell/shell.qml`, and Super+X should open alacritty themed from `~/.config/dwm-titus/alacritty`.
+  4. **Displays:** `grep dwm-reverse-prime ~/.local/share/sddm/xorg-session.log` should show `enabled <HDMI output> (NVIDIA-G0) right of eDP-1`; `mismatch`, `nested`, `stopped after` or `could not` means it didn't work. `xrandr --listproviders` should show `NVIDIA-G0` with `associated providers: 1`, and `xrandr --query` should show `eDP-1` at `+0+0` and HDMI at `+1920+0`.
+  5. **Refresh rate and rendering:** if HDMI isn't at 180 Hz, run `xrandr --output <HDMI output> --mode 1920x1080 --rate 180`. For 180 Hz picom pacing, put HDMI at 0,0 with `xrandr --output <HDMI output> --pos 0x0 --primary --output eDP-1 --right-of <HDMI output>`. `xrandr --prop | grep -A1 'PRIME Synchronization'` should show `1`, `glxinfo -B` should name the 780M, and `prime-run glxinfo -B` the 4060. Don't save a layout with `eDP-1` disabled.
+  6. **If a screen stays blank:** press Ctrl+Alt+F3 and log in. Run `loginctl list-sessions`, then `loginctl terminate-session <id>` on the x11 session. To turn the helper off, put `export DWM_REVERSE_PRIME=0` in `~/.xprofile`.
+  7. **Back in Plasma:** pick **Plasma** in SDDM, which preselects the last session. `systemctl --user show-environment | grep -E 'X-DWM|QT_QPA|XCURSOR'` should print nothing (Plasma exports `XAUTHORITY` itself, so don't grep for that), `pgrep -x picom` should print nothing, and the file chooser should still be KDE's.
+  8. **Dependabot PR #1** on `KartikAkolia/dwm-titus-arch`: merge or close it. Actions are off, so it has no effect either way.
+
+  Once steps 3–7 pass, move this item to `docs/archival.md`.
 
 ## Notes
 
