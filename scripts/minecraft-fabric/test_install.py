@@ -73,8 +73,10 @@ exit 1
 fi
 printf '%s\\n' "$*" >>"$FIXTURES/java-calls"
 if [[ ${BOOT_SERVER:-} == yes ]]; then
-    mkdir -p config/Geyser-Fabric
+    mkdir -p config/Geyser-Fabric config/floodgate logs
     printf 'java:\\n  auth-type: online\\n' >config/Geyser-Fabric/config.yml
+    printf '# default-locale: en_US\\n' >config/floodgate/config.yml
+    [[ -z ${FLOODGATE_WARNS:-} ]] || echo "$WARNING" >logs/latest.log
     trap 'exit 0' TERM
     echo 'Done (0.1s)!'
     while :; do sleep 0.1; done
@@ -458,6 +460,40 @@ exit "$status"
             (server / "mods/fabric-api-9.0.jar").read_bytes(), b"previous mod"
         )
 
+    @unittest.skipUnless(
+        os.access("/dev/shm", os.W_OK) and Path("/run/systemd/system").is_dir(),
+        "needs systemd and a writable /dev/shm (system mode refuses /tmp)",
+    )
+    def test_system_mode_floodgate_locale_is_read_and_set_as_owner(self):
+        if Path("/etc/systemd/system/minecraft-fabric.service").exists():
+            self.skipTest("a real minecraft-fabric system unit exists here")
+        root = Path(os.path.realpath(self.root))
+        homes = (Path("/home").resolve(), Path("/root"), Path.home().resolve())
+        if any(root.is_relative_to(home) for home in homes):
+            self.skipTest("a system unit can't use the stub Java in a home directory")
+        base = tempfile.TemporaryDirectory(prefix="fabric-system-", dir="/dev/shm")
+        self.addCleanup(base.cleanup)
+        self.server = server = Path(os.path.realpath(base.name)) / "server with spaces"
+        self.system_mode_stubs(server)
+        options = ("--service", "system", "--dir", str(server), "--type", "floodgate")
+        self.install(*options, SERVER=str(server))
+        # The configs and log a first start leaves.
+        server.chmod(0o700)
+        self.geyser_config("java:\n  auth-type: online\n")
+        self.floodgate_config(self.FLOODGATE)
+        self.server_log(f"{self.WARNING}\n")
+        server.chmod(0o000)
+        (self.fixtures / "sudo-calls").write_text("")
+        self.install(*options, SERVER=str(server))
+        self.assert_root_only_read_the_server(server)
+        calls = (self.fixtures / "sudo-calls").read_text()
+        self.assertIn("minecraft grep -qF is not a supported Floodgate language", calls)
+        self.assertIn("minecraft sed -i", calls)
+        self.assertIn(f"minecraft tee -a -- {server}/.install-state", calls)
+        server.chmod(0o700)
+        self.assertEqual(self.floodgate_config(), self.SET)
+        self.assertIn("floodgate_locale=set", (server / ".install-state").read_text())
+
     def without_sudo(self):
         """A PATH holding every command but sudo."""
         tools = self.root / "tools"
@@ -518,6 +554,88 @@ exit "$status"
         self.geyser_config("java:\n  port: 25565\n")
         result = self.install("--type", "floodgate", expected=1)
         self.assertIn("couldn't find auth-type", result.stderr)
+
+    def floodgate_config(self, text=None):
+        config = self.server / "config/floodgate/config.yml"
+        if text is not None:
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(text)
+        return config.read_text()
+
+    FLOODGATE = "replace-spaces: true\n\n# default-locale: en_US\n\ndisconnect:\n  invalid-key: x\n"
+
+    WARNING = "[21:13:59] [main/WARN]: en_ is not a supported Floodgate language."
+    SET = FLOODGATE.replace("# default-locale: en_US", "default-locale: en_US")
+
+    def server_log(self, text):
+        log = self.server / "logs/latest.log"
+        log.parent.mkdir(exist_ok=True)
+        log.write_text(text)
+
+    def test_floodgate_locale_set_once_after_its_warning(self):
+        self.install()
+        self.geyser_config("java:\n  auth-type: online\n")
+        floodgate = ("--type", "floodgate")
+        state = self.server / ".install-state"
+        # Before Floodgate's first start, the step says why it was skipped.
+        result = self.install(*floodgate)
+        self.assertIn("rerun this after that to check its locale", result.stdout)
+        self.floodgate_config(self.FLOODGATE)
+        # No log yet, or a log without the warning: nothing changes.
+        self.install(*floodgate)
+        self.assertEqual(self.floodgate_config(), self.FLOODGATE)
+        self.server_log("[main/INFO]: Loading extensions...\n")
+        self.install(*floodgate)
+        self.assertEqual(self.floodgate_config(), self.FLOODGATE)
+        # A value set by hand, or a config without the template line, stays
+        # even when the log has the warning.
+        self.server_log(f"[main/INFO]: Loading 93 mods\n{self.WARNING}\n")
+        for config in (
+            self.FLOODGATE.replace("# default-locale: en_US", "default-locale: de_DE"),
+            self.FLOODGATE.replace(
+                "# default-locale: en_US", "# default-locale: de_DE"
+            ),
+            "default-locale: de_DE\n" + self.FLOODGATE,
+            "replace-spaces: true\n",
+        ):
+            with self.subTest(config=config):
+                self.floodgate_config(config)
+                self.install(*floodgate)
+                self.assertEqual(self.floodgate_config(), config)
+        self.assertNotIn("floodgate_locale", state.read_text())
+        # Otherwise the template line is uncommented, and that's recorded.
+        self.floodgate_config(self.FLOODGATE)
+        result = self.install(*floodgate)
+        self.assertEqual(self.floodgate_config(), self.SET)
+        self.assertIn("default-locale is now en_US", result.stdout)
+        self.assertIn("\nfloodgate_locale=set\n", state.read_text())
+        # Commented out again by hand, it stays so, across reruns and starts
+        # that log the warning again.
+        self.floodgate_config(self.FLOODGATE)
+        for _ in range(2):
+            self.server_log(f"{self.WARNING}\n")
+            result = self.install(*floodgate)
+            self.assertEqual(self.floodgate_config(), self.FLOODGATE)
+            self.assertNotIn("default-locale", result.stdout + result.stderr)
+        self.assertEqual(state.read_text().count("floodgate_locale=set"), 1)
+
+    def test_floodgate_locale_edit_failure_is_reported_once(self):
+        self.install()
+        self.geyser_config("java:\n  auth-type: online\n")
+        self.floodgate_config(self.FLOODGATE)
+        self.server_log(f"{self.WARNING}\n")
+        directory = self.server / "config/floodgate"
+        directory.chmod(0o555)
+        self.addCleanup(directory.chmod, 0o755)
+        result = self.install("--type", "floodgate")
+        self.assertIn("couldn't set default-locale: en_US", result.stderr)
+        self.assertIn(
+            "floodgate_locale=set", (self.server / ".install-state").read_text()
+        )
+        result = self.install("--type", "floodgate")
+        self.assertNotIn("default-locale", result.stdout + result.stderr)
+        directory.chmod(0o755)
+        self.assertEqual(self.floodgate_config(), self.FLOODGATE)
 
     DROP = "table inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n"
 
@@ -721,13 +839,30 @@ sleep() { SECONDS=$((SECONDS + 121)); }
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.fixtures / "pid").exists())
 
-    def test_first_boot_child_is_stopped_and_floodgate_auth_set(self):
-        self.install("--type", "floodgate", "--accept-eula", BOOT_SERVER="yes")
-        self.assertIn(
-            "auth-type: floodgate",
-            (self.server / "config/Geyser-Fabric/config.yml").read_text(),
-        )
-        self.assertFalse((self.server / ".first-boot.pid").exists())
+    def test_first_boot_child_is_stopped_and_floodgate_configured(self):
+        for warns, locale in (("yes", "default-locale"), ("", "# default-locale")):
+            with self.subTest(warns=warns):
+                self.server = self.root / f"server {warns or 'quiet'}"
+                self.install(
+                    "--type",
+                    "floodgate",
+                    "--accept-eula",
+                    BOOT_SERVER="yes",
+                    FLOODGATE_WARNS=warns,
+                    WARNING=self.WARNING,
+                    SERVER=str(self.server),
+                )
+                self.assertIn(
+                    "auth-type: floodgate",
+                    (self.server / "config/Geyser-Fabric/config.yml").read_text(),
+                )
+                self.assertEqual(self.floodgate_config(), f"{locale}: en_US\n")
+                self.assertEqual(
+                    "floodgate_locale=set"
+                    in (self.server / ".install-state").read_text(),
+                    bool(warns),
+                )
+                self.assertFalse((self.server / ".first-boot.pid").exists())
 
     def test_effective_geyser_ports(self):
         self.server.mkdir()

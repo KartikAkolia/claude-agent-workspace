@@ -425,6 +425,7 @@ read_existing() {
 	local state port
 	previous_version='' previous_type='' previous_mode='' previous_launcher='' java_port=$JAVA_PORT
 	previous_jars=() previous_heap='' bedrock_port=$BEDROCK_PORT signaling_port=$BEDROCK_PORT
+	previous_floodgate_locale=''
 	[[ -d $server_dir ]] || return 0
 	[[ -r $server_dir && -x $server_dir ]] || info "Reading the existing install in $server_dir with sudo"
 	state=$(peek cat "$server_dir/$STATE_FILE" || true)
@@ -433,6 +434,7 @@ read_existing() {
 	previous_mode=$(sed -n 's/^service_mode=//p' <<<"$state")
 	previous_launcher=$(sed -n 's/^\(loader\|installer\)_version=//p' <<<"$state" | paste -sd/)
 	previous_heap=$(sed -n 's/^heap=\([1-9][0-9]*[GgMm]\)$/\1/p' <<<"$state")
+	previous_floodgate_locale=$(sed -n 's/^floodgate_locale=\(set\)$/\1/p' <<<"$state")
 	# The jars an earlier run installed, by exact name.
 	mapfile -t previous_jars < <(sed -n 's/^mod_[a-z-]*=\([A-Za-z0-9][A-Za-z0-9._+-]*\.jar\)$/\1/p' <<<"$state")
 	# Installs made before the state file existed: the vanilla jar's folder
@@ -953,6 +955,7 @@ installer_version=$installer_version
 service_mode=$service_mode
 heap=$heap
 $(for slug in "${wanted_mods[@]}"; do printf 'mod_%s=%s\n' "$slug" "${mod_files[$slug]%%$'\t'*}"; done)
+$([[ -z $previous_floodgate_locale ]] || echo "floodgate_locale=$previous_floodgate_locale")
 EOF
 artifacts_pending=false
 
@@ -1020,8 +1023,47 @@ print(0)') || die "couldn't read $geyser_config"
 	as_owner sed -i -E "${line}s/^( *auth-type:).*/\1 $1/" "$geyser_config" ||
 		die "couldn't set auth-type: $1 in $geyser_config; set it by hand"
 }
+
+# Floodgate ships translations for some locales only. When the JVM's locale
+# isn't one of them, it logs "<locale> is not a supported Floodgate language"
+# at every start and falls back to en_US (LANG=C.UTF-8 makes Java's locale
+# "en" with no country, so "en_"). If the server's last start logged that,
+# uncomment the "# default-locale: en_US" line Floodgate's config ships with:
+# the same language, without the warning. Players still get their own
+# language where Floodgate has it; default-locale sets the console's and the
+# fallback. Only that template line is changed, so a default-locale set by
+# hand stays, and only once per install (recorded in the state file), so
+# commenting the line out again stays that way.
+floodgate_config=$server_dir/config/floodgate/config.yml
+# set_floodgate_locale — do that if the server's log calls for it. Returns 1
+# when it can't find the config (Floodgate writes it on its first start).
+set_floodgate_locale() {
+	local line
+	[[ -z $previous_floodgate_locale ]] || return 0
+	as_owner test -f "$floodgate_config" || return 1
+	! as_owner grep -qE '^default-locale:' "$floodgate_config" || return 0
+	as_owner grep -qF 'is not a supported Floodgate language' "$server_dir/logs/latest.log" 2>/dev/null || return 0
+	line=$(as_owner grep -m1 -nxE '# *default-locale: *en_US *' "$floodgate_config") || return 0
+	# Record it first: an unrecorded change could come back after a hand revert.
+	if ! echo "floodgate_locale=set" | as_owner tee -a -- "$server_dir/$STATE_FILE" >/dev/null; then
+		warn "couldn't record a Floodgate locale change in $server_dir/$STATE_FILE, so left $floodgate_config alone"
+		return 0
+	fi
+	if ! as_owner sed -i "${line%%:*}s/.*/default-locale: en_US/" "$floodgate_config"; then
+		warn "couldn't set default-locale: en_US in $floodgate_config; uncomment it by hand to stop Floodgate's locale warning"
+		return 0
+	fi
+	info "Floodgate's default-locale is now en_US (in $floodgate_config): it logged that it has no translation for the server's locale and was already using en_US"
+}
+needs_first_boot=false
 case $server_type in
-floodgate) set_geyser_auth floodgate || needs_first_boot=true ;;
+floodgate)
+	set_geyser_auth floodgate || needs_first_boot=true
+	# Without a first boot to follow, say why the locale went unchecked.
+	if ! $needs_first_boot && ! set_floodgate_locale; then
+		info "Floodgate writes its config on its first start; rerun this after that to check its locale"
+	fi
+	;;
 geyser) set_geyser_auth online floodgate || true ;;
 esac
 
@@ -1276,7 +1318,7 @@ first_boot() {
 	shut_down_boot
 }
 
-if ${needs_first_boot:-false}; then
+if $needs_first_boot; then
 	if ! as_owner grep -qx 'eula=true' "$server_dir/eula.txt"; then
 		warn "Floodgate setup is unfinished: accept the EULA, start the server once, stop it, then rerun this script."
 	elif confirm "Boot the server once now to finish Floodgate setup?" y; then
@@ -1285,6 +1327,7 @@ if ${needs_first_boot:-false}; then
 		first_boot
 		set_geyser_auth floodgate || die "Geyser didn't write $geyser_config on first boot"
 		info "Geyser now uses Floodgate auth"
+		set_floodgate_locale || warn "Floodgate didn't write $floodgate_config on first boot, so its locale wasn't checked"
 	else
 		warn "Floodgate setup is unfinished: start the server once, stop it, then rerun this script."
 	fi
