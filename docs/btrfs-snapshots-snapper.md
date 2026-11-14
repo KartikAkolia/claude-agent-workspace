@@ -1,6 +1,6 @@
 # Btrfs Snapshots via Snapper on asus-vivobook
 
-Status: **Working and verified on `asus-vivobook` 2026-08-28.** `snapper` installed, `root` config created with `ALLOW_USERS="kartik"`, all three timers active, apt pre/post hook confirmed firing on a real apt operation, non-root `snapper create`/`list` independently verified.
+Status: **Historical. Not present on the current install.** This page describes `asus-vivobook`'s Debian install on Btrfs, where it was working and verified on 2026-08-28: `snapper` installed, `root` config created with `ALLOW_USERS="kartik"`, all three timers active, apt pre/post hook confirmed firing on a real apt operation, and non-root `snapper create`/`list` independently verified. The laptop was on Arch by 2026-09-17 (`docs/archival.md`), and it was reinstalled on 2026-11-09 (`docs/handoff.md`). On the current CachyOS install the root filesystem is ext4 and snapper isn't installed. Checked on 2026-11-14: `findmnt -no FSTYPE,SOURCE /` printed `ext4 /dev/nvme0n1p3`, `pacman -Q snapper` found no package, and `/etc/snapper/configs` doesn't exist. The rest of the page is kept as reference for a Debian host on Btrfs.
 
 ## Why Snapper, not Timeshift
 
@@ -31,11 +31,13 @@ Both are hardcoded to a config literally named **`root`** (`ConditionPathExists=
 bash scripts/setup-snapper.sh
 ```
 
+The script is Debian/apt-only. It exits before changing anything unless `/` is Btrfs and `apt` is on `PATH`, so on the current ext4 CachyOS install it refuses. It also works out the user for the final check up front. That's the caller, or whoever ran `sudo` (`SUDO_USER`) or `pkexec` (`PKEXEC_UID`), and it refuses plain root.
+
 The script (idempotent, safe to re-run):
 
 1. `sudo apt install -y snapper`
 2. `sudo snapper -c root create-config /` — creates `/etc/snapper/configs/root` and a nested `/.snapshots` subvolume that stores the snapshot data.
-3. Sets `ALLOW_USERS="kartik"` and `SYNC_ACL="yes"` in that config, so Kartik can run `snapper create`/`list`/`diff` day-to-day without `sudo` — the privileged Btrfs work is delegated to the root-owned `snapperd` D-Bus service, which checks `ALLOW_USERS` itself.
+3. Sets `ALLOW_USERS` to the invoking user (`"kartik"` on `asus-vivobook`) and `SYNC_ACL="yes"` in that config, so Kartik can run `snapper create`/`list`/`diff` day-to-day without `sudo` — the privileged Btrfs work is delegated to the root-owned `snapperd` D-Bus service, which checks `ALLOW_USERS` itself.
 4. Enables and starts `snapper-timeline.timer`, `snapper-cleanup.timer`, `snapper-boot.timer`.
 5. Restarts `snapperd.service` — the package's postinst enables/starts it *before* step 2 creates the config, so it comes up with nothing loaded and every non-root `snapper` call fails with `"No permissions."` until it's restarted, even though the config on disk is already correct. Hit this for real on the first run; the script now handles it.
 6. Prints the resulting config, timer state, and creates one test snapshot **as the real invoking user** (via `sudo -u`, not just `snapper create` bare) to confirm the non-root permission actually took effect — a check run as root would trivially pass regardless, since root always bypasses `ALLOW_USERS`.

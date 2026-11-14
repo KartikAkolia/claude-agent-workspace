@@ -20,8 +20,10 @@ on:
       - ".githooks/pre-commit"
       - ".claude/skills/quickshell/scripts/quickshell-qmllint"
       - "scripts/xppen-tablet/xppentablet"
+      - "scripts/xppen-tablet/xppen-tablet.install"
       - "scripts/test_install_fedora.py"
       - "scripts/minecraft-fabric/**"
+      - "scripts/test_tui_lib.py"
       - "scripts/test_device_power_saving.py"
       - "scripts/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
@@ -33,8 +35,10 @@ on:
       - ".githooks/pre-commit"
       - ".claude/skills/quickshell/scripts/quickshell-qmllint"
       - "scripts/xppen-tablet/xppentablet"
+      - "scripts/xppen-tablet/xppen-tablet.install"
       - "scripts/test_install_fedora.py"
       - "scripts/minecraft-fabric/**"
+      - "scripts/test_tui_lib.py"
       - "scripts/test_device_power_saving.py"
       - "scripts/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
@@ -137,6 +141,11 @@ jobs:
         # also want a real systemd (ubuntu-latest runs one) and skip
         # themselves without it.
         run: cd scripts/minecraft-fabric && python3 -m unittest test_install -v
+
+      - name: TUI shared-library wiring tests
+        # Needs only bash, dirname, readlink and python3: each TUI stops at
+        # require_tools before any whiptail, xrandr, pactl or v4l2-ctl call.
+        run: python3 scripts/test_tui_lib.py -v
 
       - name: Device power-saving policy tests
         # Stubs nmcli, modprobe, mkinitcpio, grub-mkconfig, udevadm, iw,

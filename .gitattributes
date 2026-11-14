@@ -19,6 +19,7 @@
 .githooks/* text eol=lf
 .claude/skills/quickshell/scripts/quickshell-qmllint text eol=lf
 scripts/xppen-tablet/xppentablet text eol=lf
+scripts/xppen-tablet/xppen-tablet.install text eol=lf
 *.py text eol=lf
 
 # .lint-versions is rewritten by lint-versions.sh with LF endings; pinning it

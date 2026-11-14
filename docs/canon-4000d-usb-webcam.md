@@ -1,23 +1,28 @@
 # Canon EOS 4000D as a USB Webcam on Linux
 
-Status: **Working and verified on `asus-vivobook` 2026-08-28.** `gphoto2 → ffmpeg → /dev/video9` bridge streaming 1056×704 @ 25 fps. Wrapper script `scripts/start-canon-webcam.sh` (installed to `~/.local/bin/`) with `-q` quality-settings and `-r` lossless-record modes. Boot-time loopback persistence not yet enabled (optional, see end).
+Status: **Working and verified on `asus-vivobook` 2026-08-28, on its earlier Debian install.** `gphoto2 → ffmpeg → /dev/video9` bridge streaming 1056×704 @ 25 fps. Wrapper script `scripts/start-canon-webcam.sh` with `-q` quality-settings and `-r` lossless-record modes. **Not set up on the current install** (Arch Linux on the CachyOS kernel since the 2026-11-09 reinstall): as of 2026-11-14 `gphoto2` isn't installed and the script isn't in `~/.local/bin/`, so none of this has been tested there. Boot-time loopback persistence not yet enabled (optional, see end).
 
-Kartik wanted the easiest way to get video off a **Canon EOS 4000D** (EF-S 18‑55 mm III kit lens) over **USB** on his Debian laptop, for **video calls** and occasionally **archiving clips**. Three options were weighed (see *Options considered*); the zero‑cost, zero‑hardware one — the standard `gphoto2` + `v4l2loopback` recipe — was chosen and set up.
+Kartik wanted the easiest way to get video off a **Canon EOS 4000D** (EF-S 18‑55 mm III kit lens) over **USB** on his laptop (then running Debian), for **video calls** and occasionally **archiving clips**. Three options were weighed (see *Options considered*); the zero‑cost, zero‑hardware one — the standard `gphoto2` + `v4l2loopback` recipe — was chosen and set up.
 
 ## Machine facts
 
 | Fact | Value |
 |---|---|
-| Host | `asus-vivobook`, Debian forky/sid, kernel `7.1.8+deb14.1-amd64` |
+| Host | `asus-vivobook` (ASUS Vivobook M6500XV, hostname `archlinux`). Since the 2026-11-09 reinstall: Arch Linux per `/etc/os-release`, kernel `7.3.4-1-cachyos` (checked 2026-11-14). The 2026-08-28 setup and test ran on its earlier Debian forky/sid install, kernel `7.1.8+deb14.1-amd64` |
 | Camera | Canon EOS 4000D (Rebel T100), mini‑HDMI + USB 2.0 Mini‑B, LP‑E10 battery |
-| gphoto2 support | 4000D in libgphoto2 since **2.5.20**; EOS live‑view fixes through 2.5.25+. Debian forky is far newer — support solid |
-| USB live‑view stream | MJPEG, **1056×704, 25 fps**, ~0.2–0.5 s latency (this is *not* the 1080p movie signal — USB 2.0 live view is always lower res) |
-| Loopback module | `v4l2loopback` 0.15.4 via `v4l2loopback-dkms`, built & signed for the running kernel |
+| gphoto2 support | 4000D in libgphoto2 since **2.5.20**; EOS live‑view fixes through 2.5.25+. Debian forky's was far newer. Not installed on the current install; Arch's `extra` repo has `gphoto2` 2.5.32 and `libgphoto2` 2.5.34 |
+| USB live‑view stream | MJPEG, **1056×704, 25 fps**, ~0.2–0.5 s latency, measured 2026-08-28 (this is *not* the 1080p movie signal — USB 2.0 live view is always lower res) |
+| Decoded pixel format | A full‑range `yuvj*` format, but which one is unconfirmed: this runbook recorded `yuvj422p` on 2026-08-28, the script's 2026-08-30 comment says `yuvj420p`. Needs the camera to settle (command below) |
+| Loopback module | `v4l2loopback` 0.15.4, now shipped prebuilt in the `linux-cachyos` kernel package, so no DKMS. The installed `linux-lts` 6.18 kernel has no v4l2loopback module. On Debian it was `v4l2loopback-dkms` 0.15.4, built & signed for the running kernel |
 | Loopback device | `/dev/video9`, `card_label="Canon 4000D"` (laptop's own webcam holds video0/1) |
 | Canon EOS Webcam Utility | Windows/macOS only — **no Linux build**, not an option |
-| No passwordless sudo on this box | the one `sudo modprobe` step prompts for a password |
+| Root for `modprobe` | the script loads the module with `sudo modprobe`, which prompted for a password on Debian (no passwordless sudo). Not re‑checked on the current install |
 
-## One‑time setup (DONE 2026-08-28)
+To settle the pixel format, attach the camera and run `gphoto2 --set-config output=PC --stdout --capture-movie=3s | ffprobe -v error -f mjpeg -show_entries stream=pix_fmt -of csv=p=0 -`. It prints the format ffmpeg decodes the stream to.
+
+## One‑time setup (Debian, DONE 2026-08-28)
+
+This section records the Debian install. On the current Arch install, `ffmpeg` (9.0.2) and `v4l-utils` are installed and the module comes with `linux-cachyos`, so only `gphoto2` is missing (`pacman -S gphoto2`, not yet run).
 
 ```bash
 sudo apt update
@@ -42,12 +47,12 @@ sudo modinfo v4l2loopback | head
 # → filename .../updates/dkms/v4l2loopback.ko.xz, version 0.15.4, depends: videodev
 ```
 
-> `dkms` and `modinfo` live in `/usr/sbin`, which is not on the normal user's `PATH` here.
+> `dkms` and `modinfo` live in `/usr/sbin`, which is not on the normal user's `PATH` on Debian.
 > Use `sudo dkms …` / `sudo modinfo …` or the full `/usr/sbin/…` path.
 
 ## Everyday use — the wrapper script
 
-`scripts/start-canon-webcam.sh` does the whole dance: checks the camera is seen, releases it from the GNOME/GVFS auto‑mount, loads `v4l2loopback` if needed, then runs the `gphoto2 | ffmpeg` bridge with a clean Ctrl‑C teardown.
+`scripts/start-canon-webcam.sh` does the whole dance: checks the camera is seen, releases it from the GNOME/GVFS auto‑mount, loads `v4l2loopback` if needed, then runs the gphoto2 → ffmpeg bridge and stops both on Ctrl‑C.
 
 Install it on the laptop once:
 
@@ -73,7 +78,7 @@ Then, every time:
    The mirror flips up, live view starts, and `ffmpeg` prints a running
    `frame= … fps= …` line.
 3. In any app (browser, Zoom, Discord…) pick the camera **Canon 4000D**.
-4. Stop with **Ctrl‑C**. The mirror drops; `/dev/video9` stays for the next run.
+4. Stop with **Ctrl‑C**, once. The script asks gphoto2 to end live view (one SIGTERM); when the feed ends, ffmpeg finishes writing any `-r` recording by itself, and the script prints `Stopped.` once both have exited. A second Ctrl‑C makes gphoto2 abort and a third kills it; if gphoto2 hangs, the script escalates by itself after 10 s and again after 20 s. ffmpeg is signalled only if it hasn't finished 10 s after gphoto2 has gone. Whether the mirror drops cleanly hasn't been confirmed with the camera on the current install; if live view is still on, switch the camera off and on. `/dev/video9` stays for the next run.
 
 To also save a lossless copy while you're on the call:
 
@@ -92,15 +97,17 @@ ffplay /dev/video9            # or: mpv av://v4l2:/dev/video9
 ```text
 start-canon-webcam.sh [-n VIDEO_NR] [-d /dev/videoN] [-l "Card Label"] [-q] [-r FILE]
   -n   loopback device number (default 9)
-  -d   explicit device path, overrides -n
+  -d   explicit /dev/videoN path, overrides -n; its N is the number loaded (other forms are rejected)
   -l   card_label apps see    (default "Canon 4000D")
   -q   apply quality settings to the camera first (WB, ISO 100, sRGB, Standard style)
-  -r   also record the untouched stream losslessly to FILE (.mkv/.mov/.avi)
+  -r   also record the untouched stream losslessly to FILE (.mkv/.mov/.avi); FILE must not exist yet
 ```
 
-Env overrides: `CANON_VIDEO_NR`, `CANON_DEVICE`, `CANON_LABEL`,
-`CANON_WB` (white balance for `-q`, default `Daylight`),
-`CANON_ISO` (ISO for `-q`, default `100`).
+Environment defaults: `CANON_VIDEO_NR`, `CANON_DEVICE`, `CANON_LABEL`,
+`CANON_WB` (white balance for `-q`, default `Daylight`) and `CANON_ISO` (ISO
+for `-q`, default `100`). A command-line flag always beats its environment
+default; for the device the order is `-d`, then `-n`, then `CANON_DEVICE`,
+then `CANON_VIDEO_NR`, then 9.
 
 ### The raw pipeline (what the script runs)
 
@@ -108,20 +115,23 @@ Env overrides: `CANON_VIDEO_NR`, `CANON_DEVICE`, `CANON_LABEL`,
 gio mount -s gphoto2 2>/dev/null; pkill -x gvfsd-gphoto2
 sudo modprobe v4l2loopback exclusive_caps=1 card_label="Canon 4000D" video_nr=9
 
-# -q only: best-effort, each skipped if the body/mode rejects it
-gphoto2 --set-config whitebalance=Daylight --set-config iso=100 \
-        --set-config colorspace=sRGB --set-config picturestyle=Standard
+# -q only: one call per setting, each skipped if the body/mode rejects it
+for kv in whitebalance=Daylight iso=100 colorspace=sRGB picturestyle=Standard; do
+  gphoto2 --set-config "$kv"
+done
 
 gphoto2 --set-config output=PC --stdout --capture-movie \
-  | ffmpeg -f mjpeg -i - \
-      -map 0:v -vf format=yuv420p -f v4l2 /dev/video9 \
+  | ffmpeg -hide_banner -loglevel warning -stats -f mjpeg -i - \
+      -map 0:v -vf "zscale=in_range=full:range=limited,format=yuv420p" -f v4l2 /dev/video9 \
       -map 0:v -c:v copy /path/to/clip.mkv        # second output only with -r
 ```
 
 - `exclusive_caps=1` — makes Chrome/Firefox/Zoom/Electron apps accept the node as a real capture device.
 - `output=PC` — largest live‑view preview size the 4000D offers (`MOBILE`/`MOBILE2` are smaller).
-- `-vf format=yuv420p` — v4l2 consumers want planar YUV; the camera sends `yuvj422p` MJPEG.
+- `zscale=in_range=full:range=limited,format=yuv420p` — the MJPEG decodes to a full‑range `yuvj*` format (which one is unconfirmed, see *Machine facts*). ffmpeg's v4l2 muxer rejects both `yuvj420p` and `yuvj422p` ("Unknown V4L2 pixel format equivalent"), so the stream is remapped to limited range and converted to `yuv420p`. A plain `format=yuv420p` also works, but swscale then logs "deprecated pixel format used" on every run. zscale doesn't. All three checked with ffmpeg 9.0.2 on 2026-11-14, without the camera.
 - `-c:v copy` — the recording branch stores the camera's exact JPEG frames, no re‑encode.
+
+The script itself joins gphoto2 and ffmpeg through a private FIFO instead of `|`, and starts each under `setsid` and `setpriv --pdeathsig TERM`. The terminal's Ctrl‑C reaches only the script, so it can stop each process with exactly one signal, and both still get one SIGTERM if the script itself is killed outright. gphoto2 also runs with SIGPIPE ignored, so if ffmpeg stops first it ends its capture loop cleanly instead of being killed. The `|` form above is fine for running by hand.
 
 ## Getting the best quality
 
@@ -151,7 +161,7 @@ Run `gphoto2 --list-config` to see the exact option names/values your body expos
 
 ### What does *not* help for calls
 
-Feeding 4:2:2 (`-pix_fmt yuyv422`) instead of `yuv420p` preserves chroma into the loopback, but every call app re-encodes to 4:2:0 VP8/VP9/H.264 anyway, so it's wasted. Browsers also usually cap the negotiated resolution at 720p regardless. The wins that survive a call are the in-camera ones above plus lighting and focus.
+Feeding 4:2:2 (`-pix_fmt yuyv422`) instead of `yuv420p` would preserve chroma into the loopback if the camera sends 4:2:2 (unconfirmed, see *Machine facts*), but every call app re-encodes to 4:2:0 VP8/VP9/H.264 anyway, so it's wasted. Browsers also usually cap the negotiated resolution at 720p regardless. The wins that survive a call are the in-camera ones above plus lighting and focus.
 
 ### Archiving clips
 
@@ -168,9 +178,12 @@ ffmpeg -i clip.mkv -c:v libx264 -crf 12 -preset slow -pix_fmt yuv422p clip-h264.
 | `Could not claim the USB device` / `device busy` | GVFS re‑grabbed the camera. Re‑run `gio mount -s gphoto2; pkill -x gvfsd-gphoto2` (the script does this each start). |
 | `*** Error: Could not capture image ***` / `Out of Focus` | Half‑press the shutter once to focus, or set the lens switch to **MF**. |
 | App doesn't list the camera | Confirm `exclusive_caps=1` was set: `cat /sys/module/v4l2loopback/parameters/exclusive_caps` → `Y`. Reload the module if not. |
-| `modprobe: ... cannot be found` after a kernel update | DKMS didn't rebuild. `sudo apt install --reinstall v4l2loopback-dkms`, or `sudo dkms autoinstall`. Make sure `linux-headers-amd64` is installed so future kernels rebuild automatically. |
+| `modprobe: ... cannot be found` after a kernel update | On the current install the module ships with `linux-cachyos` only, so check `uname -r`: the `linux-lts` kernel has none. On Debian, DKMS didn't rebuild. `sudo apt install --reinstall v4l2loopback-dkms`, or `sudo dkms autoinstall`. Make sure `linux-headers-amd64` is installed so future kernels rebuild automatically. |
 | Feed freezes after ~1 min, camera warm | LP‑E10 running low / sensor heat. Use the **ACK‑E10** dummy‑battery AC kit for long sessions. |
 | Autofocus hunts constantly | Live‑view contrast AF is slow. Set lens to **MF**, focus once. |
+| `v4l2loopback is already loaded but has no /dev/videoN` | Something else (often OBS's virtual camera) loaded the module with other numbers, and modprobe won't add devices to a loaded module. Run `sudo v4l2loopback-ctl add -x 1 -n "Canon 4000D" /dev/video9`, or close the apps using it and `sudo modprobe -r v4l2loopback`, then rerun. |
+| `/dev/videoN is not writable` | Access comes from the uaccess ACL udev and logind give the user on the active local seat (`getfacl /dev/video9`). Run the script from the desktop session, not over SSH or `su`; as a fallback, join the `video` group and log in again. |
+| `record file '…' already exists` | Choose a new `-r` name. ffmpeg won't overwrite it, so the script refuses before starting. |
 
 ## Persist the loopback across reboots (optional — NOT done yet)
 

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# pacman sources this as root, chrooted into the install root, and calls the
+# functions below (see PKGBUILD(5)). On upgrade pacman never changes an
+# existing folder's mode or group, and keeps an edited backup file as it is,
+# so an upgrade from pkgrel 2 would keep the vendor's world-writable 0777
+# folder and 0666 files. Reapply the packaged permissions after every install
+# and upgrade instead; doing it again changes nothing.
+#
+# makepkg copies this file into the package as-is, so the group can't come
+# from the PKGBUILD. Keep it equal to _confgroup there; package() refuses to
+# build when they differ.
+_xppen_confgroup=wheel
+
+_xppen_fix_conf() {
+	local dir=/usr/lib/pentablet/conf/xppen name file status=0
+	if [[ ! -d $dir || -L $dir ]]; then
+		echo "xppen-tablet: $dir is missing or not a folder; permissions not set" >&2
+		return 1
+	fi
+	# Lock the folder first, so nobody outside the group can swap a file
+	# between the checks and the chmod below.
+	chown root:"$_xppen_confgroup" "$dir" && chmod 2775 "$dir" || return 1
+	for name in config.xml dialogpos.ini language.ini name_config.ini; do
+		file=$dir/$name
+		[[ -e $file || -L $file ]] || continue
+		# A link may have been planted while the folder was world-writable;
+		# never follow one as root.
+		if [[ -L $file || ! -f $file ]] || (($(stat -c %h -- "$file") != 1)); then
+			echo "xppen-tablet: skipped $file: not a plain file; check it, then reinstall" >&2
+			status=1
+			continue
+		fi
+		chown root:"$_xppen_confgroup" "$file" && chmod 0664 "$file" || status=1
+	done
+	return "$status"
+}
+
+post_install() {
+	_xppen_fix_conf
+}
+
+post_upgrade() {
+	_xppen_fix_conf
+}

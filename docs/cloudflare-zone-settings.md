@@ -96,6 +96,17 @@ from `10.0.2.2` (the host as seen from rootless Docker), and
 tunnel, so the `webroot` certificate renewals don't need port 80
 forwarded. The router's TCP 80/443 forwards to the Pi were then removed.
 
+Later the same day, both certificates moved to the DNS-01 challenge
+(`npm-20` for `vault` and `npm-21` for `trilium`), so renewals no longer
+send any HTTP request to the Pi. The reason was Bot Fight Mode: WAF skip
+rules can't exempt traffic from it, so it could challenge Let's Encrypt's
+HTTP-01 requests. NPM uses a Cloudflare API token from the Edit zone DNS
+template, limited to this zone. That permission can change every DNS
+record in the zone, so treat the token like a password: rotate it in the
+dashboard if the Pi or an NPM backup leaks. NPM writes it to a credentials
+file only while certbot runs, so test renewals with NPM's **Renew Now**,
+not `certbot renew --dry-run`.
+
 ### How a request reaches the Pi
 
 ```text

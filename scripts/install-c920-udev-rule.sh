@@ -82,7 +82,8 @@ sudo udevadm control --reload
 # systemd only acts on SYSTEMD_WANTS when a device first appears, so a
 # re-triggered "add" won't reach an already-plugged C920 — start its unit
 # directly instead.
-started=0
+found=0
+failed=0
 for sys in /sys/class/video4linux/video*; do
 	[ "$(cat "$sys/index" 2>/dev/null)" = 0 ] || continue
 	props=$(udevadm info -q property -p "$sys" 2>/dev/null) || continue
@@ -90,9 +91,13 @@ for sys in /sys/class/video4linux/video*; do
 		continue
 	fi
 	node="${sys##*/}"
+	found=$((found + 1))
 	printf 'Applying to /dev/%s now...\n' "$node"
-	sudo systemctl start "c920-settings@$node.service" && started=$((started + 1))
+	sudo systemctl start "c920-settings@$node.service" || failed=$((failed + 1))
 done
-[ "$started" -eq 0 ] && echo "No C920 plugged in right now; it will be set up when it appears."
+[ "$found" -gt 0 ] || echo "No C920 plugged in right now; it will be set up when it appears."
+if [ "$failed" -gt 0 ]; then
+	die "rule installed, but applying the settings failed on $failed of $found plugged-in C920(s); see: journalctl -u 'c920-settings@*' -n 20"
+fi
 
 echo "Done. Check with: journalctl -u 'c920-settings@*' -n 20"

@@ -230,7 +230,19 @@ class InstallTests(unittest.TestCase):
 
     def run_policy(self, *args, success=True):
         result = subprocess.run(
-            ["bash", str(self.script), *map(str, args)],
+            [
+                # Reset the dispositions a nohup or background runner leaves
+                # ignored (bash can't trap a signal ignored on entry), and
+                # export the script's own PID for stubs that signal it.
+                "env",
+                "--default-signal=HUP,INT,TERM",
+                "bash",
+                "-c",
+                'export POLICY_PID=$$; exec bash "$@"',
+                "bash",
+                str(self.script),
+                *map(str, args),
+            ],
             env=self.env,
             text=True,
             capture_output=True,
@@ -257,6 +269,13 @@ class InstallTests(unittest.TestCase):
 
     def latest(self):
         return (self.state / "current").resolve()
+
+    def runs(self):
+        return set(self.state.glob("run.*"))
+
+    def new_run(self, earlier):
+        (run,) = self.runs() - earlier
+        return run
 
     def test_install_and_complete_undo(self):
         before = self.originals(include_boot=False)
@@ -497,6 +516,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(len(list(self.state.glob("run.*"))), 2)
 
     def test_failed_undo_keeps_source_backup(self):
+        before = self.originals(include_boot=False)
         self.run_policy()
         source = self.latest()
         profiles = json.loads((self.root / "wifi.json").read_text())
@@ -505,13 +525,56 @@ class InstallTests(unittest.TestCase):
         result = self.run_policy("--undo", source, success=False)
         self.assertIn("nmcli failed", result.stderr)
         self.assertTrue((source / "complete").exists())
-        self.assertTrue((source / "boot").is_dir())
+        self.assertFalse((source / "undone").exists())
+        # The completed source dropped its /boot copy; undo never reads it.
+        self.assertFalse((source / "boot").exists())
         self.assertEqual(self.latest(), source)
         aborted = [r for r in self.state.glob("run.*") if r != source]
         self.assertEqual(len(aborted), 1)
         self.assertTrue((aborted[0] / "aborted").exists())
         self.assertFalse((aborted[0] / "boot").exists())
         self.assertFalse((aborted[0] / "pending").exists())
+        # The kept source backup still undoes once the cause is fixed.
+        del profiles["333-ccc"]
+        (self.root / "wifi.json").write_text(json.dumps(profiles))
+        self.run_policy("--undo", source)
+        self.assertEqual(self.originals(include_boot=False), before)
+
+    def test_only_unfinished_runs_keep_boot_snapshot(self):
+        # A completed install drops its /boot copy.
+        self.run_policy()
+        installed = self.latest()
+        self.assertTrue((installed / "complete").exists())
+        self.assertTrue((installed / "before/3").is_file())
+        self.assertFalse((installed / "boot").exists())
+        # An install that fails and rolls back keeps it.
+        earlier = self.runs()
+        (self.root / "fail").write_text("grub-mkconfig")
+        self.run_policy(success=False)
+        failed = self.new_run(earlier)
+        self.assertFalse((failed / "pending").exists())
+        self.assertFalse((failed / "complete").exists())
+        self.assertTrue((failed / "boot/grub/grub.cfg").is_file())
+        # So does a failed undo; a successful one drops its own copy.
+        earlier = self.runs()
+        (self.root / "fail").write_text("mkinitcpio")
+        self.run_policy("--undo", installed, success=False)
+        self.assertTrue((self.new_run(earlier) / "boot/grub/grub.cfg").is_file())
+        earlier = self.runs()
+        self.run_policy("--undo", installed)
+        self.assertTrue((installed / "undone").exists())
+        self.assertFalse((self.new_run(earlier) / "boot").exists())
+
+    def test_rewritten_files_get_fresh_mtime(self):
+        old = 946684800  # 2000-01-01, before any run
+        for path in (self.grub, self.modprobe):
+            os.utime(path, (old, old))
+        self.run_policy()
+        for path in (self.grub, self.modprobe, *self.late):
+            with self.subTest(path=path):
+                self.assertGreater(path.stat().st_mtime, old + 86400)
+        self.assertEqual(self.grub.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.modprobe.stat().st_mode & 0o777, 0o600)
 
     def test_undo_refuses_changed_profile(self):
         self.run_policy()
@@ -525,7 +588,7 @@ class InstallTests(unittest.TestCase):
         self.tool(
             "cp",
             f"""#!/usr/bin/env bash
-if [[ $1 == --preserve=all && $2 == -- && $3 == */before/1 ]]; then
+if [[ $1 == --preserve=all && $2 == --no-preserve=timestamps && $3 == -- && $4 == */before/1 ]]; then
     exit 44
 fi
 exec {real_cp} "$@"
@@ -538,6 +601,8 @@ exec {real_cp} "$@"
         backups = list(self.state.glob("run.*"))
         self.assertEqual(len(backups), 1)
         self.assertTrue((backups[0] / "pending").exists())
+        # A run still pending recovery keeps the /boot copy --recover restores.
+        self.assertTrue((backups[0] / "boot/grub/grub.cfg").is_file())
         self.assertIn("unfinished recovery", self.run_policy(success=False).stderr)
         (self.bin / "cp").unlink()
         self.run_policy("--recover", backups[0])
@@ -579,8 +644,8 @@ exec {real_cp} "$@"
         self.tool(
             "cp",
             f"""#!/usr/bin/env bash
-if [[ $1 == --preserve=all && $2 == -- && $3 == */after/1 ]]; then
-    echo partial >"$4"
+if [[ $1 == --preserve=all && $2 == --no-preserve=timestamps && $3 == -- && $4 == */after/1 ]]; then
+    echo partial >"$5"
     exit 42
 fi
 exec {real_cp} "$@"
@@ -591,21 +656,31 @@ exec {real_cp} "$@"
         self.assertEqual(self.originals(), before)
 
     def test_signal_during_write_rolls_back(self):
+        # The stub signals the main script, not its parent place() subshell,
+        # and the write itself succeeds, so only a signal can cause the
+        # rollback. Exit status 1 is finish's own: without the main INT/TERM/HUP
+        # traps, bash would run finish and then die by the signal instead.
         real_mv = shutil.which("mv")
-        self.tool(
-            "mv",
-            f"""#!/usr/bin/env bash
+        before = self.originals()
+        for sig in ("INT", "TERM", "HUP"):
+            with self.subTest(signal=sig):
+                (self.root / "signaled").unlink(missing_ok=True)
+                self.tool(
+                    "mv",
+                    f"""#!/usr/bin/env bash
 if [[ ${{!#}} == */etc/modprobe.d/no-power-saving.conf && ! -e "$HOST/signaled" ]]; then
     touch "$HOST/signaled"
-    kill -TERM "$PPID"
-    exit 143
+    kill -{sig} "$POLICY_PID"
 fi
 exec {real_mv} "$@"
 """,
-        )
-        before = self.originals()
-        self.run_policy(success=False)
-        self.assertEqual(self.originals(), before)
+                )
+                result = self.run_policy(success=False)
+                self.assertTrue((self.root / "signaled").exists())
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Installation failed; restoring", result.stderr)
+                self.assertIn("restored", result.stderr)
+                self.assertEqual(self.originals(), before)
 
 
 if __name__ == "__main__":
