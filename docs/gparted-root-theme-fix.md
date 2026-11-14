@@ -5,11 +5,11 @@ A script audit on **2026-11-14** (finding SYS-1) found those symlinks let any co
 `kartik` choose a GTK module for root to load. `scripts/sync-root-gtk-theme.sh` was redesigned the
 same day and then simplified: it writes **root-owned, filtered copies of the appearance settings**
 (reading them with `kartik`'s own privileges) and **copies nothing else** — themes, icon themes and
-cursor themes are not copied, only noted for system-wide install (see "Current fix" below). The new version has only been tested against scratch directories. **What's in
-`/root` on the current install is not verified**: reading it needs root, and the laptop was
-reinstalled on 2026-11-09 (see `docs/handoff.md`), so `/root` may hold the old symlinks, nothing,
-or something else. Kartik needs to run the new `--apply` once, as root (see "Re-applying after the
-2026-11-14 change").
+cursor themes are not copied, only noted for system-wide install (see "Current fix" below). It was run once as root on `asus-vivobook` on 2026-11-14 (see "Re-applying after the
+2026-11-14 change"): `--check` first found all three settings files missing from `/root` and no
+legacy theme links, `--apply` wrote the filtered copies (leaving out `gtk-modules`, the cursor-blink
+and sound-theme keys), and a second `--check` reported all three `ok`. GParted's look hasn't been
+checked yet, and `dell-optiplex` still needs its own run.
 
 ## Symptom
 
@@ -230,7 +230,7 @@ hands only the disk work to a root helper.
   escaping link, clean tree). The Brother script exits `0`/`1`/`2` (verified/failed/
   unverified). `scripts/lib/tui.sh` is sourced only by `--pick` (guarded by
   `scripts/test_tui_lib.py`), and the root-path `WARNING` fires only for a non-root-writable script.
-- **Not verified:** the contents of the real `/root`, and GParted's look after the new `--apply`.
+- **Not verified:** GParted's look after the new `--apply`, and `dell-optiplex`'s `/root`. On `asus-vivobook`, `/root` was checked and applied as root on 2026-11-14 (see the status at the top).
 
 ## Re-applying after the 2026-11-14 change
 
