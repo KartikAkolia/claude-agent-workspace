@@ -4,9 +4,13 @@
 # dwm-titus's own install.sh hard-rejects any non-Fedora distro, so this script
 # does NOT reproduce that installer. It only installs the apt equivalents of
 # every package dwm-titus-main/scripts/dwm-packages.sh lists for Fedora, grouped
-# into the same profiles. After running this, build dwm yourself from the
-# dwm-titus source tree (make, make install-system, make install-user) and copy
-# over the config files the upstream installer would otherwise place.
+# into the same profiles. After running this, build and install dwm from the
+# dwm-titus source tree with a single `sudo make install` run from your own
+# account (the port ran `make` first; see docs/dwm-titus-debian-port.md). It
+# takes the target user from SUDO_USER (falling back to USER), builds as that
+# user, installs system files as root and user files as that user, and refuses
+# to install when the target user is root, e.g. from a plain root shell. The
+# non-package steps below stay manual.
 #
 # Verified against packages.debian.org, suite=unstable (sid), 2026-08-24.
 #
@@ -16,8 +20,11 @@
 #   - Nordic GTK theme git clone https://github.com/EliverLara/Nordic
 #   - Nord wallpapers  git clone https://github.com/ChrisTitusTech/nord-background
 #
-# Known gap: deepin-gtk-theme (Fedora) has no Debian package. No substitute
-# installed below; pick a different GTK theme or build it from source.
+# Known gaps (Fedora theme-gtk packages with no Debian package; no substitute
+# installed below):
+#   - adw-gtk3-theme   in no Debian suite; upstream ships it only as a Flatpak
+#                      (org.gtk.Gtk3theme.adw-gtk3) or a manual GitHub release
+#   - deepin-gtk-theme not in sid; pick another GTK theme or build from source
 
 set -euo pipefail
 
@@ -49,9 +56,8 @@ sudo apt install -y thunar gvfs gvfs-backends tumbler thunar-archive-plugin \
 # theme
 sudo apt install -y dconf-cli
 
-# theme-gtk (deepin-gtk-theme skipped — no Debian package exists)
-sudo apt install -y arc-theme adw-gtk3 numix-gtk-theme yaru-theme-gtk \
-	bluebird-gtk-theme
+# theme-gtk (adw-gtk3 and deepin-gtk-theme skipped — no Debian package exists)
+sudo apt install -y arc-theme numix-gtk-theme yaru-theme-gtk bluebird-gtk-theme
 
 # theme-optional
 sudo apt install -y qt6ct qt5ct
@@ -71,9 +77,15 @@ sudo apt install -y alacritty kitty
 # screenshot-optional
 sudo apt install -y maim
 
-# gaming (x86_64 only — needs 32-bit multiarch for gamemode/mangohud)
-# Uncomment if you want the gaming profile:
+# gaming (x86_64 only — needs 32-bit multiarch for the i386 packages)
+# For the gaming profile, uncomment every command below, including the separate
+# mangohud line. Use the gamemode i386 runtime libraries, not gamemode:i386,
+# which conflicts with native gamemode over daemon ownership:
 # sudo dpkg --add-architecture i386
 # sudo apt update
-# sudo apt install -y steam-installer gamescope gamemode gamemode:i386 \
-#   mangohud mangohud:i386
+# sudo apt install -y steam-installer gamescope gamemode \
+#   libgamemode0:i386 libgamemodeauto0:i386
+# mangohud + mangohud:i386 are separate because they were blocked when this was
+# ported (dependency libspdlog1.15-fmt10 had no installable candidate in sid);
+# a failure here would otherwise stop the line above:
+# sudo apt install -y mangohud mangohud:i386

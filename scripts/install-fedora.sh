@@ -35,6 +35,9 @@ readonly STARSHIP_SHA256="52c64f14a558034ebeb1907ea9364e802b32474576fd3e68265f73
 readonly USER_PATH="/usr/local/bin:/usr/bin:/bin"
 readonly BASHRC_BEGIN="# >>> install-fedora.sh >>>"
 readonly BASHRC_END="# <<< install-fedora.sh <<<"
+readonly LOCK_FILE="/run/install-fedora.lock"
+# Exit status of update_dnf_conf's editor when the file already matches.
+readonly EDITOR_UNCHANGED=3
 
 # Defaults (the user chose SELinux off, firewalld off and the CachyOS kernel
 # as defaults; Cockpit removal is opt-in).
@@ -83,7 +86,10 @@ Options:
                          or none. cachyos/rt need an x86-64-v3 CPU; on older
                          CPUs with x86-64-v2 the script falls back to lts.
                          Older CPUs keep the stock kernel.
-  --keep-selinux         Leave SELinux as it is (default: disable it).
+  --keep-selinux         Leave SELinux as it is (default: disable it). If
+                         SELinux is enabled, the CachyOS kernel step still
+                         turns on the persistent boolean
+                         domain_kernel_load_modules.
   --keep-firewall        Leave firewalld as it is (default: stop and mask it).
   --remove-cockpit       Stop Cockpit and remove all cockpit* packages.
   --java VERSION         OpenJDK version to install: 21, 25 (default), or none.
@@ -116,11 +122,12 @@ run() {
 	"$@"
 }
 
-# Runs a command as the target user with that user's HOME.
+# Runs a command as the target user with that user's HOME. Fd 9, the run lock,
+# is closed so nothing a user command or installer leaves running holds it.
 as_user() {
 	run runuser -u "$TARGET_USER" -- setpriv --no-new-privs env -i \
 		HOME="$TARGET_HOME" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
-		PATH="$TARGET_HOME/.local/bin:$USER_PATH" "$@"
+		PATH="$TARGET_HOME/.local/bin:$USER_PATH" "$@" 9>&-
 }
 user_have() {
 	((DRY_RUN)) && return 1
@@ -273,6 +280,8 @@ detect_system() {
 	fi
 
 	TARGET_USER="${TARGET_USER:-${SUDO_USER:-}}"
+	# Only the CLI tools step needs a user; don't reject e.g. SUDO_USER=root without it.
+	((DO_CLI_TOOLS)) || TARGET_USER=""
 	detect_target_user
 
 	log "System: $PRETTY_NAME | family=$OS_FAMILY | dnf5=$IS_DNF5 | virt=$VIRT | user=${TARGET_USER:-<none>}"
@@ -308,7 +317,8 @@ check_kernel_repository() {
 	select_kernel_variant
 	[[ "$KERNEL_VARIANT" != none ]] || return 0
 	require_commands grubby kernel-install
-	((DISABLE_SELINUX)) || require_commands selinuxenabled setsebool
+	((DISABLE_SELINUX)) || require_commands selinuxenabled
+	! selinux_kept_and_enabled || require_commands getsebool setsebool
 	local pkg=kernel-cachyos chroot="fedora-$OS_VERSION"
 	[[ "$KERNEL_VARIANT" == cachyos ]] || pkg="kernel-cachyos-$KERNEL_VARIANT"
 	pkg_installed "$pkg" && pkg_installed "$pkg-devel-matched" && return 0
@@ -359,11 +369,18 @@ step_dnf_conf() {
 		printf '[dry-run] atomically tune only [main] in /etc/dnf/dnf.conf\n'
 		return 0
 	fi
-	update_dnf_conf /etc/dnf/dnf.conf
-	note "dnf.conf tuned (existing original backed up once)"
+	local status=0
+	update_dnf_conf /etc/dnf/dnf.conf || status=$?
+	case "$status" in
+	0) note "dnf.conf tuned (existing original backed up once)" ;;
+	"$EDITOR_UNCHANGED") log "dnf.conf already tuned" ;;
+	*) return "$status" ;;
+	esac
 }
 update_dnf_conf() {
-	python3 - "$1" <<'PYTHON'
+	# -I: ignore PYTHON* variables, user site-packages and the cwd, so a module
+	# planted in the directory sudo was run from is never imported as root.
+	python3 -I - "$1" <<'PYTHON'
 import os, pathlib, re, shutil, signal, sys, tempfile
 def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
@@ -390,7 +407,7 @@ for line in lines:
     out.append(line)
 new = (("" if seen else "[main]\n" + keys) + "".join(out)).encode()
 if new == old:
-    sys.exit(0)
+    sys.exit(3)  # EDITOR_UNCHANGED in the shell
 fd, tmp = tempfile.mkstemp(prefix=".install-fedora-", dir=p.parent)
 try:
     with os.fdopen(fd, "wb") as f:
@@ -398,7 +415,10 @@ try:
         f.flush()
         os.fsync(f.fileno())
     if p.exists():
+        # Mode, flags and xattrs (SELinux label) from the old file, but a
+        # fresh mtime: copystat would otherwise backdate the edit.
         shutil.copystat(p, tmp)
+        os.utime(tmp)
         os.chown(tmp, p.stat().st_uid, p.stat().st_gid)
     if not p.exists():
         os.chmod(tmp, 0o644)
@@ -560,6 +580,7 @@ select_kernel_variant() {
 	cachyos | rt)
 		cpu_supports_level 3 && return 0
 		warn "CPU lacks x86-64-v3; using LTS (x86-64-v2)"
+		note "CachyOS $KERNEL_VARIANT needs an x86-64-v3 CPU; using the LTS kernel instead"
 		KERNEL_VARIANT=lts
 		;;
 	esac
@@ -587,10 +608,33 @@ step_kernel() {
 	ensure_kernel_boot_files "$pkg"
 	if ((fresh)); then
 		set_kernel_default "$pkg"
+	else
+		report_kernel_not_default "$pkg"
 	fi
-	if ((DISABLE_SELINUX == 0)) && have selinuxenabled && selinuxenabled; then
-		run setsebool -P domain_kernel_load_modules on
-	fi
+	allow_kernel_module_loading
+}
+# Reruns keep the boot default so a deliberate rollback sticks, but the stock
+# kernel can also still be the default after an interrupted first run. Report
+# it instead of guessing which one this is.
+report_kernel_not_default() {
+	local pkg="$1" image
+	((DRY_RUN == 0)) || return 0
+	image="$(kernel_boot_image "$pkg")" || return 0
+	[[ "$(grubby --default-kernel 2>/dev/null)" != "$image" ]] || return 0
+	note "Newest $pkg is installed but not the boot default; to use it: grubby --set-default $image, then reboot"
+}
+selinux_kept_and_enabled() {
+	((DISABLE_SELINUX == 0)) || return 1
+	have selinuxenabled && selinuxenabled
+}
+# --keep-selinux on an SELinux host: this persistent policy change goes in the
+# summary rather than happening silently, and only when the boolean is off.
+allow_kernel_module_loading() {
+	selinux_kept_and_enabled || return 0
+	[[ "$(getsebool domain_kernel_load_modules 2>/dev/null)" != *"--> on" ]] || return 0
+	run setsebool -P domain_kernel_load_modules on ||
+		die "could not set SELinux boolean domain_kernel_load_modules; check that the loaded policy defines it"
+	note "SELinux kept; persistent boolean domain_kernel_load_modules set to on for the CachyOS kernel"
 }
 install_kernel_packages() {
 	local pkg="$1" fresh="$2"
@@ -655,6 +699,7 @@ set_kernel_default() {
 	local pkg="$1" newest
 	if ((DRY_RUN)); then
 		printf '[dry-run] select newest boot entry for %s-core\n' "$pkg"
+		note "Installed $pkg as default; reboot to use it"
 		return 0
 	fi
 	newest="$(kernel_boot_image "$pkg")" || die "cannot locate installed $pkg kernel release"
@@ -847,7 +892,8 @@ write_bashrc_block() {
 		printf '[dry-run] validate markers and atomically update %s as %s\n' "$rc" "$TARGET_USER"
 		return 0
 	fi
-	as_user python3 - "$rc" "$BASHRC_BEGIN" "$BASHRC_END" <<'PYTHON'
+	# -I keeps the caller's cwd off sys.path, as in update_dnf_conf.
+	as_user python3 -I - "$rc" "$BASHRC_BEGIN" "$BASHRC_END" <<'PYTHON'
 import os, pathlib, shutil, signal, sys, tempfile
 def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
@@ -900,7 +946,9 @@ try:
         f.flush()
         os.fsync(f.fileno())
     if p.exists():
+        # Keep the old mode and xattrs but give the edit a fresh mtime.
         shutil.copystat(p, tmp)
+        os.utime(tmp)
     if p.exists() and not os.path.lexists(str(p) + ".bak.install-fedora"):
         shutil.copy2(p, str(p) + ".bak.install-fedora")
     if p.is_symlink() or (p.read_bytes() if p.exists() else b"") != old:
@@ -917,38 +965,64 @@ finally:
 PYTHON
 }
 
+# Steps word their notes as results ("firewalld masked"). A dry run changes
+# nothing, so each note is marked as what a real run would report, and the
+# reboot notice is conditional, rather than rewording every note per mode.
 print_summary() {
+	local line mark="" reboot="Reboot required for the kernel / SELinux changes. After rebooting, verify with:"
 	printf '\n'
 	if ((DRY_RUN)); then
-		log "Summary (dry run: planned changes, nothing was modified)"
+		log "Summary (dry run: nothing was modified; a real run would report the following)"
+		mark="[would] "
+		reboot="A real run would need a reboot for the kernel / SELinux changes, then verify with:"
 	else
 		log "Summary"
 	fi
-	local line
 	for line in "${SUMMARY[@]}"; do
-		printf '  - %s\n' "$line"
+		printf '  - %s%s\n' "$mark" "$line"
 	done
-	((${#SUMMARY[@]})) || printf '  - nothing changed\n'
+	((${#SUMMARY[@]})) || printf '  - %snothing changed\n' "$mark"
 	if ((NEED_REBOOT)); then
 		printf '\n'
-		log "Reboot required for the kernel / SELinux changes. After rebooting, verify with:"
+		log "$reboot"
 		printf '    uname -r                 # CachyOS kernel if one was installed\n'
 		printf '    getenforce               # Disabled, unless --keep-selinux\n'
 		printf '    sudo grubby --default-kernel\n'
 	fi
 }
 
+# Copies all output to the log. tee ignores HUP and TERM so a signal to the whole
+# process group (dropped SSH, timeout) can't kill it and take the summary with
+# it. INT stays as it is: listing it here would reset it and lose Ctrl-C. The
+# log starts after the lock, so tee closes the lock fd: a concurrent run never
+# writes into the active run's log, and tee can't outlive us holding the lock.
+start_log() {
+	exec > >(
+		exec 9>&-
+		trap '' HUP TERM
+		exec tee -a "$1"
+	) 2>&1
+	printf '\n--- %s run %s ---\n' "$SCRIPT_NAME" "$(date -Is)"
+}
+# Fixed fd 9, so as_user can close it for user commands and installers.
+# Runs before preflight, so it checks for flock itself: a missing flock must
+# not read as "another run is active".
+acquire_lock() {
+	require_commands flock
+	exec 9>"$1"
+	flock -n 9 || die "another install-fedora run is active"
+}
+
 main() {
 	parse_args "$@"
 	trap 'on_error $LINENO' ERR
 	detect_system
+	# After detect_system's root check. The lock comes first so a second run
+	# fails before it can append to the active run's log; preflight is still
+	# logged.
+	((DRY_RUN)) || acquire_lock "$LOCK_FILE"
+	((DRY_RUN)) || start_log "$LOG_FILE"
 	preflight
-	if ((! DRY_RUN)); then
-		exec {INSTALL_LOCK}>/run/install-fedora.lock
-		flock -n "$INSTALL_LOCK" || die "another install-fedora run is active"
-		exec > >(tee -a "$LOG_FILE") 2>&1
-		printf '\n--- %s run %s ---\n' "$SCRIPT_NAME" "$(date -Is)"
-	fi
 	SUMMARY_READY=1
 	trap on_exit EXIT
 	trap 'exit 130' INT
