@@ -8,8 +8,7 @@ Google publishes online-assessment prep materials on its own careers site, but n
 unified "how our interview works" document, so treat the stage-by-stage breakdown below
 as informed pattern, not verbatim policy.
 
-## Typical large-tech-company SWE process shape (aggregated, e.g. Google-style, current
-as of the 2026 research date)
+## Typical large-tech-company SWE process shape (aggregated, e.g. Google-style, current as of the 2026 research date)
 
 1. Resume/application screen.
 2. Online assessment(s) — often a coding assessment plus, at some companies, a
@@ -30,9 +29,9 @@ figure to a help-desk or IT-support interview prep plan.
 
 - Problem-solving process, not just the final answer — verbalize the approach, start
   from a working brute-force solution before optimizing, rather than going silent.
-  - Practice this out loud, not just by reading solutions — mock explaining the approach
-    is the actual skill being tested, and it's not exercised by silently solving a
-    problem alone.
+   - Practice this out loud, not just by reading solutions — mock explaining the approach
+     is the actual skill being tested, and it's not exercised by silently solving a
+     problem alone.
 - Role-specific knowledge appropriate to the actual role (e.g., networking depth for a
   network engineer role, SQL/data-modeling depth for a data analyst role) — don't run a
   generic "LeetCode algorithms" prep plan for a role that isn't algorithm-heavy. Match

@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
-# Lints bash scripts with shellcheck, shfmt, and a bash -n syntax check.
-# Takes file paths as arguments, like validate-config.sh, so both the
-# pre-commit hook (staged files) and lint-markdown.sh/CI (all tracked files)
-# can share this one script. Callers are responsible for excluding the
-# read-only ChrisTitusTech reference clones (see AGENTS.md non-negotiable #1)
-# and for only passing files that are actually bash (shebang-matched, since
-# not every bash script here has a .sh extension -- e.g. .githooks/pre-commit).
+# Lints shell scripts -- bash and POSIX sh -- with shellcheck, shfmt, and a
+# syntax check (bash -n, or sh -n for a #!/bin/sh script). shellcheck and
+# shfmt both read the dialect from the shebang. Takes file paths as
+# arguments, like validate-config.sh, so both the pre-commit hook (staged
+# files) and lint-markdown.sh/CI (all tracked files) can share this one
+# script. Callers are responsible for excluding the read-only
+# ChrisTitusTech reference clones (see AGENTS.md non-negotiable #1) and for
+# only passing shell scripts (list-lint-files.sh's "bash" category, found
+# by shebang, since not every script here has a .sh extension -- e.g.
+# .githooks/pre-commit).
 #
 # Both linters' versions are checked against .lint-versions first, so the
 # pre-commit hook and CI run the same versions -- see lint-versions.sh for
 # how a mismatch is handled in each LINT_VERSIONS_MODE.
 set -uo pipefail
 
-# No files: nothing to do -- except in sync mode, where the pre-commit hook
-# runs it for a commit that only changes .lint-versions, to check versions
-# and do the full re-lint if one applies.
-if [ "$#" -eq 0 ] && [ "${LINT_VERSIONS_MODE:-}" != sync ]; then
-	exit 0
-fi
+# No files: nothing to do -- except in sync or index mode, where the
+# pre-commit hook runs it for a commit that only changes .lint-versions, to
+# check versions and do the full re-lint if one applies.
+case "${LINT_VERSIONS_MODE:-}" in
+sync | index) ;;
+*) [ "$#" -gt 0 ] || exit 0 ;;
+esac
 
-# Linted on its own (it's a tracked bash script), so not followed here.
+# Linted on their own (they're tracked bash scripts), so not followed here.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/lint-versions.sh"
+# llf_read_list and llf_file_shell, the same rules CI lists files by.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/list-lint-files.sh" || exit 1
 
 status=0
 files=("$@")
@@ -45,7 +52,7 @@ lv_sync_file || status=1
 
 # Runs one linter (lint_with <tool> <command...>) over the given files --
 # or, if this commit changes the tool's version (sync mode), over every
-# bash script instead, as CI will. Otherwise the commit that bumps it
+# shell script instead, as CI will. Otherwise the commit that bumps it
 # could fail CI on scripts nobody touched.
 lint_with() {
 	local tool="$1"
@@ -55,22 +62,23 @@ lint_with() {
 		# target, and it's what actually runs.
 		local when="this commit changes"
 		[ -n "${LV_TARGET[$tool]:-}" ] && when="once .lint-versions is staged, this commit changes"
-		printf 'lint-bash: %s %s to %s -- running it over every bash script, as CI will\n' \
+		printf 'lint-bash: %s %s to %s -- running it over every shell script, as CI will\n' \
 			"$when" "$tool" "${LV_INST[$tool]}" >&2
 		(
 			cd "$LV_DIR" >/dev/null || exit 1
-			# Not mapfile < <(...): a failing list-lint-files.sh would leave
-			# the list empty, and shfmt -d with no files reads stdin.
-			list=$(./list-lint-files.sh bash) && [ -n "$list" ] || {
-				printf 'lint-bash: could not list the bash scripts to re-lint\n' >&2
+			# llf_read_list fails rather than return an empty list, which
+			# would pass here (and shfmt -d with no files reads stdin).
+			listed=()
+			llf_read_list bash listed || {
+				printf 'lint-bash: could not list the shell scripts to re-lint\n' >&2
 				exit 1
 			}
 			# Tracked but deleted on disk (deletion not staged): skipped, as
 			# the hook's own file lists do.
 			all=()
-			while IFS= read -r f; do
+			for f in "${listed[@]}"; do
 				[ -f "$f" ] && all+=("$f")
-			done <<<"$list"
+			done
 			[ "${#all[@]}" -gt 0 ] || exit 0
 			"$@" "${all[@]}"
 		) || status=1
@@ -97,7 +105,11 @@ for tool in "${linters[@]}"; do
 done
 
 for f in "$@"; do
-	bash -n "$f" || status=1
+	if llf_file_shell "$f" && [ "$LLF_SHELL" = sh ]; then
+		sh -n "$f" || status=1
+	else
+		bash -n "$f" || status=1
+	fi
 done
 
 exit "$status"

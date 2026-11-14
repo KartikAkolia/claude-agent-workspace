@@ -1,0 +1,19 @@
+# ChrisTitusTech's read-only reference clones (AGENTS.md non-negotiable #1),
+# one per line: <dir> <owner/repo> <default branch>, separated by tabs or
+# spaces; # starts a comment. The one list every tool reads:
+#   list-lint-files.sh               skips these dirs (so every lint gate does)
+#   refresh-reference-clone.sh       only ever writes <owner/repo> into <dir>
+#   scripts/sync-docs-to-trilium.py  never publishes them
+# Each refuses to run if this file is missing, malformed or empty. So that
+# a mistaken line can't point the refresh's rsync --delete at docs/ or
+# another project directory, a dir must be named <repo>-<branch> (GitHub's
+# name for a branch download), and its owner must be on the @owners line
+# below -- trusting a new owner is a separate, deliberate edit there. Check
+# it with ./list-lint-files.sh --reference-clones.
+@owners	ChrisTitusTech
+dwm-titus-main	ChrisTitusTech/dwm-titus	main
+linutil-main	ChrisTitusTech/linutil	main
+# Upstream renamed it ChrisTitusTech/titstack; GitHub redirects this name.
+titus-ai-main	ChrisTitusTech/titus-ai	main
+website-master	ChrisTitusTech/website	master
+winutil-main	ChrisTitusTech/winutil	main

@@ -8,6 +8,7 @@ description: Run an incident response workflow - triage, communicate, and write 
 ## Triage
 
 Assess severity first, before diagnosing root cause — severity determines who needs to be pulled in and how urgently, and that call shouldn't wait on a full diagnosis.
+
 - Scope: how many users/systems affected, is it growing?
 - Is there a known safe mitigation (rollback, flag flip, restart) available right now, independent of finding root cause?
 - Assign a severity level per whatever scale this org/team uses; if none exists, state impact and urgency explicitly rather than inventing a label.

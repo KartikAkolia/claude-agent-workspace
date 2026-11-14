@@ -15,6 +15,7 @@ on:
       - "**.yaml"
       - "validate-config.sh"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - ".github/workflows/lint-config.yml"
   pull_request:
     paths:
@@ -23,15 +24,24 @@ on:
       - "**.yaml"
       - "validate-config.sh"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - ".github/workflows/lint-config.yml"
+
+# bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: validate-config.sh
+        # NUL-separated, via a file so a lister failure fails the step (it
+        # also fails on an empty list rather than check nothing).
         run: |
-          mapfile -t files < <(./list-lint-files.sh config)
+          ./list-lint-files.sh -z config >"$RUNNER_TEMP/config-files"
+          mapfile -d '' -t files <"$RUNNER_TEMP/config-files"
           ./validate-config.sh "${files[@]}"

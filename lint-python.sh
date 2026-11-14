@@ -17,19 +17,20 @@
 # each new release, so the two could drift apart.
 set -uo pipefail
 
-# No files: nothing to do -- except in sync mode, where the pre-commit hook
-# runs it for a commit that changes ruff in .lint-versions, to check the
-# staged ruff line even when there's no .py file to lint.
-if [ "$#" -eq 0 ] && [ "${LINT_VERSIONS_MODE:-}" != sync ]; then
-	exit 0
-fi
+# No files: nothing to do -- except in sync or index mode, where the
+# pre-commit hook runs it for a commit that changes ruff in .lint-versions,
+# to check the staged ruff line even when there's no .py file to lint.
+case "${LINT_VERSIONS_MODE:-}" in
+sync | index) ;;
+*) [ "$#" -gt 0 ] || exit 0 ;;
+esac
 
 # Linted on its own (it's a tracked bash script), so not followed here.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/lint-versions.sh"
 
 status=0
-if [ "$LV_MODE" = sync ]; then
+if [ "$LV_MODE" = sync ] || [ "$LV_MODE" = index ]; then
 	# From the pre-commit hook: use the version this commit will contain
 	# (the staged copy), which is what CI reads -- not an unstaged edit.
 	staged_content=$(lv_git_content "")

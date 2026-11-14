@@ -6,8 +6,7 @@ to look), and Jobscan (an established vendor whose product is literally ATS-matc
 treated as a reputable industry source, not treated as neutral/unbiased on "buy our
 scanner," so the mechanics below are kept, the upsell isn't).
 
-## What actually is an ATS, and what it does (source: Jobscan, "How to Write an ATS
-Resume That Gets Past the Bots," and Jobscan's State of the Job Search 2026 report)
+## What actually is an ATS, and what it does (source: Jobscan, "How to Write an ATS Resume That Gets Past the Bots," and Jobscan's State of the Job Search 2026 report)
 
 - Fact: 99.7% of recruiters (per Jobscan's own survey data — self-reported by the vendor,
   flag as vendor-sourced rather than independently audited) use keyword filters in their
@@ -43,9 +42,7 @@ Resume That Gets Past the Bots," and Jobscan's State of the Job Search 2026 repo
   headers/footers, since some parsers skip those regions.
 - Source: <https://www.jobscan.co/blog/ats-resume/>
 
-## Content and human-reader mechanics (source: LinkedIn's own career-advice content,
-"Resume Tips for New Graduates and Experienced Professionals," and LinkedIn's Talent
-Blog guidance on recruiter attention)
+## Content and human-reader mechanics (source: LinkedIn's own career-advice content, "Resume Tips for New Graduates and Experienced Professionals," and LinkedIn's Talent Blog guidance on recruiter attention)
 
 - Fact (LinkedIn's own framing): recruiters reportedly give a resume roughly 7.4 seconds
   of initial attention — treat this as directional, not a precise measured constant, but

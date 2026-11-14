@@ -11,12 +11,18 @@
 #   For shellcheck and shfmt: follow the newest installed on Kartik's machines.
 #     lint-bash.sh calls lv_check for each, then lv_sync_file once, which
 #     handle a mismatch per LINT_VERSIONS_MODE:
-#       sync   (.githooks/pre-commit): see "Sync mode" below.
+#       sync   (.githooks/pre-commit's sync step, `./lint-versions.sh sync`,
+#              run against the working tree): see "Sync mode" below.
+#       index  (lint-bash.sh as the hook runs it, over its export of the
+#              index, after the sync step): this commit's staged version is
+#              the one; decides the full re-lint, writes nothing.
 #       strict (lint-bash.yml): installed must equal the file exactly, since
 #              the workflow installed what the file says.
 #       unset  (lint-markdown.sh's sweep, one-off runs): warn, write nothing.
 #   ruff: set by hand. uvx runs exactly this version locally and in CI, so
 #     there's no installed copy to follow.
+#   mdl: set by hand too, never bumped; lint-markdown.yml gem-installs
+#     exactly this version.
 #
 # Sync mode answers one question per tool: did you set this line on
 # purpose? Then the hook leaves it alone. You did if:
@@ -38,8 +44,12 @@
 # that's the installed version; if not, the hook says CI's verdict may
 # differ from its own.
 #
-# Sourced by lint-bash.sh and lint-python.sh. The workflows run it directly:
+# Sourced by lint-bash.sh and lint-python.sh. The workflows and the hook run
+# it directly:
 #   ./lint-versions.sh get <tool>      print <tool>'s version, or fail
+#   LINT_VERSIONS_MODE=sync ./lint-versions.sh sync
+#                                      the hook's sync step: lv_check both
+#                                      shell linters, then lv_sync_file
 #   ./lint-versions.sh changed <tool>  exit 0 if the staged version differs
 #                                      from HEAD's, 1 if not, 2 on a git or
 #                                      usage error. .githooks/pre-commit uses
@@ -55,7 +65,10 @@
 # CI's own full lint with that version is the backstop there.
 
 # >/dev/null: an interactive shell can wrap cd in a function that prints.
-LV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+# LINT_VERSIONS_DIR: the checkout whose .lint-versions to read (and, in
+# sync mode, write) when that isn't this script's own -- the hook runs the
+# index's copy of this script, from its export, against the working tree.
+LV_DIR="${LINT_VERSIONS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)}"
 readonly LV_DIR
 readonly LV_NAME=.lint-versions
 readonly LV_FILE="$LV_DIR/$LV_NAME"
@@ -234,6 +247,10 @@ lv_check() {
 		LV_INST[$tool]=$installed
 	fi
 
+	if [ "$LV_MODE" = index ]; then
+		lv_index_check "$tool"
+		return
+	fi
 	if [ "$LV_MODE" != sync ]; then
 		pinned=$(lv_get "$tool")
 		if [ "$LV_MODE" = strict ]; then
@@ -374,6 +391,36 @@ lv_check() {
 			printf 'lint-versions: warning: this commit sets %s=%s but %s is installed, so the hook can'\''t lint with it -- CI will, and may disagree with this run.\n' \
 				"$tool" "$final" "$installed" >&2
 		fi
+	fi
+	return 0
+}
+
+# Index mode, for tool $1 (lv_check has read the installed version): the
+# version this commit gives CI is the staged one. Sets LV_CHANGED (re-lint
+# everything with it, when it's a change from HEAD and installed) and
+# LV_FINAL/LV_HELD (lint-bash.sh's newer-tool warning) as sync mode would
+# for that version, without writing anything or repeating the notes the
+# sync step has already printed.
+lv_index_check() {
+	local tool="$1" staged_content head_content rc final head installed="${LV_INST[$1]:-}"
+	staged_content=$(lv_git_content "")
+	rc=$?
+	case "$rc" in 0) ;; 3) staged_content="" ;; *) return 1 ;; esac
+	head_content=$(lv_git_content HEAD)
+	rc=$?
+	case "$rc" in 0) ;; 3) head_content="" ;; *) return 1 ;; esac
+	final=$(lv_parse "$tool" <<<"$staged_content")
+	head=$(lv_parse "$tool" <<<"$head_content")
+	# No valid line: the sync step has said so.
+	[ -n "$final" ] || return 1
+	# shellcheck disable=SC2034
+	lv_held "$tool" <<<"$staged_content" && LV_HELD[$tool]=1
+	[ -n "$installed" ] || return 0
+	if [ "$final" = "$head" ]; then
+		# shellcheck disable=SC2034
+		LV_FINAL[$tool]=$final
+	elif [ "$installed" = "$final" ]; then
+		LV_CHANGED[$tool]=1
 	fi
 	return 0
 }
@@ -532,9 +579,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 		# An unknown tool would parse as empty on both sides and read as
 		# "unchanged" -- an error, so it must exit 2, not 1.
 		case "${2:-}" in
-		shellcheck | shfmt | ruff) ;;
+		shellcheck | shfmt | ruff | mdl) ;;
 		*)
-			printf 'usage: %s changed <shellcheck|shfmt|ruff>\n' "${0##*/}" >&2
+			printf 'usage: %s changed <shellcheck|shfmt|ruff|mdl>\n' "${0##*/}" >&2
 			exit 2
 			;;
 		esac
@@ -542,8 +589,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 		head=$(lv_get_git "$2" HEAD) || exit 2
 		[ "$staged" != "$head" ]
 		;;
+	sync)
+		if [ "$LV_MODE" != sync ]; then
+			printf 'usage: LINT_VERSIONS_MODE=sync %s sync\n' "${0##*/}" >&2
+			exit 2
+		fi
+		status=0
+		for tool in shellcheck shfmt; do
+			lv_check "$tool" || status=1
+		done
+		lv_sync_file || status=1
+		exit "$status"
+		;;
 	*)
-		printf 'usage: %s get <tool> | changed <tool>\n' "${0##*/}" >&2
+		printf 'usage: %s get <tool> | changed <tool> | sync\n' "${0##*/}" >&2
 		exit 2
 		;;
 	esac

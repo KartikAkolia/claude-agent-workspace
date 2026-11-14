@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lints this repo's own markdown with mdl and checks local cross-references
 # for rot; validates tracked JSON/YAML config parses cleanly; and runs
-# lint-bash.sh/lint-python.sh over this repo's own bash and Python scripts.
+# lint-bash.sh/lint-python.sh over this repo's own shell and Python scripts.
 # The name predates the JSON/YAML/bash/Python checks -- kept as-is since
 # .githooks/pre-commit calls it by name for a full local sweep. CI no longer
 # calls this directly: it's split into four path-filtered
@@ -15,12 +15,17 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
-mapfile -t files < <(./list-lint-files.sh markdown)
-mapfile -t config_files < <(./list-lint-files.sh config)
-mapfile -t bash_files < <(./list-lint-files.sh bash)
-mapfile -t python_files < <(./list-lint-files.sh python)
+# llf_read_list: NUL-safe, and it fails -- rather than hand back an empty
+# list, which every linter below would pass -- if listing breaks.
+# shellcheck source=/dev/null
+source ./list-lint-files.sh || exit 1
 
 status=0
+files=() config_files=() bash_files=() python_files=()
+llf_read_list markdown files || status=1
+llf_read_list config config_files || status=1
+llf_read_list bash bash_files || status=1
+llf_read_list python python_files || status=1
 
 if ! command -v mdl >/dev/null 2>&1; then
 	printf 'mdl not found on PATH (gem install --user-install mdl, then add the gem bin dir to PATH)\n' >&2
@@ -41,7 +46,8 @@ else
 	if [ -z "$py" ]; then
 		printf 'no working python3/python interpreter found on PATH\n' >&2
 		status=1
-	else
+	elif [ "${#files[@]}" -gt 0 ]; then
+		# Guarded: mdl with no files reads stdin.
 		mdl "${files[@]}" || status=1
 		"$py" check-markdown-links.py "${files[@]}" || status=1
 	fi

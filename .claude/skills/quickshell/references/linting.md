@@ -7,8 +7,9 @@ Use this reference for `qmllint`, `qmlls`, `qml-language-server`, and missing QM
 Stock `qmllint` often does not discover Quickshell modules automatically. It needs explicit QML import roots that contain Qt's modules, Quickshell's `qmldir` files, and generated `.qmltypes` files. Quickshell `qs.<path>` imports are rooted at the directory containing `shell.qml`; stock Qt tooling may also need a lint-only `qmldir` map for each local `qs.*` module.
 
 Official docs for the current reference version:
-- QML imports: https://quickshell.org/docs/v0.3.0/guide/qml-language/
-- Installation and editor setup: https://quickshell.org/docs/v0.3.0/guide/install-setup/
+
+- QML imports: <https://quickshell.org/docs/v0.3.0/guide/qml-language/>
+- Installation and editor setup: <https://quickshell.org/docs/v0.3.0/guide/install-setup/>
 
 Use the version-selection rules in `docs-map.md` for a project that targets a
 different release.
@@ -32,6 +33,7 @@ When running elsewhere, pass an absolute root explicitly:
 ```
 
 It:
+
 - finds `qmllint-qt6`, `qmllint`, or `/usr/lib*/qt6/bin/qmllint`;
 - adds common Qt/Quickshell QML roots such as `/usr/lib64/qt6/qml`, `/usr/lib/qt6/qml`, and `/usr/lib/qt6/qml`;
 - discovers `qs.*` imports in the target files;

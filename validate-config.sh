@@ -38,7 +38,23 @@ for f in "$@"; do
 			status=1
 			continue
 		fi
-		if ! ruby -ryaml -e 'YAML.load_file(ARGV[0])' "$f" >/dev/null 2>&1; then
+		# Every document in the file is fully loaded -- as Psych.safe_load
+		# does, but with aliases allowed and once per document, since
+		# safe_load reads only the first -- so a syntax error anywhere, or an
+		# alias to an anchor that isn't defined, fails. The class loader is
+		# safe_load's restricted one: plain YAML types, plus dates and
+		# symbols; a !ruby/object tag is refused, never instantiated. Ruby's
+		# own message says where it broke.
+		if ! ruby -ryaml -rdate -e 'begin
+			loader = Psych::ClassLoader::Restricted.new(%w[Date DateTime Time Symbol], [])
+			scanner = Psych::ScalarScanner.new(loader)
+			Psych.parse_stream(File.read(ARGV[0]), filename: ARGV[0]).children.each do |doc|
+				Psych::Visitors::ToRuby.new(scanner, loader).accept(doc)
+			end
+		rescue Psych::Exception => e
+			warn "#{ARGV[0]}: #{e.message}"
+			exit 1
+		end' "$f"; then
 			printf 'validate-config: %s: invalid YAML\n' "$f" >&2
 			status=1
 		fi
