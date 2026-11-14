@@ -6,6 +6,34 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Session entries since 2026-10-11 are kept below, newest first. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
 
+### This session's work (2026-11-14, night, on the CachyOS laptop): `Debian-titus` audited, fixed for Debian 13 and VM-tested; private repo created and PR #1 merged
+
+Kartik asked for a full skeptic analysis of `/home/kartik/Debian-titus`, using agents at xhigh effort and replacing package names from debian.org. That directory was a fresh clone of upstream `ChrisTitusTech/Debian-titus` (`f5533bc`, 2024-04-21). The August fork `KartikAkolia/Debian-titus` (item 11) no longer exists on GitHub. Kartik chose:
+
+- **Scope:** a faithful fix, for trixie only.
+- **Repo:** a new private repo, standalone because GitHub forks of public repos can't be private.
+- **Future work:** an automated VM test, owning a Debian-compatible dwm-titus fork, and an unattended preseed ISO. These are recorded in the repo's `ROADMAP.md`, not started.
+
+1. **Audit.** Five parallel agents covered Debian archive names (madison), third-party sources, a static bash audit, dotconfig against trixie's app versions, and a VM baseline run of the original script.
+   - The original produces no desktop on trixie. `neofetch`'s removal aborts the package line carrying LightDM and X.
+   - Other failures: git is never installed, dwm-titus is now Fedora-only and its session file got clobbered, mybash set up `/root`, and Thorium has no Linux builds.
+   - The config also shipped an unaudited prebuilt GIMP ELF plug-in.
+2. **Fix.** The fix is commit `550f9a4` on `skeptic-audit-2026-11-14`, pushed to private `KartikAkolia/Debian-titus` with PR #1 into `main`. Kartik had it merged the same night (merge commit `99a06c1`, which keeps `550f9a4` on `main`), so the README's plain `git clone` now gets the fixed script. Afterwards, at Kartik's request, Alacritty was installed and made the default terminal (`x-terminal-emulator` and the `mimeapps.list` terminal handler). That went straight to `main` as `3eaf40a`, VM-tested and clean in a low `/code-review` pass.
+   - **Packages and sources:** packages are checked against trixie, with Quickshell from backports and Chromium replacing Thorium. Sources are pinned and verified, with dwm-titus at `afebb4ae`.
+   - **Root never touches the user's files:** user files go through `scripts/user-setup` as the user, dwm-titus is built from a root-owned copy, and the checkout is trust-checked and staged first.
+   - **Re-runs and upgrades:** re-runs are idempotent, and upgraded systems get the old script's leftovers cleaned up.
+   - `CHANGELOG.md`, `README.md` (Testing section) and `ROADMAP.md` in that repo hold the details.
+3. **Testing.** All runs used throwaway rootless KVM VMs, which Kartik authorized.
+   - **Cloud image:** Debian's trixie generic cloud image, covering the sudo path from a umask-002 clone, both browsers, an upgrade over the original script's leftovers, SDDM takeover, planted root dotfiles and trust-check refusals. A forced download failure exits 1.
+   - **Real netinstall:** a preseeded `debian-13.7.0-amd64-netinst.iso` install with a root password, so no sudo. The README's root-shell path passed end to end, including the graphical LightDM/dwm-titus login and a clean re-run after login.
+   - **Review:** eleven `/code-review` passes, repeated until clean. Pass 5 caught a regression of mine, `main "$@" && exit`, which silently disabled `set -e` inside `main`; it is fixed and was VM-tested.
+   - **Not tested:** UEFI, real hardware and GPUs, sound and Wi-Fi.
+4. **Harness kept, volatile.** It lives in `/var/tmp/claude-debian-titus/`, 9.6 GB after deleting the per-test overlays. A reboot or `/var/tmp` cleanup can remove it.
+   - **Cloud harness:** `vm.sh` with the verified `base.qcow2`/`clean.qcow2`, and the `vms/baseline` overlay with its `pre-fixed3` snapshot of a pristine upstream install, for upgrade tests.
+   - **Netinstall harness:** under `netinst/`, `vm-netinst.sh`, the commented `preseed.cfg` (a prototype for the preseed-ISO roadmap item) and `netinst-clean.qcow2`.
+   - **Logs:** under `logs/`.
+5. **Item 11 closed as superseded.** The fork and VM it referred to are gone, and the graphical LightDM login it asked about was verified for the new code above. If `dell-optiplex` still has the August fork's clone at `/home/kartik/Debian-titus`, its local history is the only remaining copy of those three fixes. They are subsumed by this work.
+
 ### This session's work (2026-11-14, evening, on the CachyOS laptop): dwm-titus Arch port reviewed, fixed and squash-merged into private `KartikAkolia/dwm-titus-arch`
 
 Kartik asked to continue the skeptic port from the entry below, with every agent and review at xhigh effort. One fixer agent edited `~/dwm-titus`. Two read-only agents ran alongside it: a Plasma-safety audit and a hybrid-GPU investigation. The GPU agent then built a reverse-PRIME patch in an isolated copy, which the fixer merged. Three `/code-review xhigh` passes ran between fix rounds, and each returned 15 findings.
@@ -373,9 +401,8 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 58.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 59.
 
-- **11.** **Reboot the fresh-VM install and confirm the dwm session actually launches/logs in via lightdm.** `install.sh` completed cleanly end-to-end (2026-08-25, three fixes documented in `docs/archival.md`'s 2026-08-25 `install.sh` entry and in `Debian-titus`'s new `CHANGELOG.md`), but that only confirms the script itself didn't error — the graphical login has not been checked yet.
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
 - **13.** **Cloudflare items deliberately left open** (2026-08-26): account 2FA (dashboard-only, can't be scripted), Hotlink Protection (likely safe but held for explicit confirmation because of `personal-website`'s deliberately-embeddable `/embed/widget/` route), and HSTS preload (effectively irreversible once submitted). See `docs/cloudflare-zone-settings.md`.
 - **14.** **CLIProxyAPI: additional provider accounts?** (2026-08-27) Only Claude Code is linked so far; CLIProxyAPI also supports Codex, Gemini, Grok, Kimi — Kartik hasn't said whether he wants any of those linked too.
