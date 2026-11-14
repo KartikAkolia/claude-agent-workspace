@@ -39,12 +39,30 @@ class InstallerTests(unittest.TestCase):
             "FIXTURES": str(self.fixtures),
             "SERVER": str(self.server),
             "TMPDIR": str(self.root),
+            # Keeps a real user unit of the same name out of every test.
+            "XDG_CONFIG_HOME": str(self.root / "config"),
         }
         self.tool(
             "systemctl",
-            'if [[ $1 == show || $2 == show ]]; then echo "${UNIT_STATE:-inactive}"; exit 0; fi\nexit 3\n',
+            """if [[ $1 == show || $2 == show ]]; then echo "${UNIT_STATE:-inactive}"; exit 0; fi
+if [[ $1 == daemon-reload ]]; then exit 0; fi
+if [[ $1 == is-active && " ${ACTIVE_UNITS:-} " == *" ${!#} "* ]]; then exit 0; fi
+exit 3
+""",
         )
         self.tool("ss", "exit 0\n")
+        # Like the real one, it needs root (AS_ROOT, set by a sudo stub) to
+        # read the ruleset, unless NFT_READABLE=user.
+        self.tool(
+            "nft",
+            """if [[ ${NFT_READABLE:-} == user || ${AS_ROOT:-} == 1 ]]; then
+    cat "$FIXTURES/ruleset"
+    exit
+fi
+echo 'Error: Operation not permitted (perhaps you must be root?)' >&2
+exit 1
+""",
+        )
         self.tool("sudo", 'echo "unexpected sudo call" >&2; exit 99\n')
         self.tool(
             "java",
@@ -170,7 +188,7 @@ else:
 
     def snapshot(self):
         return {
-            str(p.relative_to(self.server)): p.read_bytes()
+            str(p.relative_to(self.server)): (p.read_bytes(), p.stat().st_mode)
             for p in self.server.rglob("*")
             if p.is_file()
         }
@@ -249,10 +267,14 @@ exec {real} "$@"
         self.assertTrue((self.server / "mods/fabric-api-9.0.jar").exists())
         self.assertEqual(other.read_bytes(), b"unselected unmanaged mod")
 
+    # place copies with tee, the source arriving as tee's stdin.
+    COPYING = "[[ $(readlink /proc/self/fd/0) == */mods/{} ]]"
+
     def test_copy_failure_restores_launcher_mods_and_state(self):
         self.prepare_upgrade()
+        (self.server / "fabric-server-launch.jar").chmod(0o600)
         before = self.snapshot()
-        self.fail_tool("install", '[[ " $* " == *"/mods/fabric-api-9.0.jar "* ]]')
+        self.fail_tool("tee", self.COPYING.format("fabric-api-9.0.jar"))
         result = self.install(expected=42)
         self.assertIn("restored the previous", result.stderr)
         self.assertEqual(self.snapshot(), before)
@@ -261,9 +283,21 @@ exec {real} "$@"
     def test_second_mod_failure_rolls_back_first_replacement(self):
         self.prepare_upgrade()
         before = self.snapshot()
-        self.fail_tool("install", '[[ " $* " == *"/mods/Geyser-Fabric-9.jar "* ]]')
+        self.fail_tool("tee", self.COPYING.format("Geyser-Fabric-9.jar"))
         self.install("--type", "geyser", expected=42)
         self.assertEqual(self.snapshot(), before)
+
+    def test_rollback_restores_a_symlinked_artifact(self):
+        self.prepare_upgrade()
+        launcher = self.server / "fabric-server-launch.jar"
+        shared = self.root / "shared-launcher.jar"
+        launcher.rename(shared)
+        launcher.symlink_to(shared)
+        self.fail_tool("tee", self.COPYING.format("fabric-api-9.0.jar"))
+        self.install(expected=42)
+        self.assertTrue(launcher.is_symlink())
+        self.assertEqual(os.readlink(launcher), str(shared))
+        self.assertEqual(shared.read_bytes(), b"synthetic mod artifact")
 
     def test_state_write_failure_restores_removed_mods(self):
         self.prepare_upgrade()
@@ -286,10 +320,10 @@ exec {real} "$@"
     def test_sigterm_during_replacement_rolls_back(self):
         self.prepare_upgrade()
         before = self.snapshot()
-        real = shutil.which("install")
+        real = shutil.which("tee")
         self.tool(
-            "install",
-            f"""if [[ " $* " == *"/mods/fabric-api-9.0.jar "* ]]; then
+            "tee",
+            f"""if {self.COPYING.format("fabric-api-9.0.jar")}; then
     kill -TERM "$PPID"
     exit 143
 fi
@@ -298,6 +332,300 @@ exec {real} "$@"
         )
         self.install(expected=143)
         self.assertEqual(self.snapshot(), before)
+
+    # Reads root may do anywhere; anything else as root is refused (99).
+    ROOT_READS = ("find", "test", "sha512sum", "cat", "grep")
+
+    def system_mode_stubs(self, server):
+        """A sudo whose root and minecraft are both us, with $SERVER closed
+        (mode 000) except during a sudo call, as a minecraft-owned 750
+        directory is to the installer."""
+        real_id, real_stat = shutil.which("id"), shutil.which("stat")
+        self.tool(
+            "id",
+            f'if [[ ${{!#}} == minecraft ]]; then set -- "${{@:1:$#-1}}"; fi\nexec {real_id} "$@"\n',
+        )
+        self.tool(
+            "stat",
+            f'if [[ $* == "-c %U $SERVER" ]]; then echo minecraft; exit 0; fi\nexec {real_stat} "$@"\n',
+        )
+        self.tool(
+            "sudo",
+            f"""[[ $1 != -n ]] || shift
+[[ $1 != -v ]] || exit 0
+user=root
+if [[ $1 == -u ]]; then user=$2; shift 2; fi
+printf '%s %s\\n' "$user" "$*" >>"$FIXTURES/sudo-calls"
+if [[ $user == root ]]; then
+    case $1 in
+    {" | ".join(self.ROOT_READS)} | systemctl | nft) ;;
+    install)
+        # Only creating the directory itself; its ownership is simulated.
+        [[ $2 == -d && $3 == -o && $5 == -g && $7 == -m && $9 == "$SERVER" && $# == 9 ]] || exit 99
+        set -- install -d -m "$8" "$9"
+        ;;
+    tee)
+        [[ $2 == /etc/systemd/system/* && $# == 2 ]] || exit 99
+        exec tee "$FIXTURES/system-unit"
+        ;;
+    *) exit 99 ;;
+    esac
+elif [[ $user != minecraft ]]; then
+    exit 99
+fi
+[[ ! -d $SERVER ]] || chmod 700 "$SERVER"
+status=0
+"$@" || status=$?
+[[ ! -d $SERVER ]] || chmod 000 "$SERVER"
+exit "$status"
+""",
+        )
+        self.addCleanup(lambda: server.exists() and server.chmod(0o700))
+
+    def assert_root_only_read_the_server(self, server):
+        for call in (self.fixtures / "sudo-calls").read_text().splitlines():
+            user, command = call.split(" ", 1)
+            if user == "root" and f"{server}/" in command:
+                self.assertIn(command.split(" ", 1)[0], self.ROOT_READS, call)
+
+    @unittest.skipUnless(
+        os.access("/dev/shm", os.W_OK) and Path("/run/systemd/system").is_dir(),
+        "needs systemd and a writable /dev/shm (system mode refuses /tmp)",
+    )
+    def test_system_mode_writes_as_owner_and_adopts_through_sudo(self):
+        if Path("/etc/systemd/system/minecraft-fabric.service").exists():
+            self.skipTest("a real minecraft-fabric system unit exists here")
+        root = Path(os.path.realpath(self.root))
+        homes = (Path("/home").resolve(), Path("/root"), Path.home().resolve())
+        if any(root.is_relative_to(home) for home in homes):
+            self.skipTest("a system unit can't use the stub Java in a home directory")
+        base = tempfile.TemporaryDirectory(prefix="fabric-system-", dir="/dev/shm")
+        self.addCleanup(base.cleanup)
+        server = Path(os.path.realpath(base.name)) / "server with spaces"
+        self.system_mode_stubs(server)
+        options = ("--service", "system", "--dir", str(server))
+        self.install(*options, SERVER=str(server))
+        self.assert_root_only_read_the_server(server)
+        # System mode already uses sudo, so the firewall check may read the
+        # ruleset with it.
+        self.assertIn(
+            "root nft list ruleset", (self.fixtures / "sudo-calls").read_text()
+        )
+        unit = (self.fixtures / "system-unit").read_text()
+        self.assertIn("User=minecraft", unit)
+        server.chmod(0o700)
+        self.assertEqual(
+            (server / "mods/fabric-api-9.0.jar").read_bytes(), b"synthetic mod artifact"
+        )
+        self.assertEqual((server / "start.sh").stat().st_mode & 0o7777, 0o755)
+        self.assertEqual((server / ".install-state").stat().st_mode & 0o7777, 0o644)
+        self.assertFalse(list(server.rglob(".install-file.*")))
+
+        # A legacy install: the jar is unrecorded, readable only through sudo,
+        # and byte-for-byte the resolved build, so it's adopted.
+        (server / ".install-state").unlink()
+        server.chmod(0o000)
+        (self.fixtures / "sudo-calls").write_text("")
+        result = self.install(*options, SERVER=str(server))
+        # Checked through peek's sudo fallback. peek gives the command no
+        # stdin (MC-2), so the checklist is a file that root's sha512sum reads.
+        self.assertIn("fabric-api 9.0 already present", result.stdout)
+        self.assert_root_only_read_the_server(server)
+        self.assertIn(
+            f"root sha512sum -c --status {self.root}",
+            (self.fixtures / "sudo-calls").read_text(),
+        )
+        server.chmod(0o700)
+        self.assertIn(
+            "mod_fabric-api=fabric-api-9.0.jar", (server / ".install-state").read_text()
+        )
+
+        # A failed update is rolled back by the owner too.
+        (server / "fabric-server-launch.jar").write_bytes(b"previous launcher")
+        (server / "mods/fabric-api-9.0.jar").write_bytes(b"previous mod")
+        server.chmod(0o000)
+        (self.fixtures / "loader").write_text("0.20.2")
+        (self.fixtures / "sudo-calls").write_text("")
+        self.fail_tool("tee", self.COPYING.format("fabric-api-9.0.jar"))
+        result = self.install(*options, expected=42, SERVER=str(server))
+        self.assertIn("restored the previous", result.stderr)
+        self.assert_root_only_read_the_server(server)
+        server.chmod(0o700)
+        self.assertEqual(
+            (server / "fabric-server-launch.jar").read_bytes(), b"previous launcher"
+        )
+        self.assertEqual(
+            (server / "mods/fabric-api-9.0.jar").read_bytes(), b"previous mod"
+        )
+
+    def without_sudo(self):
+        """A PATH holding every command but sudo."""
+        tools = self.root / "tools"
+        tools.mkdir()
+        for directory in os.environ["PATH"].split(os.pathsep):
+            if not os.path.isdir(directory):
+                continue
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if (
+                    name != "sudo"
+                    and not (tools / name).exists()
+                    and os.access(path, os.X_OK)
+                ):
+                    (tools / name).symlink_to(path)
+        (self.bin / "sudo").unlink()
+        return f"{self.bin}:{tools}"
+
+    def test_user_and_none_modes_need_no_sudo(self):
+        path = self.without_sudo()
+        self.install(PATH=path)
+        self.assertTrue((self.server / "start.sh").exists())
+        if Path("/run/systemd/system").is_dir():
+            result = self.install("--service", "system", expected=1, PATH=path)
+            self.assertIn(
+                "sudo isn't installed, and it's needed to run a system unit",
+                result.stderr,
+            )
+
+    def geyser_config(self, text=None):
+        config = self.server / "config/Geyser-Fabric/config.yml"
+        if text is not None:
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(text)
+        return config.read_text()
+
+    def test_geyser_rerun_only_undoes_floodgate_auth(self):
+        self.install()
+        other = "advanced:\n  auth-type: floodgate\n"
+        self.geyser_config(f"java:\n  # comment\n  auth-type: offline\n{other}")
+        self.install("--type", "geyser")
+        self.assertEqual(
+            self.geyser_config(), f"java:\n  # comment\n  auth-type: offline\n{other}"
+        )
+        self.geyser_config(f"java:\n  auth-type: 'Floodgate'\n{other}")
+        self.install("--type", "geyser")
+        self.assertEqual(self.geyser_config(), f"java:\n  auth-type: online\n{other}")
+        # Older configs keep it under remote:; a missing key means online.
+        self.geyser_config("remote:\n  auth-type: floodgate\n")
+        self.install("--type", "geyser")
+        self.assertEqual(self.geyser_config(), "remote:\n  auth-type: online\n")
+        self.geyser_config("java:\n  port: 25565\n")
+        self.install("--type", "geyser")
+        self.assertEqual(self.geyser_config(), "java:\n  port: 25565\n")
+        self.geyser_config("java:\n  auth-type: offline\n")
+        self.install("--type", "floodgate")
+        self.assertEqual(self.geyser_config(), "java:\n  auth-type: floodgate\n")
+        self.geyser_config("java:\n  port: 25565\n")
+        result = self.install("--type", "floodgate", expected=1)
+        self.assertIn("couldn't find auth-type", result.stderr)
+
+    DROP = "table inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n"
+
+    def firewall(self, ruleset=DROP, **env):
+        (self.fixtures / "ruleset").write_text(ruleset)
+        (self.fixtures / "sudo-calls").write_text("")
+        # Only the ruleset read is expected; it never prompts (-n).
+        self.tool(
+            "sudo",
+            """printf '%s\\n' "$*" >>"$FIXTURES/sudo-calls"
+if [[ $1 == -n && $2 == nft ]]; then shift; AS_ROOT=1 exec "$@"; fi
+exit 99
+""",
+        )
+        return self.bash(
+            """java_port=25565
+server_type=java
+assume_yes=true
+sudo_ready=${SUDO_READY:-false}
+"""
+            + section("ask() {", "\n# --- helpers")
+            + section("# --- firewall", "# --- first boot")
+            + 'printf "%s\\n" "$firewall_note"\n',
+            **env,
+        )
+
+    def test_firewall_note_flags_unreachable_addresses(self):
+        accept = self.DROP.replace("policy drop", "policy accept")
+        drop_note = "an nftables input chain drops unmatched traffic"
+        unread = "{}.service is active and its ruleset can't be read without root"
+        for ruleset, env, expected, sudo in (
+            (
+                self.DROP,
+                {"ACTIVE_UNITS": "firewalld"},
+                "firewalld is active and this run didn't open 25565/tcp",
+                False,
+            ),
+            (self.DROP, {"NFT_READABLE": "user"}, drop_note, False),
+            # Through sudo only when this run already uses it.
+            (self.DROP, {"SUDO_READY": "true"}, drop_note, True),
+            (self.DROP, {"ACTIVE_UNITS": "nftables"}, unread.format("nftables"), False),
+            (self.DROP, {"ACTIVE_UNITS": "iptables"}, unread.format("iptables"), False),
+            # Read and found open, so an active service doesn't matter.
+            (accept, {"SUDO_READY": "true", "ACTIVE_UNITS": "nftables"}, "", True),
+            (self.DROP, {}, "", False),
+        ):
+            with self.subTest(ruleset=ruleset, env=env):
+                result = self.firewall(ruleset, **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip()[: len(expected)], expected)
+                self.assertEqual(bool(result.stdout.strip()), bool(expected))
+                calls = (self.fixtures / "sudo-calls").read_text()
+                self.assertEqual(calls, "-n nft list ruleset\n" if sudo else "")
+        result = self.install(ACTIVE_UNITS="nftables")
+        self.assertIn(
+            f"Firewall:        warning: {unread.format('nftables')}; make sure it allows 25565/tcp",
+            result.stdout,
+        )
+
+    def test_package_install_marks_sudo_ready(self):
+        result = self.bash(
+            """pm=pacman
+sudo_ready=false
+sudo() { :; }
+"""
+            + section("pkg_install() {", "\npm=$(detect_pm)")
+            + 'pkg_install jre-openjdk-headless\necho "sudo_ready=$sudo_ready"\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sudo_ready=true", result.stdout)
+
+    def start(self, *states):
+        (self.fixtures / "states").write_text("".join(f"{s}\n" for s in states))
+        return self.bash(
+            """service_mode=user
+UNIT_NAME=minecraft-fabric.service
+me=$(id -un)
+server_dir=$SERVER
+was_running=true
+assume_yes=true
+as_owner() { "$@"; }
+confirm() { [[ $1 == Start\\ the\\ server\\ now* ]]; }
+service_ctl() { echo "$*" >>"$FIXTURES/service-calls"; }
+state_in() { local s; s=$(head -n1 "$FIXTURES/states"); sed -i 1d "$FIXTURES/states"; echo "${s:-active}"; }
+sleep() { :; }
+info() { :; }
+mkdir -p "$SERVER"
+echo eula=true >"$SERVER/eula.txt"
+"""
+            + section("readonly START_WATCH=", "\nfinished=true")
+            + 'echo "start_failed=$start_failed"\n'
+        )
+
+    def test_start_is_checked_until_the_server_stays_up(self):
+        for states, failed in (
+            ((), "false"),
+            (("active", "activating"), "true"),
+            (("failed",), "true"),
+            (("active",) * 14 + ("inactive",), "true"),
+        ):
+            with self.subTest(states=states):
+                result = self.start(*states)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"start_failed={failed}", result.stdout)
+        self.assertIn(
+            "start minecraft-fabric.service",
+            (self.fixtures / "service-calls").read_text(),
+        )
 
     def test_launcher_rejects_pending_restart(self):
         self.install()
@@ -323,6 +651,7 @@ state_in() { cat "$FIXTURES/service-state"; }
 ctl_in() { echo "$*" >>"$FIXTURES/service-calls"; if [[ $2 == stop ]]; then echo "$STOP_STATE" >"$FIXTURES/service-state"; fi; }
 confirm() { return 0; }
 sudo() { "$@"; } # simulated privilege boundary; all paths are disposable
+need_sudo() { :; }
 warn() { :; }
 die() { echo "$*" >&2; exit 1; }
 """
@@ -509,7 +838,11 @@ sudo() { if [[ $1 == tee ]]; then "$@"; fi; }
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         unit = self.fixtures / "generated.service"
-        self.assertIn(f'Environment="HOME={self.server}"', unit.read_text())
+        text = unit.read_text()
+        self.assertIn(f'Environment="HOME={self.server}"', text)
+        unit_section = text.split("[Service]")[0]
+        self.assertIn("StartLimitIntervalSec=600", unit_section)
+        self.assertIn("StartLimitBurst=5", unit_section)
         check = subprocess.run(
             ["systemd-analyze", "verify", str(unit)],
             text=True,
@@ -518,7 +851,10 @@ sudo() { if [[ $1 == tee ]]; then "$@"; fi; }
             timeout=15,
         )
         self.assertEqual(check.returncode, 0, check.stderr)
-        self.assertNotIn("Invalid environment assignment", check.stderr)
+        # verify still exits 0 after an ignored setting, such as "Invalid
+        # environment assignment" or an unknown key, but names the unit file
+        # in each warning. Warnings about other units on the host don't count.
+        self.assertNotIn(unit.name, check.stderr)
 
 
 if __name__ == "__main__":
