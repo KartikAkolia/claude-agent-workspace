@@ -12,6 +12,7 @@ on:
       - "**.py"
       - "lint-python.sh"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - "lint-versions.sh"
       - ".lint-versions"
       - ".github/workflows/lint-python.yml"
@@ -20,22 +21,38 @@ on:
       - "**.py"
       - "lint-python.sh"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - "lint-versions.sh"
       - ".lint-versions"
       - ".github/workflows/lint-python.yml"
+
+# bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
         # Gives lint-python.sh's `uvx ruff@<version in .lint-versions>` a
         # resolvable interpreter, no system-wide install needed.
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: lint-python.sh
+        # NUL-separated, via a file so a lister failure fails the step (it
+        # also fails on an empty list rather than lint nothing).
         run: |
-          mapfile -t files < <(./list-lint-files.sh python)
+          ./list-lint-files.sh -z python >"$RUNNER_TEMP/python-files"
+          mapfile -d '' -t files <"$RUNNER_TEMP/python-files"
           ./lint-python.sh "${files[@]}"
+
+      - name: sync-docs-to-trilium tests
+        # Includes reading the real reference-clones.tsv, unstubbed, and
+        # checking list-lint-files.sh parses it to the same table. --script
+        # installs the test file's own inline dependencies, where markdown
+        # is pinned.
+        run: uv run -q --script scripts/test_sync_docs_to_trilium.py -v

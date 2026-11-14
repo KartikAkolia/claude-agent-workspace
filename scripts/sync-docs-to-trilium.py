@@ -21,6 +21,8 @@ The repo is the source of truth: doc notes carry `#readOnly`, and any edit made
 in Trilium is overwritten the next time that doc's rendering changes. Notes for
 files deleted from the repo are listed, and only removed with --prune. A stale
 folder note is only pruned when every note under it is a stale doc too.
+Protected notes are skipped with a warning, never written or pruned, since
+ETAPI can't open a protected session.
 
 Only files git tracks (or would track) are synced, so gitignored nested repos
 (estuary/, personal-website/, ...) never leave the machine. Hidden directories
@@ -46,7 +48,8 @@ import json
 import os
 import posixpath
 import re
-import shlex
+import secrets
+import string
 import subprocess
 import sys
 import urllib.error
@@ -66,24 +69,42 @@ HASH_LABEL = "workspaceDocHash"
 ROOT_TITLE = "claude-agent-workspace docs"
 
 
+def reference_clone_table() -> list[tuple[str, str, str]]:
+    """(dir, owner/repo, branch) for each of ChrisTitusTech's read-only
+    reference clones (AGENTS.md), as `list-lint-files.sh --reference-clones`
+    prints them. That script is the one parser of reference-clones.tsv --
+    the lint gates and refresh-reference-clone.sh use it too -- so its rules
+    exist once. A missing or malformed list, or no bash to run it, stops the
+    run with the lister's own message rather than letting a clone through."""
+    lister = REPO_ROOT / "list-lint-files.sh"
+    try:
+        result = subprocess.run(
+            ["bash", str(lister), "--reference-clones"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as err:
+        sys.exit(f"Can't read the reference-clone list: can't run bash: {err}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        sys.exit(f"Can't read the reference-clone list: {detail}")
+    table = []
+    for line in result.stdout.splitlines():
+        fields = tuple(line.split("\t"))
+        if len(fields) != 3 or not all(fields):
+            sys.exit(f"Can't read the reference-clone list: unexpected line {line!r}")
+        table.append(fields)
+    if not table:
+        sys.exit("Can't read the reference-clone list: list-lint-files.sh printed none")
+    return table
+
+
 @functools.cache
 def reference_clones() -> frozenset[str]:
-    """ChrisTitusTech's read-only reference clones (AGENTS.md), read from
-    list-lint-files.sh's `exclude_dirs=( ... )` so there's one list to keep up
-    to date. Parsed with shell quoting and comment rules; anything that doesn't
-    come out as plain top-level directory names stops the run rather than
-    letting a clone through."""
-    try:
-        lister = (REPO_ROOT / "list-lint-files.sh").read_text(encoding="utf-8")
-    except OSError as err:
-        sys.exit(f"Can't read the reference-clone list: {err}")
-    match = re.search(r"^exclude_dirs=\((.*?)\)", lister, re.MULTILINE | re.DOTALL)
-    try:
-        names = shlex.split(match.group(1), comments=True) if match else []
-    except ValueError:
-        names = []
-    if not names or not all(re.fullmatch(r"[A-Za-z0-9._-]+", n) for n in names):
-        sys.exit("Can't parse exclude_dirs in list-lint-files.sh")
+    """The reference clones' directory names (see reference_clone_table)."""
+    names = [clone for clone, _, _ in reference_clone_table()]
     missing = [n for n in names if not (REPO_ROOT / n).is_dir()]
     if missing:
         print(f"warning: reference clones not on disk: {', '.join(missing)}")
@@ -101,7 +122,15 @@ SETEXT_H1 = re.compile(r"\A(?:[ \t]*\n)*[ ]{0,3}(\S[^\n]*?)[ \t]*\n=+[ \t]*(?:\n
 
 
 class EtapiError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # the HTTP status, when the server answered
+
+    @property
+    def refused(self) -> bool:
+        """The server answered and didn't act (3xx/4xx), as opposed to a
+        5xx or lost response, where the request may have gone through."""
+        return self.status is not None and self.status < 500
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -109,10 +138,18 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     ETAPI token) to whatever host a redirect names."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise EtapiError(f"{req.get_method()} {req.full_url}: redirected to {newurl}")
+        raise EtapiError(
+            f"{req.get_method()} {req.full_url}: redirected to {newurl}", code
+        )
 
 
 OPENER = urllib.request.build_opener(NoRedirect)
+ID_CHARS = string.ascii_letters + string.digits
+
+
+def new_note_id() -> str:
+    """A random noteId shaped like Trilium's own (12 letters and digits)."""
+    return "".join(secrets.choice(ID_CHARS) for _ in range(12))
 
 
 class Etapi:
@@ -138,19 +175,30 @@ class Etapi:
             else:
                 data = json.dumps(body).encode()
                 headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(
-            self.base + path, data=data, method=method, headers=headers
-        )
         try:
+            req = urllib.request.Request(
+                self.base + path, data=data, method=method, headers=headers
+            )
             with OPENER.open(req, timeout=30) as resp:
                 payload = resp.read()
         except urllib.error.HTTPError as err:
             detail = err.read().decode(errors="replace")[:500]
-            raise EtapiError(f"{method} {path}: HTTP {err.code}: {detail}") from err
+            raise EtapiError(
+                f"{method} {path}: HTTP {err.code}: {detail}", err.code
+            ) from err
         # URLError, timeouts, resets and TLS errors are all OSError;
         # IncompleteRead and friends are HTTPException.
         except (OSError, http.client.HTTPException) as err:
             raise EtapiError(f"{method} {path}: {err}") from err
+        # http.client rejects a bad header with ValueError('Invalid header
+        # value ...') quoting the value, which here is the token, so neither
+        # the message nor the chained exception is passed on.
+        except ValueError as err:
+            raise EtapiError(
+                f"{method} {path}: invalid request ({type(err).__name__}, "
+                "details withheld as they can quote the token); check the token "
+                "and URL"
+            ) from None
         if not payload:
             if method in ("GET", "POST"):
                 raise EtapiError(f"{method} {path}: empty response")
@@ -172,17 +220,7 @@ class Etapi:
         return results
 
     def create(self, parent: str, title: str, labels: dict[str, str]) -> str:
-        created = self.call(
-            "POST",
-            "/create-note",
-            {"parentNoteId": parent, "title": title, "type": "text", "content": ""},
-        )
-        try:
-            note_id = created["note"]["noteId"]
-            if not isinstance(note_id, str) or not note_id:
-                raise EtapiError(f"create-note: bad noteId in {created!r}")
-        except (KeyError, TypeError) as err:
-            raise EtapiError(f"create-note: unexpected response {created!r}") from err
+        note_id = self.create_note(parent, title)
         # ETAPI can't label a note at creation. A note left without its
         # identifying label is invisible to later runs, so undo the create if
         # labelling fails or is interrupted, without hiding the original error.
@@ -190,17 +228,76 @@ class Etapi:
             for name, value in labels.items():
                 self.add_label(note_id, name, value)
         except BaseException:
-            if not self.dry_run:
-                try:
-                    self.call("DELETE", f"/notes/{note_id}")
-                except EtapiError:
-                    print(
-                        f"warning: couldn't delete unlabelled note {note_id}; "
-                        "delete it by hand",
-                        file=sys.stderr,
-                    )
+            self.discard(note_id)
             raise
         return note_id
+
+    def create_note(self, parent: str, title: str) -> str:
+        """POST create-note with a noteId chosen here (CreateNoteDef accepts
+        one), so a create whose response is lost or garbled can be looked up:
+        the note is adopted if it exists, rather than left as an unlabelled
+        orphan that the next run duplicates. An interrupted create is looked
+        up and deleted."""
+        note_id = new_note_id()
+        body = {"parentNoteId": parent, "title": title, "type": "text", "content": ""}
+        try:
+            created = self.call("POST", "/create-note", {**body, "noteId": note_id})
+        except EtapiError as err:
+            if err.refused or not self.was_created(note_id, parent, title):
+                raise
+            print(
+                f"warning: create-note failed ({err}), but note {note_id} "
+                f"('{title}') exists; using it",
+                file=sys.stderr,
+            )
+            return note_id
+        except BaseException:
+            if self.was_created(note_id, parent, title):
+                self.discard(note_id)
+            raise
+        returned = created.get("note") if isinstance(created, dict) else None
+        returned = returned.get("noteId") if isinstance(returned, dict) else None
+        if isinstance(returned, str) and returned:
+            return returned  # note_id, or a dry run's placeholder
+        if self.was_created(note_id, parent, title):
+            return note_id
+        raise EtapiError(f"create-note: unexpected response {created!r}")
+
+    def was_created(self, note_id: str, parent: str, title: str) -> bool:
+        """Whether this run's create-note made note_id after all. Only a note
+        with the title and parent asked for counts, so a note that already
+        had the ID is never adopted or deleted."""
+        if self.dry_run:
+            return False
+        try:
+            found = self.call("GET", f"/notes/{note_id}")
+        except EtapiError as err:
+            if err.status != 404:
+                print(
+                    f"warning: can't tell whether note {note_id} ('{title}') was "
+                    f"created ({err}); if it exists without a {PATH_LABEL} label, "
+                    "delete it by hand",
+                    file=sys.stderr,
+                )
+            return False
+        return (
+            isinstance(found, dict)
+            and found.get("title") == title
+            and parent in (found.get("parentNoteIds") or [])
+        )
+
+    def discard(self, note_id: str) -> None:
+        """Delete a note this run created but couldn't finish labelling."""
+        if self.dry_run:
+            return
+        try:
+            self.call("DELETE", f"/notes/{note_id}")
+        except EtapiError:
+            print(
+                f"warning: couldn't delete unlabelled note {note_id}; "
+                "delete it by hand",
+                file=sys.stderr,
+            )
 
     def add_label(self, note_id: str, name: str, value: str = "") -> None:
         self.call(
@@ -246,7 +343,7 @@ def rel_path(p: str) -> str:
 
 
 def excluded(rel: str) -> bool:
-    """Reference clones are top-level folders, as in list-lint-files.sh;
+    """Reference clones are top-level folders (reference-clones.tsv);
     hidden folders and node_modules are skipped at any depth."""
     parts = rel.split("/")
     if parts[0] in reference_clones():
@@ -434,6 +531,58 @@ def parent_dir(rel: str) -> str:
     return posixpath.dirname(rel)
 
 
+def duplicates_message(
+    duplicated: dict[str, list[dict]], claims: dict[str, list[dict]], roots: list
+) -> str:
+    """Explain which of several notes claiming one path is the script's own.
+
+    Trilium's Duplicate copies labels, so a copy (perhaps edited by hand)
+    carries the same path, hash and #readOnly as the note it was made from.
+    Deleting the wrong one loses those edits or turns the copy into the
+    managed note, so name the likely original and have the labels removed
+    from the rest instead. A copy is newer, and Duplicate puts it next to
+    the original, so creation date decides and placement under the
+    expected parent note only breaks a tie.
+    """
+
+    def created(n: dict) -> str:
+        return n.get("utcDateCreated") or n.get("dateCreated") or ""
+
+    lines = []
+    for path, notes in sorted(duplicated.items()):
+        parent = parent_dir(path)
+        parent_ids = {
+            n["noteId"] for n in (claims.get(parent, []) if parent else roots)
+        }
+        placed = {
+            n["noteId"]: any(p in parent_ids for p in n.get("parentNoteIds") or [])
+            for n in notes
+        }
+        ranked = sorted(
+            notes,
+            key=lambda n: (
+                not created(n),
+                created(n),
+                not placed[n["noteId"]],
+                n["noteId"],
+            ),
+        )
+        lines.append(f"{len(notes)} notes carry {PATH_LABEL}={path}:")
+        for i, n in enumerate(ranked):
+            where = "under its parent note" if placed[n["noteId"]] else "elsewhere"
+            when = f"created {created(n)}" if created(n) else "creation date unknown"
+            mark = "  <- likely the original" if i == 0 else ""
+            lines.append(
+                f"  {n['noteId']} '{n.get('title', '')}', {when}, {where}{mark}"
+            )
+    lines.append(
+        "Trilium's Duplicate copies labels, so a copy looks managed too. Don't "
+        f"delete a note: remove the {PATH_LABEL} and {HASH_LABEL} labels (and "
+        "readOnly, to keep editing it) from each copy, then rerun."
+    )
+    return "\n".join(lines)
+
+
 def sync(
     api: Etapi,
     files: list[str],
@@ -457,18 +606,15 @@ def sync(
     # The whole tree: a doc note moved elsewhere in Trilium is found and
     # updated in place instead of duplicated.
     existing = api.search(f"#{PATH_LABEL}")
-    by_path: dict[str, dict] = {}
+    claims: dict[str, list[dict]] = {}
     for note in existing:
         attr = label(note, PATH_LABEL)
-        if not attr:  # matched through an inherited label only
-            continue
-        path = attr["value"]
-        if path in by_path:
-            sys.exit(
-                f"Two notes carry {PATH_LABEL}={path} "
-                f"({by_path[path]['noteId']}, {note['noteId']}); delete one and rerun"
-            )
-        by_path[path] = note
+        if attr:  # not matched through an inherited label only
+            claims.setdefault(attr["value"], []).append(note)
+    duplicated = {p: ns for p, ns in claims.items() if len(ns) > 1}
+    if duplicated:
+        sys.exit(duplicates_message(duplicated, claims, roots))
+    by_path = {p: ns[0] for p, ns in claims.items()}
 
     # Everything that can be checked before writing is checked here, so a bad
     # run exits before touching Trilium.
@@ -481,6 +627,25 @@ def sync(
     ]
     if unmatched:
         sys.exit(f"Nothing to sync or prune under: {', '.join(unmatched)}")
+    # ETAPI can't open a protected session: it shows a protected note's title
+    # as "[protected]" and can't write to the note, so such a note is left
+    # alone, neither updated nor pruned.
+    protected = {
+        p for p, n in by_path.items() if n.get("isProtected") and in_scope(p, scope)
+    }
+    for rel in sorted(protected):
+        nid = by_path[rel]["noteId"]
+        if rel in wanted:
+            print(
+                f"! {rel}: note {nid} is protected, so ETAPI can't update it; "
+                "skipped (unprotect it in Trilium to sync it)"
+            )
+        else:
+            print(
+                f"! {rel} is no longer in the repo, but note {nid} is protected, "
+                "so it isn't pruned; delete it in Trilium by hand"
+            )
+    stale = [p for p in stale if p not in protected]
 
     if roots:
         root_id = roots[0]["noteId"]
@@ -506,7 +671,7 @@ def sync(
     for sub in sorted(wanted - set(files)):
         name = posixpath.basename(sub)
         folder = by_path.get(sub)
-        if folder and in_scope(sub, scope):
+        if folder and in_scope(sub, scope) and sub not in protected:
             # Folder notes follow the repo too: name and #sorted.
             if folder["title"] != name:
                 api.call("PATCH", f"/notes/{folder['noteId']}", {"title": name})
@@ -535,6 +700,8 @@ def sync(
     render = Renderer(note_ids)
     updated = 0
     for rel in files:
+        if rel in protected:
+            continue
         title, body = sources[rel]
         content, unresolved = render(rel, body)
         nid = note_ids[rel]
@@ -567,14 +734,13 @@ def sync(
         updated += 1
 
     # Stale: known paths inside this run's scope that no longer exist. A run
-    # on `docs/x.md` never touches the rest. A stale note under a stale
-    # folder goes with its folder, so only the topmost ones are deleted.
+    # on `docs/x.md` never touches the rest. Stale notes are deleted deepest
+    # path first, so the stale docs under a stale folder go before it.
     # A note is only deleted when nothing but already-deleted stale notes sit
     # under it, so a live doc or hand-made note moved there is never lost.
-    # Passes repeat (deepest paths first) until one deletes nothing, so the
-    # order notes really sit in Trilium doesn't matter. A note that also
-    # appears elsewhere (a clone) is never deleted: DELETE would remove it
-    # from every place it appears.
+    # Passes repeat until one deletes nothing, so the order notes really sit
+    # in Trilium doesn't matter. A note that also appears elsewhere (a clone)
+    # is never deleted: DELETE would remove it from every place it appears.
     pruned_ids: set[str] = set()
     pending = sorted(stale, key=lambda p: (-p.count("/"), p))
     if not prune:
@@ -616,10 +782,32 @@ def sync(
             "link to them are updated the next time a run covers them."
         )
 
+    skipped = sum(rel in protected for rel in files)
     print(
-        f"{len(files)} docs, {updated} written, {len(files) - updated} unchanged, "
-        f"{len(stale)} stale, {len(pruned_ids)} pruned"
+        f"{len(files)} docs, {updated} written, "
+        f"{len(files) - updated - skipped} unchanged, "
+        + (f"{skipped} protected (skipped), " if skipped else "")
+        + f"{len(stale)} stale, {len(pruned_ids)} pruned"
     )
+
+
+def read_token() -> str:
+    """The ETAPI token, trimmed like the token file is (a value set with
+    `$(cat file)` from a CRLF file keeps its CR). A token holding anything
+    but printable ASCII is refused by a message that never repeats it."""
+    token, source = os.environ.get("TRILIUM_ETAPI_TOKEN", "").strip(), None
+    if token:
+        source = "TRILIUM_ETAPI_TOKEN"
+    elif TOKEN_FILE.is_file():
+        token, source = TOKEN_FILE.read_text().strip(), str(TOKEN_FILE)
+    if not token:
+        sys.exit(f"No ETAPI token: set TRILIUM_ETAPI_TOKEN or write it to {TOKEN_FILE}")
+    if not re.fullmatch(r"[\x21-\x7e]+", token):
+        sys.exit(
+            f"The ETAPI token in {source} contains whitespace, control or "
+            "non-ASCII characters; copy it again from Trilium -> Options -> ETAPI"
+        )
+    return token
 
 
 def main() -> None:
@@ -644,12 +832,7 @@ def main() -> None:
     if url.scheme != "https" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
         sys.exit(f"{args.url}: refusing to send the ETAPI token over {url.scheme}")
 
-    token = os.environ.get("TRILIUM_ETAPI_TOKEN")
-    if not token and TOKEN_FILE.is_file():
-        token = TOKEN_FILE.read_text().strip()
-    if not token:
-        sys.exit(f"No ETAPI token: set TRILIUM_ETAPI_TOKEN or write it to {TOKEN_FILE}")
-
+    token = read_token()
     every = syncable_files()
     files, scope = collect_files(args.paths, every)
     # Read every in-scope file up front, so a bad one stops the run before any write.

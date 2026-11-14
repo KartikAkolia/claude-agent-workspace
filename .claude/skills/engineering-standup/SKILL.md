@@ -6,6 +6,7 @@ description: Generate a standup update from recent activity. Use when preparing 
 # Standup Update
 
 Pull from actual recent activity rather than asking the user to reconstruct it from memory, when that activity is available:
+
 - `git log --author=<user> --since=yesterday --oneline` for commits.
 - `gh pr list --author @me` / `gh pr status` for PRs opened, reviewed, merged.
 - Any ticket/issue tracker the user references — ask which one if unclear, don't assume.

@@ -5,9 +5,7 @@ cross-checked, dated. This file is time-sensitive: wage, growth, and demand figu
 year to year. Re-verify against the live source before quoting a number older than ~12
 months, don't just copy it forward.
 
-## Field-wide outlook (source: U.S. Bureau of Labor Statistics, Occupational Outlook
-Handbook, "Computer and Information Technology Occupations," data current as of the
-research date 2026-08-30, most recently updated by BLS 2026-08-27)
+## Field-wide outlook (source: U.S. Bureau of Labor Statistics, Occupational Outlook Handbook, "Computer and Information Technology Occupations," data current as of the research date 2026-08-30, most recently updated by BLS 2026-08-27)
 
 - Fact: Employment in computer and IT occupations overall is projected to grow faster
   than the average for all occupations, 2025–2035, with about 280,000 openings a year on
@@ -15,20 +13,18 @@ research date 2026-08-30, most recently updated by BLS 2026-08-27)
 - Fact: Median annual wage for the group was $109,470 (May 2025) vs. $50,980 across all
   occupations.
 - Fact, by occupation (May 2025 median wages, BLS):
-  - Computer and Information Systems Managers: $175,140; employment +16% 2025–2035;
-    ~53,500 openings/year.
-  - Information Security Analysts: ~192,900 jobs held in 2025.
-  - Computer Network Support Specialists: $76,220; Computer User Support Specialists:
-    $61,860; overall computer support specialist employment projected -3% 2025–2035
-    (structural decline in this sub-role even as the field grows), ~48,700 openings/year.
-  - Computer and Information Research Scientists: $140,300; employment +22% 2025–2035;
-    ~2,900 openings/year; typically requires a master's, though some federal roles accept
-    a bachelor's.
+   - Computer and Information Systems Managers: $175,140; employment +16% 2025–2035;
+     ~53,500 openings/year.
+   - Information Security Analysts: ~192,900 jobs held in 2025.
+   - Computer Network Support Specialists: $76,220; Computer User Support Specialists:
+     $61,860; overall computer support specialist employment projected -3% 2025–2035
+     (structural decline in this sub-role even as the field grows), ~48,700 openings/year.
+   - Computer and Information Research Scientists: $140,300; employment +22% 2025–2035;
+     ~2,900 openings/year; typically requires a master's, though some federal roles accept
+     a bachelor's.
 - Source: <https://www.bls.gov/ooh/computer-and-information-technology/>
 
-## Industry-wide hiring trends (source: CompTIA, "State of the Tech Workforce 2026,"
-released March 2026 — CompTIA is the IT industry's own trade/standards association, using
-BLS + Lightcast labor-market data)
+## Industry-wide hiring trends (source: CompTIA, "State of the Tech Workforce 2026," released March 2026 — CompTIA is the IT industry's own trade/standards association, using BLS + Lightcast labor-market data)
 
 - Fact: CompTIA estimates 2026 net tech employment growth of 1.9% (~185,499 new jobs),
   rebounding from a 0.3% net decline in 2025.
@@ -51,9 +47,7 @@ BLS + Lightcast labor-market data)
   searching outside the U.S., these figures are directional context at best, not a
   substitute for a local source.
 
-## Entry-level and career-change certification path (source: CompTIA's own certification
-program — CompTIA is the certifying body, so this is a primary source for what its own
-certs cover and how they sequence)
+## Entry-level and career-change certification path (source: CompTIA's own certification program — CompTIA is the certifying body, so this is a primary source for what its own certs cover and how they sequence)
 
 - Fact: the standard sequence is CompTIA A+ (entry-level IT support: hardware,
   troubleshooting, networking basics, mobile devices, OS) → Network+ (networking

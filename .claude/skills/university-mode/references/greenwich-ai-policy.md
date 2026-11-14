@@ -112,16 +112,17 @@ Policy — §3.1 in full.)
 
 > **4.1 Category 1 Offence** - Normally applies to students in the early stages of their
 > studies at the University.
-
+>
 > **4.2 Category 2 Offence** - Relates to all forms of assessment and can apply to
 > students at any stage of their studies. Normally applies where:
 > - work evidencing copying and/or use of unattributed material;
 > - work evidencing use of AI to demonstrate learning that has not been achieved;
 > - there is collusion amongst students;
 > - there is a repetition of a Category 1 Offence.
-
+>
 > **4.3 Category 3 Offence** - Relates to all forms of assessment and can apply to
 > students at any stage of their studies and to former students. Normally applies to:
+>
 > - work evidencing extensive and/or repeated copying or use of unattributed material;
 > - work evidencing extensive and/or repeated use of AI to demonstrate learning that has
 >   not been achieved;
@@ -193,6 +194,7 @@ not a free pass.
 > process of undertaking the assignment to acknowledge the ways in which you have used it.
 >
 > I have used AI while undertaking my assignment in the following ways:
+>
 > - To develop research questions on the topic – YES/NO
 > - To create an outline of the topic – YES/NO
 > - To explain concepts – YES/NO

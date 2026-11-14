@@ -1,38 +1,56 @@
 name: Lint Bash
 
-# Runs lint-bash.sh (shellcheck + shfmt -d + bash -n) against every tracked
-# bash script, skipping the five read-only reference clones (see AGENTS.md
-# non-negotiable #1). Path-filtered so a markdown/Python/config-only change
-# doesn't also trigger this -- split out of the single lint.yml
-# (2026-09-03), see SPEC.md's Testing & CI section for why. Backstop for the
-# local pre-commit hook (.githooks/pre-commit).
+# Runs lint-bash.sh (shellcheck + shfmt -d + bash -n, or sh -n for a
+# #!/bin/sh script) against every tracked shell script, skipping the five
+# read-only reference clones (see AGENTS.md non-negotiable #1).
+# Path-filtered so a markdown/Python/config-only change doesn't also
+# trigger this -- split out of the single lint.yml (2026-09-03), see
+# SPEC.md's Testing & CI section for why. Backstop for the local pre-commit
+# hook (.githooks/pre-commit). Also runs the installer regression tests.
 #
-# Bash scripts aren't reliably *.sh (list-lint-files.sh finds them by
+# Shell scripts aren't reliably *.sh (list-lint-files.sh finds them by
 # shebang instead), but a GitHub Actions path filter can only match on the
-# file path itself, not its content -- so .githooks/pre-commit (the tracked
-# bash script without a .sh extension) is listed explicitly below.
-# A future non-.sh bash script would need adding here too.
+# file path itself, not its content -- so the tracked scripts without a .sh
+# extension are listed explicitly below. A new one needs adding here too
+# (and to .gitattributes).
 on:
   push:
     paths:
       - "**.sh"
-      - "scripts/test_install_fedora.py"
       - ".githooks/pre-commit"
+      - ".claude/skills/quickshell/scripts/quickshell-qmllint"
+      - "scripts/xppen-tablet/xppentablet"
+      - "scripts/test_install_fedora.py"
+      - "scripts/minecraft-fabric/**"
+      - "scripts/test_device_power_saving.py"
+      - "scripts/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
+      - "reference-clones.tsv"
   pull_request:
     paths:
       - "**.sh"
-      - "scripts/test_install_fedora.py"
       - ".githooks/pre-commit"
+      - ".claude/skills/quickshell/scripts/quickshell-qmllint"
+      - "scripts/xppen-tablet/xppentablet"
+      - "scripts/test_install_fedora.py"
+      - "scripts/minecraft-fabric/**"
+      - "scripts/test_device_power_saving.py"
+      - "scripts/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
+      - "reference-clones.tsv"
+
+# bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install shellcheck and shfmt at the versions in .lint-versions
         # Not Ubuntu's apt packages, which lag Kartik's machines (see
@@ -42,6 +60,17 @@ jobs:
         # lint-bash.sh fails if they still don't match. Downloads go to a
         # file, not a pipe: a --retry after a partial transfer would
         # otherwise feed the bytes twice.
+        #
+        # Each download is checked against a sha256 before it's unpacked or
+        # run: the one pinned below when there is one -- the stronger check,
+        # fixed when the pin was added -- else the sha256 GitHub itself
+        # records for that release asset, fetched from its API, with a
+        # warning to pin it. The pre-commit hook bumps .lint-versions to
+        # whatever's installed locally, so a new version must not need an
+        # edit here first; only a release with neither a pin nor a GitHub
+        # digest (assets uploaded before mid-2025 have none) fails.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           sc=$(./lint-versions.sh get shellcheck)
           sf=$(./lint-versions.sh get shfmt)
@@ -52,21 +81,66 @@ jobs:
           aarch64) sf_arch=arm64 ;;
           *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
           esac
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/shellcheck.tar.xz" \
-            "https://github.com/koalaman/shellcheck/releases/download/v${sc}/shellcheck-v${sc}.linux.$(uname -m).tar.xz"
-          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          sc_asset="shellcheck-v${sc}.linux.$(uname -m).tar.xz"
+          sf_asset="shfmt_v${sf}_linux_${sf_arch}"
+          # Sets sha to the sha256 asset $3 of GitHub repo $1's release $2
+          # must have. Workflow commands go to stdout, so not called in $(...).
+          expected_sha256() {
+            sha=""
+            case "$3" in
+            shellcheck-v0.11.0.linux.x86_64.tar.xz) sha=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198 ;;
+            shellcheck-v0.11.0.linux.aarch64.tar.xz) sha=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588 ;;
+            shfmt_v3.14.1_linux_amd64) sha=76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf ;;
+            shfmt_v3.14.1_linux_arm64) sha=5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489 ;;
+            esac
+            [ -n "$sha" ] && return 0
+            digest=$(gh api "repos/$1/releases/tags/$2" --jq ".assets[] | select(.name == \"$3\") | .digest") || digest=""
+            if [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              sha=${digest#sha256:}
+              echo "::warning::no pinned sha256 for $3 -- checking it against GitHub's release digest instead; once this passes, pin $sha for it in lint-bash.yml"
+              return 0
+            fi
+            echo "::error::no pinned sha256 for $3, and GitHub's release has no sha256 digest for it either -- pin one in lint-bash.yml"
+            return 1
+          }
+          expected_sha256 koalaman/shellcheck "v$sc" "$sc_asset"
+          sc_sha=$sha
+          expected_sha256 mvdan/sh "v$sf" "$sf_asset"
+          sf_sha=$sha
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$sc_asset" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${sc}/$sc_asset"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$sf_asset" \
+            "https://github.com/mvdan/sh/releases/download/v${sf}/$sf_asset"
+          printf '%s  %s\n' "$sc_sha" "$sc_asset" "$sf_sha" "$sf_asset" |
+            (cd "$RUNNER_TEMP" && sha256sum --strict -c -)
+          tar -xJf "$RUNNER_TEMP/$sc_asset" -C "$RUNNER_TEMP"
           mv "$RUNNER_TEMP/shellcheck-v${sc}/shellcheck" "$bin/"
-          curl -fsSL --retry 3 -o "$bin/shfmt" \
-            "https://github.com/mvdan/sh/releases/download/v${sf}/shfmt_v${sf}_linux_${sf_arch}"
+          mv "$RUNNER_TEMP/$sf_asset" "$bin/shfmt"
           chmod +x "$bin/shfmt"
           echo "$bin" >> "$GITHUB_PATH"
 
       - name: lint-bash.sh
         env:
           LINT_VERSIONS_MODE: strict
+        # NUL-separated, via a file so a lister failure fails the step (it
+        # also fails on an empty list rather than lint nothing).
         run: |
-          mapfile -t files < <(./list-lint-files.sh bash)
+          ./list-lint-files.sh -z bash >"$RUNNER_TEMP/bash-files"
+          mapfile -d '' -t files <"$RUNNER_TEMP/bash-files"
           ./lint-bash.sh "${files[@]}"
 
       - name: Installer regression and mandatory no-nested-if checks
         run: python3 scripts/test_install_fedora.py
+
+      - name: Minecraft Fabric installer tests
+        # Stubs java, curl, sudo and systemctl itself; the system-unit tests
+        # also want a real systemd (ubuntu-latest runs one) and skip
+        # themselves without it.
+        run: cd scripts/minecraft-fabric && python3 -m unittest test_install -v
+
+      - name: Device power-saving policy tests
+        # Stubs nmcli, modprobe, mkinitcpio, grub-mkconfig, udevadm, iw,
+        # setpci, systemctl and sleep, and works in a temp dir, never the
+        # runner's own config. Beyond those it needs only bash, python3, GNU
+        # coreutils, flock (util-linux) and cmp (diffutils), all stock.
+        run: cd scripts && python3 -m unittest test_device_power_saving -v

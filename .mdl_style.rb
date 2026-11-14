@@ -25,5 +25,7 @@ rule 'MD024', :allow_different_nesting => true
 rule 'MD010', :ignore_code_blocks => true
 
 # Question-form headings (e.g. "## Is X actually Y?") are legitimate; only
-# flag the punctuation marks that are never intentional in a heading.
-rule 'MD026', :punctuation => '.,;:!'
+# flag the punctuation marks that are never intentional in a heading. A colon
+# is allowed too: a heading can quote a source's lead-in line verbatim (e.g.
+# the university-mode policy's "...includes but is not limited to:").
+rule 'MD026', :punctuation => '.,;!'

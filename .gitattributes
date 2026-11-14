@@ -12,6 +12,14 @@
 # Shell scripts must stay LF even on Windows checkouts — CRLF breaks shebangs
 # and heredocs under strict sh/dash, and trips shellcheck's SC1017 on every line.
 *.sh text eol=lf
+# The same for scripts without a .sh extension (a CRLF .githooks/pre-commit
+# fails every commit: "env: 'bash\r'"), and for Python, whose scripts here
+# are run through their shebangs too. A new extensionless script needs a
+# line here.
+.githooks/* text eol=lf
+.claude/skills/quickshell/scripts/quickshell-qmllint text eol=lf
+scripts/xppen-tablet/xppentablet text eol=lf
+*.py text eol=lf
 
 # .lint-versions is rewritten by lint-versions.sh with LF endings; pinning it
 # keeps a Windows checkout from ending up with mixed CRLF/LF lines.

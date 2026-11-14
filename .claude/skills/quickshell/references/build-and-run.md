@@ -3,9 +3,10 @@
 Use this reference for Quickshell installs, config validation, packaged configs, and source builds.
 
 Official docs:
-- Installation and setup for the current reference version: https://quickshell.org/docs/v0.3.0/guide/install-setup/
-- Distributing configurations for the current reference version: https://quickshell.org/docs/v0.3.0/guide/distribution/
-- Source build instructions: https://github.com/quickshell-mirror/quickshell/blob/master/BUILD.md
+
+- Installation and setup for the current reference version: <https://quickshell.org/docs/v0.3.0/guide/install-setup/>
+- Distributing configurations for the current reference version: <https://quickshell.org/docs/v0.3.0/guide/distribution/>
+- Source build instructions: <https://github.com/quickshell-mirror/quickshell/blob/master/BUILD.md>
 
 Use the version-selection rules in `docs-map.md` when the project targets a
 different Quickshell release.
@@ -61,6 +62,7 @@ cmake --install build
 ```
 
 Important source-build rules from upstream:
+
 - Quickshell depends on private Qt APIs and must be rebuilt against each Qt release to avoid ABI mismatches.
 - At least Qt 6.6 is required.
 - Features are enabled by default. Install dependencies for required features;

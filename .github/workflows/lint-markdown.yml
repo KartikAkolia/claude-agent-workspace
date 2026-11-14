@@ -15,37 +15,120 @@ on:
       - "**.md"
       - "check-markdown-links.py"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - ".mdlrc"
       - ".mdl_style.rb"
+      - ".lint-versions"
+      - "lint-versions.sh"
       - ".github/workflows/lint-markdown.yml"
   pull_request:
     paths:
       - "**.md"
       - "check-markdown-links.py"
       - "list-lint-files.sh"
+      - "reference-clones.tsv"
       - ".mdlrc"
       - ".mdl_style.rb"
+      - ".lint-versions"
+      - "lint-versions.sh"
       - ".github/workflows/lint-markdown.yml"
+
+# bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit and its parent, for the scope check below.
+          fetch-depth: 2
 
-      - name: Install mdl
-        # --user-install: the runner's system gem dir isn't writable by the
-        # non-root runner user.
+      - name: Check whether markdown linting applies
+        # The path filter above fires on any .lint-versions change, but only
+        # its mdl line matters here -- not the hook's automatic
+        # shellcheck/shfmt bumps or a hand-set ruff -- and a filter can't
+        # read a file's lines. So: run unless every changed file that
+        # matches a path filter (read from this file, so the two can't
+        # drift) is .lint-versions with its mdl version unchanged. Anything
+        # uncertain -- another event, no base commit (a new branch), one
+        # that can't be fetched (a force push), a git or parse failure --
+        # means a full run.
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
-          gem install --no-document --user-install mdl
-          echo "$(ruby -e 'puts Gem.user_dir')/bin" >> "$GITHUB_PATH"
+          run=true
+          base=""
+          case "$EVENT" in
+          push) base=$BEFORE ;;
+          pull_request) base=$(git rev-parse -q --verify 'HEAD^1') || base="" ;;
+          esac
+          changed="$RUNNER_TEMP/changed-files"
+          if [ -n "$base" ] && [ "$base" != 0000000000000000000000000000000000000000 ] &&
+            { git cat-file -e "$base^{commit}" 2>/dev/null ||
+              git fetch -q --no-tags --depth=1 origin "$base"; } &&
+            git -c core.quotePath=false diff --name-only -z "$base" HEAD -- >"$changed" &&
+            filters=$(ruby -ryaml -e 'w = YAML.safe_load(File.read(ARGV[0])); puts (w["on"] || w[true])["push"]["paths"]' \
+              .github/workflows/lint-markdown.yml) && [ -n "$filters" ]; then
+            run=false
+            # shellcheck source=/dev/null
+            source ./lint-versions.sh
+            while IFS= read -r -d '' f; do
+              while IFS= read -r pattern; do
+                # Bash's * also matches /, so this can only over-match.
+                # shellcheck disable=SC2053
+                [[ $f == $pattern ]] || continue
+                if [ "$f" = .lint-versions ]; then
+                  old=$(git show "$base:.lint-versions" 2>/dev/null | lv_parse mdl) || old=""
+                  new=$(lv_parse mdl <.lint-versions) || new=""
+                  if [ -n "$old" ] && [ "$old" = "$new" ]; then
+                    continue
+                  fi
+                fi
+                run=true
+              done <<<"$filters"
+            done <"$changed"
+          fi
+          echo "run=$run" >>"$GITHUB_OUTPUT"
+          if [ "$run" = false ]; then
+            echo "No markdown-relevant change (only non-mdl lines of .lint-versions) -- skipping the markdown checks."
+          fi
+
+      - name: Install mdl at the version in .lint-versions
+        if: steps.scope.outputs.run == 'true'
+        # --user-install: the runner's system gem dir isn't writable by the
+        # non-root runner user. The version is set by hand in .lint-versions,
+        # like ruff's, so CI and the hook run the same mdl.
+        run: |
+          v=$(./lint-versions.sh get mdl)
+          gem install --no-document --user-install mdl -v "$v"
+          gem_bin="$(ruby -e 'puts Gem.user_dir')/bin"
+          installed=$("$gem_bin/mdl" --version)
+          if [ "$installed" != "$v" ]; then
+            echo "::error::installed mdl $installed, but .lint-versions says $v"
+            exit 1
+          fi
+          echo "$gem_bin" >> "$GITHUB_PATH"
+
+      - name: List the markdown files
+        if: steps.scope.outputs.run == 'true'
+        # NUL-separated, via a file so a lister failure fails the step (it
+        # also fails on an empty list rather than lint nothing).
+        run: ./list-lint-files.sh -z markdown >"$RUNNER_TEMP/markdown-files"
 
       - name: mdl
+        if: steps.scope.outputs.run == 'true'
         run: |
-          mapfile -t files < <(./list-lint-files.sh markdown)
+          mapfile -d '' -t files <"$RUNNER_TEMP/markdown-files"
           mdl "${files[@]}"
 
       - name: check-markdown-links.py
+        if: steps.scope.outputs.run == 'true'
         run: |
-          mapfile -t files < <(./list-lint-files.sh markdown)
+          mapfile -d '' -t files <"$RUNNER_TEMP/markdown-files"
           python3 check-markdown-links.py "${files[@]}"

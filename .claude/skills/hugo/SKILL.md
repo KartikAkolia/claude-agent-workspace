@@ -53,9 +53,9 @@ Use `--source`, `--config`, `--environment`, or `--destination` only when the re
 ## Assets And Data
 
 - Understand the asset boundary:
-  - `assets/` is processed by Hugo Pipes.
-  - `static/` is copied directly to the published site.
-  - `public/` is generated output and is usually not source.
+   - `assets/` is processed by Hugo Pipes.
+   - `static/` is copied directly to the published site.
+   - `public/` is generated output and is usually not source.
 - For SCSS, JS, fonts, and images, follow the existing pipeline rather than adding a new package manager or bundler.
 - For image processing, check config and template use of `.Resources`, `resources.Get`, `Fit`, `Fill`, `Resize`, WebP, and fingerprinting before changing paths.
 - For `data/` files, keep JSON/YAML/TOML valid and preserve the shape consumed by templates.

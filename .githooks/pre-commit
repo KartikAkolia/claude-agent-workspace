@@ -1,127 +1,200 @@
 #!/usr/bin/env bash
 # Lints staged markdown with mdl and checks local cross-references for rot;
 # validates staged JSON/YAML config parses cleanly; and runs
-# lint-bash.sh/lint-python.sh over staged bash and Python files, before
-# allowing a commit. When a commit changes a linter's version in
-# .lint-versions, every file of that kind is linted with it (as CI will),
-# even if none is staged; and lint-bash.sh may write a newer installed
-# version of either bash linter into .lint-versions and fail until that's
-# staged (see lint-versions.sh). Skips the read-only ChrisTitusTech
-# reference clones and vendored/tool-generated content (see AGENTS.md
-# non-negotiable #1).
+# lint-bash.sh/lint-python.sh over staged shell (bash and POSIX sh) and
+# Python files, before allowing a commit. Which files count as which comes
+# from list-lint-files.sh, the same rules the full sweep and CI use, and it
+# skips the read-only ChrisTitusTech reference clones (see AGENTS.md
+# non-negotiable #1) and vendored node_modules content. When a commit
+# changes a linter's version in .lint-versions, every file of that kind is
+# linted with it (as CI will), even if none is staged; and the sync step may
+# write a newer installed version of either shell linter into .lint-versions
+# and fail until that's staged (see lint-versions.sh). When a commit deletes
+# or renames a file, every tracked markdown file's links are checked, since
+# any of them could point at it.
+#
+# It lints exactly what the commit contains, with exactly the tooling and
+# config it contains: the index (every tracked file but the reference
+# clones) is exported to a temporary directory, and the index's own copy of
+# this hook runs there, calling the index's copies of the lint scripts and
+# reading the index's .mdlrc, .shellcheckrc and so on. Unstaged edits,
+# partial staging (git add -p) and untracked files make no difference: an
+# unstaged fix doesn't hide a staged error, and an unrelated unstaged edit
+# doesn't block a commit. git still reads the real repository (GIT_DIR) and
+# sees the export as its work tree, so the link check and the version
+# checks see this commit's index and HEAD. The one step run against the
+# working tree is lint-versions.sh's sync, which keeps .lint-versions there
+# at the newest installed shellcheck/shfmt -- the only thing the hook ever
+# writes. Paths in its messages are repo-relative.
 # Config: ../.mdlrc, ../.mdl_style.rb
 set -uo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root" || exit 1
+if [ -z "${LINT_HOOK_EXPORT:-}" ]; then
+	# The hook git runs, from the working tree: export the index, then run
+	# the index's copy of this script there (below).
+	self=$(realpath -- "${BASH_SOURCE[0]}") || exit 1
+	repo_root="$(git rev-parse --show-toplevel)" || exit 1
+	cd "$repo_root" || exit 1
+	git_dir=$(git rev-parse --absolute-git-dir) || exit 1
+	# git commit <paths> and -a point GIT_INDEX_FILE at a temporary index,
+	# maybe as a relative path; the inner run works from elsewhere.
+	case "${GIT_INDEX_FILE:-}" in
+	"" | /*) ;;
+	*) export GIT_INDEX_FILE="$repo_root/$GIT_INDEX_FILE" ;;
+	esac
+	tmp=$(mktemp -d) || exit 1
+	trap 'rm -rf "$tmp"' EXIT
+	export_dir="$tmp/index"
+	# The clones (thousands of files) aren't linted, so they aren't
+	# exported. Which dirs they are comes from the canonical validator: the
+	# index's own list-lint-files.sh, run on the index's reference-clones.tsv,
+	# both exported on their own first -- so a malformed list fails here,
+	# with the lister's message, rather than excluding the wrong paths.
+	meta="$tmp/meta"
+	excludes=()
+	index_lister=$(git cat-file blob :0:list-lint-files.sh 2>/dev/null)
+	if [[ $index_lister != *--reference-clones* ]] &&
+		! git cat-file -e :0:reference-clones.tsv 2>/dev/null; then
+		# The index's tooling predates reference-clones.tsv (the commit
+		# bringing it in is still to come): nothing to exclude by, so the
+		# whole index is exported and its own, older hook runs.
+		# Transitional: once the commit that adds reference-clones.tsv is on
+		# master and no branch based on an older master is still open, delete
+		# this branch and fail like the missing-file case below.
+		:
+	elif ! git checkout-index --prefix="$meta/" -- list-lint-files.sh reference-clones.tsv 2>"$tmp/err"; then
+		printf 'pre-commit: this commit needs list-lint-files.sh and reference-clones.tsv, which every lint gate reads:\n' >&2
+		cat "$tmp/err" >&2
+		exit 1
+	elif ! bash "$meta/list-lint-files.sh" --reference-clones >"$tmp/clones" 2>"$tmp/err"; then
+		printf 'pre-commit: the staged reference-clones.tsv is not valid:\n' >&2
+		sed "s|$meta/||g" "$tmp/err" >&2
+		exit 1
+	else
+		while IFS=$'\t' read -r dir _; do
+			excludes+=(":(exclude)$dir")
+		done <"$tmp/clones"
+	fi
+	if ! git ls-files -z -- "${excludes[@]}" >"$tmp/paths" ||
+		! git checkout-index -z --stdin --prefix="$export_dir/" <"$tmp/paths"; then
+		printf 'pre-commit: could not export the index to lint it\n' >&2
+		exit 1
+	fi
+	if [ ! -s "$tmp/paths" ] || [ ! -d "$export_dir" ]; then
+		printf 'pre-commit: exporting the index to lint it produced no files -- check reference-clones.tsv and git ls-files\n' >&2
+		exit 1
+	fi
+	inner="$export_dir/.githooks/pre-commit"
+	# A commit that drops this hook from the index still gets linted, by
+	# the working tree's copy.
+	[ -x "$inner" ] || inner=$self
+	LINT_HOOK_REPO="$repo_root" LINT_HOOK_EXPORT="$export_dir" GIT_DIR="$git_dir" \
+		"$inner" 2>&1 | sed "s|$export_dir/||g"
+	exit "${PIPESTATUS[0]}"
+fi
 
-exclude_dirs=(dwm-titus-main linutil-main titus-ai-main website-master winutil-main)
+# The index's copy of this hook, in the export: everything below reads the
+# export, and git reads the real repository with the export as work tree.
+real_root=$LINT_HOOK_REPO
+if ! cd "$LINT_HOOK_EXPORT"; then
+	printf 'pre-commit: cannot enter the export of the index (%s)\n' "$LINT_HOOK_EXPORT" >&2
+	exit 1
+fi
+export GIT_WORK_TREE="$LINT_HOOK_EXPORT" GIT_OPTIONAL_LOCKS=0
 
-is_reference_clone() {
-	local f="$1" dir
-	for dir in "${exclude_dirs[@]}"; do
-		case "$f" in
-		"$dir"/*) return 0 ;;
+# The same path rules as the full sweep and CI: llf_excluded (reference
+# clones, node_modules), llf_name_category, llf_file_shell and
+# llf_read_list. Linted on its own, so not followed here.
+# shellcheck source=/dev/null
+source ./list-lint-files.sh || exit 1
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+# Paths this commit adds or changes (ACMR) and deletes or renames away
+# (DR), NUL separated. Via files, not < <(...), so a git failure fails the
+# commit.
+if ! git diff --cached --name-only -z --diff-filter=ACMR >"$tmp/staged" ||
+	! git diff --cached --name-only -z --diff-filter=DR >"$tmp/removed"; then
+	printf 'pre-commit: could not compare the index with HEAD\n' >&2
+	exit 1
+fi
+
+# Sorts the staged paths into the lint lists: by extension, else (shell
+# scripts) by shebang.
+md_files=() config_files=() shell_files=() python_files=()
+while IFS= read -r -d '' f; do
+	llf_excluded "$f" && continue
+	if llf_name_category "$f"; then
+		case "$LLF_CATEGORY" in
+		markdown) md_files+=("$f") ;;
+		config) config_files+=("$f") ;;
+		python) python_files+=("$f") ;;
 		esac
-	done
-	return 1
-}
+	elif llf_file_shell "$f"; then
+		shell_files+=("$f")
+	fi
+done <"$tmp/staged"
 
-mapfile -t staged_md < <(git diff --cached --name-only --diff-filter=ACMR -- '*.md')
-md_files=()
-for f in "${staged_md[@]}"; do
-	skip=0
-	case "$f" in
-	.*/*) skip=1 ;;
-	*/node_modules/*) skip=1 ;;
-	esac
-	is_reference_clone "$f" && skip=1
-	[ "$skip" -eq 0 ] && [ -f "$f" ] && md_files+=("$f")
-done
+# Set by any failure before linting starts (a git error, a file list that
+# can't be built), so the commit fails. One is enough; version_changed
+# doesn't repeat its git error per tool.
+setup_error=0
 
-mapfile -t staged_config < <(git diff --cached --name-only --diff-filter=ACMR -- '*.json' '*.yml' '*.yaml')
-config_files=()
-for f in "${staged_config[@]}"; do
-	skip=0
-	case "$f" in
-	*/node_modules/*) skip=1 ;;
-	esac
-	is_reference_clone "$f" && skip=1
-	[ "$skip" -eq 0 ] && [ -f "$f" ] && config_files+=("$f")
-done
-
-# Bash scripts aren't reliably *.sh (e.g. .githooks/pre-commit has no
-# extension), so find them by shebang instead of extension.
-mapfile -t staged_all < <(git diff --cached --name-only --diff-filter=ACMR)
-bash_files=()
-for f in "${staged_all[@]}"; do
-	skip=0
-	case "$f" in
-	*/node_modules/*) skip=1 ;;
-	esac
-	is_reference_clone "$f" && skip=1
-	[ "$skip" -eq 1 ] && continue
-	[ -f "$f" ] || continue
-	IFS= read -r first_line <"$f" 2>/dev/null || continue
-	case "$first_line" in
-	'#!'*bash) bash_files+=("$f") ;;
-	esac
-done
-
-mapfile -t staged_py < <(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
-python_files=()
-for f in "${staged_py[@]}"; do
-	skip=0
-	case "$f" in
-	*/node_modules/*) skip=1 ;;
-	esac
-	is_reference_clone "$f" && skip=1
-	[ "$skip" -eq 0 ] && [ -f "$f" ] && python_files+=("$f")
-done
+# A deletion or rename can break a link in any file, staged or not, so then
+# every tracked markdown file's links are re-checked (from the index, so an
+# unstaged edit doesn't count), not just the staged files'.
+link_files=("${md_files[@]}")
+if [ -s "$tmp/removed" ]; then
+	if llf_read_list markdown link_files; then
+		printf 'pre-commit: this commit deletes or renames files -- checking the links in every markdown file\n' >&2
+	else
+		printf 'pre-commit: could not list the markdown files to check links in\n' >&2
+		setup_error=1
+	fi
+fi
 
 # A commit that changes a linter's version in .lint-versions gets every
 # file of that kind linted with it, as CI will -- not just the staged ones,
 # and even when no file of that kind is staged at all. Runs before the
 # nothing-to-lint early exit below, since a commit of .lint-versions alone
 # stages nothing else.
-version_error=0
 
 # 0 if this commit changes $1's version, 1 if not. A git read error is
 # flagged (failing the commit) rather than read as "unchanged".
 version_changed() {
 	local rc
-	# One git failure is enough to fail the commit; don't repeat it per tool.
-	[ "$version_error" -eq 0 ] || return 1
-	"$repo_root/lint-versions.sh" changed "$1"
+	[ "$setup_error" -eq 0 ] || return 1
+	./lint-versions.sh changed "$1"
 	rc=$?
 	[ "$rc" -le 1 ] && return "$rc"
 	printf 'pre-commit: could not tell whether this commit changes %s in .lint-versions\n' "$1" >&2
-	version_error=1
+	setup_error=1
 	return 1
 }
 
-# Replaces array $2 with every tracked $1-category file still on disk.
-# Not mapfile < <(...), which would hide a list-lint-files.sh failure.
+# Replaces array $2 with every tracked $1-category file.
 use_all_lint_files() {
-	local list f
-	if ! list=$("$repo_root/list-lint-files.sh" "$1"); then
+	local f listed=()
+	if ! llf_read_list "$1" listed; then
 		printf 'pre-commit: could not list the %s files to re-lint\n' "$1" >&2
-		version_error=1
+		setup_error=1
 		return
 	fi
 	local -n files_ref="$2"
 	files_ref=()
-	while IFS= read -r f; do
-		[ -n "$f" ] && [ -f "$f" ] && files_ref+=("$f")
-	done <<<"$list"
+	for f in "${listed[@]}"; do
+		[ -f "$f" ] && files_ref+=("$f")
+	done
 }
 
 # For shellcheck/shfmt, lint-bash.sh decides whether a full re-lint means
 # anything -- only when the installed tool is the version CI will run, not
-# an older one -- so this only makes sure it runs, even with no bash file
-# staged.
+# an older one -- so this only makes sure it runs, even with no shell
+# script staged.
 bash_versions_changed=0
 ruff_version_changed=0
+mdl_version_changed=0
 # None of it applies unless this commit touches .lint-versions at all (a
 # deletion counts: --cached diffs against HEAD).
 if ! git diff --cached --quiet -- .lint-versions; then
@@ -133,16 +206,23 @@ if ! git diff --cached --quiet -- .lint-versions; then
 		printf 'pre-commit: this commit changes ruff in .lint-versions -- linting every .py file, as CI will\n' >&2
 		use_all_lint_files python python_files
 	fi
+	if version_changed mdl; then
+		mdl_version_changed=1
+		printf 'pre-commit: this commit changes mdl in .lint-versions -- checking every markdown file, as CI will\n' >&2
+		use_all_lint_files markdown md_files
+		llf_read_list markdown link_files || setup_error=1
+	fi
 fi
 
-if [ "${#md_files[@]}" -eq 0 ] && [ "${#config_files[@]}" -eq 0 ] &&
-	[ "${#bash_files[@]}" -eq 0 ] && [ "${#python_files[@]}" -eq 0 ] &&
+if [ "${#md_files[@]}" -eq 0 ] && [ "${#link_files[@]}" -eq 0 ] &&
+	[ "${#config_files[@]}" -eq 0 ] && [ "${#shell_files[@]}" -eq 0 ] &&
+	[ "${#python_files[@]}" -eq 0 ] &&
 	[ "$bash_versions_changed" -eq 0 ] && [ "$ruff_version_changed" -eq 0 ] &&
-	[ "$version_error" -eq 0 ]; then
+	[ "$mdl_version_changed" -eq 0 ] && [ "$setup_error" -eq 0 ]; then
 	exit 0
 fi
 
-status=$version_error
+status=$setup_error
 
 if [ "${#md_files[@]}" -gt 0 ]; then
 	if ! command -v mdl >/dev/null 2>&1; then
@@ -154,42 +234,63 @@ if [ "${#md_files[@]}" -gt 0 ]; then
 			"$gem_bin" >&2
 		status=1
 	else
-		# See lint-markdown.sh for why: don't trust the script's own python3
-		# shebang -- Windows's App Execution Alias stub can shadow a real
-		# interpreter.
-		py=""
-		for candidate in python3 python; do
-			if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
-				py="$candidate"
-				break
-			fi
-		done
-		if [ -z "$py" ]; then
-			printf 'pre-commit: no working python3/python interpreter found on PATH\n' >&2
-			status=1
-		else
-			mdl "${md_files[@]}" || status=1
-			"$py" "$repo_root/check-markdown-links.py" "${md_files[@]}" || status=1
+		# CI installs exactly the mdl in .lint-versions; a different local
+		# one may disagree with it.
+		mdl_pinned=$(./lint-versions.sh get mdl 2>/dev/null)
+		mdl_installed=$(mdl --version 2>/dev/null | tr -d '\r')
+		if [ -n "$mdl_pinned" ] && [ "$mdl_installed" != "$mdl_pinned" ]; then
+			printf 'pre-commit: warning: installed mdl %s is not the %s CI runs (.lint-versions) -- CI may disagree with this run\n' \
+				"${mdl_installed:-<unknown>}" "$mdl_pinned" >&2
 		fi
+		mdl "${md_files[@]}" || status=1
+	fi
+fi
+
+if [ "${#link_files[@]}" -gt 0 ]; then
+	# See lint-markdown.sh for why: don't trust the script's own python3
+	# shebang -- Windows's App Execution Alias stub can shadow a real
+	# interpreter.
+	py=""
+	for candidate in python3 python; do
+		if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+			py="$candidate"
+			break
+		fi
+	done
+	if [ -z "$py" ]; then
+		printf 'pre-commit: no working python3/python interpreter found on PATH\n' >&2
+		status=1
+	else
+		# --index: check what this commit contains -- staged files, and
+		# targets that are in the index, not just on disk.
+		# --real-root: a target outside the repo is looked for beside the
+		# real checkout, not beside this export.
+		"$py" ./check-markdown-links.py --index --real-root "$real_root" "${link_files[@]}" || status=1
 	fi
 fi
 
 if [ "${#config_files[@]}" -gt 0 ]; then
-	"$repo_root/validate-config.sh" "${config_files[@]}" || status=1
+	./validate-config.sh "${config_files[@]}" || status=1
 fi
 
-if [ "${#bash_files[@]}" -gt 0 ] || [ "$bash_versions_changed" -eq 1 ]; then
-	# sync: bump .lint-versions to a newer installed shellcheck/shfmt,
-	# require it staged, and re-lint every bash script when this commit
-	# changes a version (see lint-versions.sh). Runs with no files too.
-	LINT_VERSIONS_MODE=sync "$repo_root/lint-bash.sh" "${bash_files[@]}" || status=1
+if [ "${#shell_files[@]}" -gt 0 ] || [ "$bash_versions_changed" -eq 1 ]; then
+	# The one step that works on the working tree: bump .lint-versions
+	# there to a newer installed shellcheck/shfmt and fail until it's
+	# staged (see "Sync mode" in lint-versions.sh). It's the index's
+	# lint-versions.sh, pointed at the real checkout; GIT_WORK_TREE is
+	# dropped so git sees that checkout as the work tree.
+	env -u GIT_WORK_TREE LINT_VERSIONS_DIR="$real_root" LINT_VERSIONS_MODE=sync \
+		./lint-versions.sh sync || status=1
+	# Then lint the export with the versions this commit gives CI, and
+	# re-lint every shell script when it changes one (index mode).
+	LINT_VERSIONS_MODE=index ./lint-bash.sh "${shell_files[@]}" || status=1
 fi
 
 if [ "${#python_files[@]}" -gt 0 ] || [ "$ruff_version_changed" -eq 1 ]; then
-	# sync: lint with the ruff version this commit will contain, which is
+	# index: lint with the ruff version this commit will contain, which is
 	# what lint-python.yml reads (see lint-python.sh). Runs with no files
 	# too when ruff changes, so the new ruff line is still checked.
-	LINT_VERSIONS_MODE=sync "$repo_root/lint-python.sh" "${python_files[@]}" || status=1
+	LINT_VERSIONS_MODE=index ./lint-python.sh "${python_files[@]}" || status=1
 fi
 
 exit "$status"
