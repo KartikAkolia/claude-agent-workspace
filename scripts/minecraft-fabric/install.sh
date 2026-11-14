@@ -34,6 +34,8 @@
 #     --yes              take the default for every unanswered question
 #                        (never accepts the EULA or opens the firewall)
 #
+# Run it as a normal user. sudo is needed only for a system unit, package
+# installs, firewall changes and stopping a system unit for this directory.
 # Java listens on TCP 25565; Geyser on UDP 19132 for gameplay and TCP 19132
 # for NetherNet signaling.
 
@@ -131,38 +133,45 @@ as_owner() {
 }
 
 # place SRC DEST MODE — copy beside the destination, then rename atomically.
+# The owner does every step and the installer only opens SRC: root never
+# writes inside a system-mode server tree, where $SYSTEM_USER could swap a
+# path for a symlink to somewhere else between two steps.
 place() (
 	# This subshell owns its cleanup variable even after callers unwind on error.
 	place_staged=$(as_owner mktemp "$(dirname "$2")/.install-file.XXXXXX") || return
-	trap 'as_owner rm -f -- "$place_staged" || true' EXIT
-	if [[ $service_mode == system ]]; then
-		sudo install -o "$SYSTEM_USER" -g "$system_group" -m "$3" "$1" "$place_staged" || return
-	else
-		install -m "$3" "$1" "$place_staged" || return
-	fi
-	as_owner mv -fT -- "$place_staged" "$2"
+	# Cleanup only while the staged file still exists: after the rename it's
+	# gone, and an extra `sudo -u` rm per placed file is pure overhead.
+	trap '[[ -z "$place_staged" ]] || as_owner rm -f -- "$place_staged" || true' EXIT
+	as_owner tee -- "$place_staged" <"$1" >/dev/null || return
+	as_owner chmod -- "$3" "$place_staged" || return
+	as_owner mv -fT -- "$place_staged" "$2" || return
+	place_staged=""
 )
 
-# Keep artifact backups private to the installer, including in system mode.
-artifact_cmd() {
-	if [[ $service_mode == system ]]; then sudo "$@"; else "$@"; fi
-}
+# Artifact backups are read by the owner into the installer's private $tmp
+# and restored through place, so neither step needs root.
 remember_artifact() {
-	local dest=$1 backup=''
+	local dest=$1 backup='' mode=''
 	[[ ! ${saved_artifacts[$dest]+saved} ]] || return 0
-	if as_owner test -e "$dest" || as_owner test -L "$dest"; then
+	if as_owner test -L "$dest"; then
+		backup=$tmp/artifact.${#artifact_paths[@]} mode=link
+		as_owner readlink -- "$dest" >"$backup" || return
+	elif as_owner test -e "$dest"; then
 		backup=$tmp/artifact.${#artifact_paths[@]}
-		artifact_cmd cp -a -- "$dest" "$backup" || return
+		mode=$(as_owner stat -c %a -- "$dest") || return
+		as_owner cat -- "$dest" >"$backup" || return
 	fi
-	printf '%s\t%s\n' "$dest" "$backup" >>"$tmp/recovery-map"
+	printf '%s\t%s\t%s\n' "$dest" "$backup" "$mode" >>"$tmp/recovery-map"
 	saved_artifacts[$dest]=1
-	artifact_paths+=("$dest") artifact_backups+=("$backup")
+	artifact_paths+=("$dest") artifact_backups+=("$backup") artifact_modes+=("$mode")
 }
 rollback_artifacts() {
 	local i failed=false
 	for ((i = ${#artifact_paths[@]} - 1; i >= 0; i--)); do
-		if [[ -n ${artifact_backups[i]} ]]; then
-			artifact_cmd mv -fT -- "${artifact_backups[i]}" "${artifact_paths[i]}" || failed=true
+		if [[ ${artifact_modes[i]} == link ]]; then
+			as_owner ln -sfnT -- "$(<"${artifact_backups[i]}")" "${artifact_paths[i]}" || failed=true
+		elif [[ -n ${artifact_backups[i]} ]]; then
+			place "${artifact_backups[i]}" "${artifact_paths[i]}" "${artifact_modes[i]}" || failed=true
 		else
 			as_owner rm -f -- "${artifact_paths[i]}" || failed=true
 		fi
@@ -206,7 +215,7 @@ pkg_install() {
 	apt-get) sudo apt-get install -y "$@" ;;
 	dnf) sudo dnf install -y "$@" ;;
 	zypper) sudo zypper -n install "$@" ;;
-	esac
+	esac && sudo_ready=true
 }
 
 pm=$(detect_pm) || pm=
@@ -218,12 +227,22 @@ apt_update_once() {
 	fi
 }
 
+# need_sudo WHY — sudo is only required on the paths that use it, so a
+# user-mode or start.sh-only install works without it. sudo_ready records
+# that this run already authenticated it (system mode, package installs),
+# so a read-only check may use sudo -n without a new prompt.
+sudo_ready=false
+need_sudo() {
+	command -v sudo >/dev/null || die "sudo isn't installed, and it's needed to $1; install it, or do that by hand and rerun"
+}
+
 missing=()
-for cmd in curl python3 sha512sum sudo; do
+for cmd in curl python3 sha512sum; do
 	command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 if ((${#missing[@]})); then
-	[[ -n $pm && ! " ${missing[*]} " =~ \ sudo\  ]] || die "missing: ${missing[*]}; install them and rerun"
+	[[ -n $pm ]] || die "missing: ${missing[*]}; install them and rerun"
+	need_sudo "install ${missing[*]}"
 	confirm "Missing ${missing[*]}. Install with $pm?" y || die "missing: ${missing[*]}"
 	pkgs=()
 	for cmd in "${missing[@]}"; do
@@ -240,7 +259,7 @@ fi
 
 tmp=$(mktemp -d)
 boot_pid='' boot_stop_failed=false
-artifacts_pending=false artifact_paths=() artifact_backups=()
+artifacts_pending=false artifact_paths=() artifact_backups=() artifact_modes=()
 declare -A saved_artifacts
 # Whatever way the script ends, a first-boot server must not outlive it.
 finished=false stopped_units=()
@@ -343,10 +362,11 @@ in_home() {
 # peek CMD... — read from an existing install. A system-mode one belongs to
 # $SYSTEM_USER with mode 750, so fall back to sudo only when the directory
 # exists but is closed to us (not when it or the file is simply missing).
+# CMD gets no stdin: it may run twice, and the first try would use it up.
 peek() {
-	"$@" 2>/dev/null && return
+	"$@" </dev/null 2>/dev/null && return
 	[[ -d $server_dir && ! (-r $server_dir && -x $server_dir) ]] || return 1
-	sudo "$@" 2>/dev/null
+	sudo "$@" </dev/null 2>/dev/null
 }
 
 read_geyser_ports() {
@@ -453,6 +473,7 @@ user | system) $have_systemd || die "systemd isn't running here; use --service n
 none) ;;
 *) die "--service must be user, system or none" ;;
 esac
+[[ $service_mode != system ]] || need_sudo "run a system unit"
 if [[ $service_mode == user ]] && ! systemctl --user show-environment >/dev/null 2>&1; then
 	die "no systemd user session (common over su or some SSH setups); log in directly or use --service system"
 fi
@@ -632,6 +653,7 @@ find_java() {
 
 if ! find_java; then
 	[[ -n $pm ]] || die "Minecraft $mc_version needs Java $java_required or newer; install it and rerun"
+	need_sudo "install Java $java_required"
 	case $pm in
 	pacman) candidates=("jre$java_required-openjdk-headless" jre-openjdk-headless) ;;
 	apt-get) candidates=("openjdk-$java_required-jre-headless") ;;
@@ -709,8 +731,10 @@ for slug in "${wanted_mods[@]}"; do
 			[[ $old != "$recorded" ]] || managed=true
 		done
 		$managed && continue
-		if [[ $old == "$filename" ]] && peek sha512sum -c --status <<<"$sha512  $server_dir/mods/$old"; then
-			continue
+		if [[ $old == "$filename" ]]; then
+			# A checklist file, not stdin, which peek doesn't pass on.
+			printf '%s  %s\n' "$sha512" "$server_dir/mods/$old" >"$tmp/adopt.sha512"
+			peek sha512sum -c --status "$tmp/adopt.sha512" && continue
 		fi
 		die "unmanaged mods/$old conflicts with $slug; move it out of mods/ before rerunning (it has been left untouched)"
 	done <<<"$jars"
@@ -763,6 +787,7 @@ confirm "Proceed with the install?" y || die "cancelled"
 
 if [[ $service_mode == system ]]; then
 	sudo -v
+	sudo_ready=true
 	if ! id -u "$SYSTEM_USER" >/dev/null 2>&1; then
 		info "Creating system user $SYSTEM_USER"
 		sudo useradd --system --user-group --home-dir "$server_dir" --no-create-home \
@@ -855,6 +880,7 @@ if $have_systemd; then
 			[[ $scope == system ]] || $user_bus ||
 				die "$file also serves $server_dir, but there's no user systemd session here to stop or remove it; rerun from a normal login"
 		fi
+		[[ $scope == user ]] || need_sudo "stop the system unit $file"
 		state=$(state_in "$scope") || die "can't inspect the $scope unit $UNIT_NAME"
 		[[ -n $state ]] || die "no state reported for the $scope unit $UNIT_NAME"
 		if [[ $state != inactive && $state != failed ]]; then
@@ -956,17 +982,47 @@ fi
 
 # Geyser writes its config on first start with auth-type: online. With
 # Floodgate, point it at Floodgate (key.pem is shared automatically on the
-# same server); without, put it back to online in case Floodgate was dropped.
+# same server). Without, undo only a floodgate left from a Floodgate server,
+# so a deliberate offline (or online) stays.
 geyser_config=$server_dir/config/Geyser-Fabric/config.yml
+# set_geyser_auth TYPE [FROM] — set Geyser's java.auth-type (remote.auth-type
+# in older configs; no other key) to TYPE, or only while it is FROM. Fails
+# only when the config doesn't exist yet.
 set_geyser_auth() {
+	local found line current
 	as_owner test -f "$geyser_config" || return 1
-	as_owner sed -i -E "s/^(\s*auth-type:).*/\1 $1/" "$geyser_config"
-	as_owner grep -qE "^\s*auth-type: $1\s*$" "$geyser_config" ||
-		die "couldn't set auth-type: $1 in $geyser_config (has its layout changed?); set it by hand"
+	# Print the key's line number and value, or 0 when the config has none.
+	found=$(as_owner cat -- "$geyser_config" | python3 -Ic '
+import re, sys
+stack = []
+for number, line in enumerate(sys.stdin, 1):
+    match = re.fullmatch(r"( *)([\w-]+):(?:\s+(.*))?\s*", line.rstrip())
+    if not match:
+        continue
+    indent, key, value = match.groups()
+    while stack and stack[-1][0] >= len(indent):
+        stack.pop()
+    path = ".".join([entry[1] for entry in stack] + [key])
+    value = (value or "").split("#", 1)[0].strip()
+    if value and path in ("java.auth-type", "remote.auth-type"):
+        print(number, value.strip("\"\x27").lower())
+        sys.exit()
+    if not value:
+        stack.append((len(indent), key))
+print(0)') || die "couldn't read $geyser_config"
+	read -r line current <<<"$found"
+	if ((line == 0)); then
+		# Geyser's default is online, so there's nothing to undo.
+		[[ -z ${2:-} ]] || return 0
+		die "couldn't find auth-type in $geyser_config (has its layout changed?); set it to $1 by hand"
+	fi
+	[[ $current != "$1" && (-z ${2:-} || $current == "$2") ]] || return 0
+	as_owner sed -i -E "${line}s/^( *auth-type:).*/\1 $1/" "$geyser_config" ||
+		die "couldn't set auth-type: $1 in $geyser_config; set it by hand"
 }
 case $server_type in
 floodgate) set_geyser_auth floodgate || needs_first_boot=true ;;
-geyser) set_geyser_auth online || true ;;
+geyser) set_geyser_auth online floodgate || true ;;
 esac
 
 # systemd_quote ARG... — join arguments for a unit file. systemd has its own
@@ -1052,6 +1108,13 @@ After=network-online.target"
 		cat <<EOF
 [Unit]
 Description=Minecraft $mc_version Fabric server ($server_type)
+# RestartSec=10 spaces restarts out, so systemd's default limit (5 starts in
+# 10 s) never trips and a crashing server restarts forever. With 5 starts in
+# 10 minutes, the 6th start is refused when 5 x (uptime + 10 s) < 600 s, i.e.
+# for a server that keeps dying within about 110 s of starting.
+# Manual starts count too; systemctl reset-failed clears the count.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 ${ordering}
 
 [Service]
@@ -1086,17 +1149,35 @@ if [[ $server_type != java ]]; then
 	ports+=("$bedrock_port/udp")
 	((signaling_port == 0)) || ports+=("$signaling_port/tcp")
 fi
+# firewall_note — printed with the addresses, which may not be reachable.
+firewall_note=''
 if systemctl is-active -q firewalld 2>/dev/null; then
-	if confirm "firewalld is active. Open ${ports[*]} permanently in its default zone?" n; then
+	if command -v sudo >/dev/null && confirm "firewalld is active. Open ${ports[*]} permanently in its default zone?" n; then
 		for p in "${ports[@]}"; do sudo firewall-cmd -q --permanent --add-port="$p"; done
 		sudo firewall-cmd -q --reload
 		info "Opened ${ports[*]}; undo with: sudo firewall-cmd --permanent --remove-port=PORT/PROTO && sudo firewall-cmd --reload"
+	else
+		firewall_note="firewalld is active and this run didn't open ${ports[*]}; unless they're already open, other machines can't connect"
 	fi
 elif systemctl is-active -q ufw 2>/dev/null && grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf; then
-	if confirm "ufw is active. Allow ${ports[*]}?" n; then
+	if command -v sudo >/dev/null && confirm "ufw is active. Allow ${ports[*]}?" n; then
 		for p in "${ports[@]}"; do sudo ufw allow "$p"; done
 		info "Allowed ${ports[*]}; undo with: sudo ufw delete allow PORT/PROTO"
+	else
+		firewall_note="ufw is active and this run didn't allow ${ports[*]}; unless they're already allowed, other machines can't connect"
 	fi
+# Other firewalls are only reported. Reading the nftables ruleset needs root,
+# so sudo -n is tried only when this run already uses sudo (it never adds a
+# prompt). Unread, an active firewall service is the best sign available.
+elif ruleset=$(nft list ruleset 2>/dev/null || { $sudo_ready && sudo -n nft list ruleset 2>/dev/null; }); then
+	! grep -Eq 'hook input .*policy drop' <<<"$ruleset" ||
+		firewall_note="an nftables input chain drops unmatched traffic; unless it allows ${ports[*]}, other machines can't connect"
+else
+	for fw_unit in nftables iptables; do
+		systemctl is-active -q "$fw_unit" 2>/dev/null || continue
+		firewall_note="$fw_unit.service is active and its ruleset can't be read without root; make sure it allows ${ports[*]}, or other machines can't connect"
+		break
+	done
 fi
 
 # --- first boot --------------------------------------------------------------
@@ -1211,6 +1292,21 @@ fi
 
 # --- start -------------------------------------------------------------------
 
+# stays_up — systemctl start returns once the JVM forks (Type=simple), so
+# watch the unit for a while: a server that dies at once (a bad flag, a mod
+# that won't load) shows up as activating (waiting to restart) or failed.
+readonly START_WATCH=15
+stays_up() {
+	local i state
+	info "Checking that the server stays up for $START_WATCH s"
+	for ((i = 0; i < START_WATCH; i++)); do
+		sleep 1
+		state=$(state_in "$service_mode") || return 1
+		[[ $state == active ]] || return 1
+	done
+}
+
+start_failed=false
 if [[ $service_mode != none ]] && as_owner grep -qx 'eula=true' "$server_dir/eula.txt"; then
 	if [[ $service_mode == user ]]; then
 		autostart_q="Start the server automatically at boot (enables the unit and lingering for $me)?"
@@ -1234,6 +1330,7 @@ if [[ $service_mode != none ]] && as_owner grep -qx 'eula=true' "$server_dir/eul
 	fi
 	if confirm "Start the server now?" "$($was_running && echo y || echo n)"; then
 		service_ctl start "$UNIT_NAME"
+		stays_up || start_failed=true
 	fi
 fi
 
@@ -1244,9 +1341,10 @@ fi
 finished=true
 
 addresses=$(ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' | paste -sd' ' || true)
+if $start_failed; then heading="Installed, but not running"; else heading=Done; fi
 cat <<EOF
 
-Done: Minecraft $mc_version Fabric server in $server_dir
+$heading: Minecraft $mc_version Fabric server in $server_dir
   Java players:    ${addresses:-<this host>} port $java_port
 EOF
 if [[ $server_type != java ]]; then
@@ -1257,6 +1355,7 @@ if [[ $server_type != java ]]; then
 		echo "  Bedrock signaling: external NXS service (no separate TCP listener)"
 	fi
 fi
+[[ -z $firewall_note ]] || echo "  Firewall:        warning: $firewall_note"
 case $service_mode in
 user)
 	echo "  Manage:          systemctl --user start|stop|status $UNIT_NAME; journalctl --user -u $UNIT_NAME -f"
@@ -1270,3 +1369,4 @@ none) echo "  Console:         $(printf %q "$server_dir/start.sh")" ;;
 esac
 as_owner grep -qx 'eula=true' "$server_dir/eula.txt" ||
 	echo "  The EULA isn't accepted yet: rerun with --accept-eula before starting."
+! $start_failed || die "$UNIT_NAME stopped within $START_WATCH s of starting; see its log with the journalctl command above"
