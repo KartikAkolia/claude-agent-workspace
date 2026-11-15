@@ -4,7 +4,9 @@
 # EULA and choose the IP URI. Exit 0 queue verified, 1 failed, 2 kept queue unverifiable.
 # Docs: docs/brother-dcp-l2665dw-printer.md
 
-set -euo pipefail
+set -Eeuo pipefail
+# Any unhandled failure exits 1, as the header promises, not with the failing command's own status.
+trap 'exit 1' ERR
 
 MODEL="DCP-L2665DW"
 PRINTER_IP="192.168.0.214"
@@ -90,10 +92,13 @@ cd "$workdir"
 
 curl -fsSO "$INSTALLER_URL"
 actual_sha256="$(sha256sum "${INSTALLER}.gz" | cut -d' ' -f1)"
-[ "$actual_sha256" = "$EXPECTED_SHA256" ] ||
+[ "$actual_sha256" = "$EXPECTED_SHA256" ] || {
+	trap - EXIT
 	fail "Downloaded file hash does not match the pinned value -- Brother may have" \
-		"updated the installer since this script was written. Re-verify by hand" \
-		"before running it: $workdir/${INSTALLER}.gz (got $actual_sha256)"
+		"updated the installer since this script was written. The download is kept for checking" \
+		"by hand: $workdir/${INSTALLER}.gz (sha256 $actual_sha256, pinned $EXPECTED_SHA256);" \
+		"delete $workdir when done."
+}
 gunzip "${INSTALLER}.gz"
 chmod +x "$INSTALLER"
 
@@ -108,6 +113,11 @@ fi
 
 echo "About to run: sudo bash $workdir/$INSTALLER $MODEL"
 echo "When prompted for the device URI, choose IP and enter: $PRINTER_IP"
+# The installer's own test runs as root, whose PATH has the sbin directories a user's may lack.
+if { command -v aa-complain || [ -x /usr/sbin/aa-complain ] || [ -x /sbin/aa-complain ]; } >/dev/null 2>&1; then
+	echo "The installer will also run 'aa-complain cupsd', putting CUPS's AppArmor profile in complain mode."
+	echo "Check: sudo grep cupsd /sys/kernel/security/apparmor/profiles; revert: sudo aa-enforce cupsd"
+fi
 echo
 sudo bash "./$INSTALLER" "$MODEL"
 

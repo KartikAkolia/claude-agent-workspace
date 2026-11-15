@@ -37,7 +37,7 @@ It:
 - finds `qmllint-qt6`, `qmllint`, or `/usr/lib*/qt6/bin/qmllint`;
 - adds QML roots in this order: any `--qml-root` paths, then whichever of `/usr/lib64/qt6/qml`, `/usr/lib/qt6/qml`, `/usr/local/lib64/qt6/qml` and `/usr/local/lib/qt6/qml` exist, then the path `qmake6 -query QT_INSTALL_QML` prints when `qmake6` is on `PATH`;
 - discovers `qs.*` imports in the target files;
-- creates temporary `qmldir` files and symlinks for local QML types;
+- creates temporary `qmldir` files and symlinks for local QML types, which a small watcher removes within a second of qmllint being reaped, whether it exits or is signalled (qmllint is exec'd, so it receives signals itself; only a SIGKILL to the whole process group, which kills the watcher too, leaves the tree behind);
 - sets `QMLLS_BUILD_DIRS` and `QML_IMPORT_PATH` for the lint process.
 
 ## Manual Pattern

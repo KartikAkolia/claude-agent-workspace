@@ -19,10 +19,10 @@ die() {
 	exit 1
 }
 
-if ! [[ "$EXPOSURE" =~ ^[1-9][0-9]*$ ]] || [ "$EXPOSURE" -lt 3 ] || [ "$EXPOSURE" -gt 2047 ]; then
+if ! [[ "$EXPOSURE" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$EXPOSURE" -lt 3 ] || [ "$EXPOSURE" -gt 2047 ]; then
 	die "EXPOSURE must be 3-2047, got '$EXPOSURE'"
 fi
-if ! [[ "$FOCUS" =~ ^(0|[1-9][0-9]*)$ ]] || [ "$FOCUS" -gt 250 ] || [ $((FOCUS % 5)) -ne 0 ]; then
+if ! [[ "$FOCUS" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$FOCUS" -gt 250 ] || [ $((FOCUS % 5)) -ne 0 ]; then
 	die "FOCUS must be 0-250 in steps of 5, got '$FOCUS'"
 fi
 command -v v4l2-ctl >/dev/null || die "v4l2-ctl not found (install v4l-utils)"

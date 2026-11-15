@@ -22,8 +22,9 @@ scripts/xppen-tablet/xppentablet text eol=lf
 scripts/xppen-tablet/xppen-tablet.install text eol=lf
 *.py text eol=lf
 
-# .lint-versions is rewritten by lint-versions.sh with LF endings; pinning it
-# keeps a Windows checkout from ending up with mixed CRLF/LF lines.
+# lint-versions.sh rewrites .lint-versions keeping each line's own ending but
+# appends any missing line with LF; pinning LF keeps a Windows checkout from
+# ending up with mixed CRLF/LF lines.
 .lint-versions text eol=lf
 
 # Binary files should never be touched by line-ending conversion.
