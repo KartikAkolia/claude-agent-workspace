@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# c920-apply-settings.sh — apply the Logitech C920 "stable" settings (manual
-# exposure, autofocus off) to one capture node, and keep re-applying until
-# the camera actually holds them. Run by c920-settings@<videoN>.service,
-# which install-c920-udev-rule.sh's udev rule starts whenever the C920
-# appears; not normally run by hand.
-#
-# Why a loop rather than one pass: straight after plug-in the C920 accepts
-# every v4l2-ctl write but sometimes drops some of them (seen 2026-10-21 —
-# one replug kept exposure but not focus, a boot kept focus but not
-# exposure, the next replug kept all four), and it can drift off a manual
-# exposure for a second or two after the mode switch. Why a systemd unit
-# rather than udev's own RUN+=: udev kills RUN commands that take this long.
-#
+# c920-apply-settings.sh: apply the Logitech C920 "stable" v4l2 settings to one capture node and
+# re-apply until they hold (right after plug-in it drops some writes). Run by c920-settings@.service.
 # Usage: c920-apply-settings.sh DEVICE EXPOSURE FOCUS
 
 set -uo pipefail
@@ -23,11 +12,8 @@ readonly TRIES=10 SETTLE_SECS=2
 	exit 2
 }
 readonly DEV="$1"
-# Auto-mode switches first: the C920 refuses focus_absolute with
-# "Permission denied" while autofocus is still on.
 readonly WANT=(auto_exposure=1 "exposure_time_absolute=$2" focus_automatic_continuous=0 "focus_absolute=$3")
 
-# Current value only, as v4l2-ctl -C reports it ("name: 1 (Manual Mode)" -> "1").
 ctrl_cur() {
 	v4l2-ctl -d "$DEV" -C "$1" 2>/dev/null | awk -F': ' '{ split($2, v, " "); print v[1]; exit }'
 }

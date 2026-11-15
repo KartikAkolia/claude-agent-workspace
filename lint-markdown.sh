@@ -1,61 +1,34 @@
 #!/usr/bin/env bash
-# Lints this repo's own markdown with mdl and checks local cross-references
-# for rot; validates tracked JSON/YAML config parses cleanly; and runs
-# lint-bash.sh/lint-python.sh over this repo's own shell and Python scripts.
-# The name predates the JSON/YAML/bash/Python checks -- kept as-is since
-# .githooks/pre-commit calls it by name for a full local sweep. CI no longer
-# calls this directly: it's split into four path-filtered
-# .github/workflows/lint-*.yml files instead (2026-09-03), so e.g. a
-# markdown-only change doesn't also trigger the bash/Python/config checks.
-# This script is still useful as the "run every category at once" entry
-# point for a full local check. File discovery for each category lives in
-# list-lint-files.sh, shared with those CI workflows. Skips the read-only
-# ChrisTitusTech reference clones (see AGENTS.md non-negotiable #1).
+# Full local lint sweep of every tracked file list-lint-files.sh finds: mdl and check-markdown-links.py
+# on markdown, validate-config.sh on JSON/YAML, lint-bash.sh and lint-python.sh on shell and Python.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
-
-# llf_read_list: NUL-safe, and it fails -- rather than hand back an empty
-# list, which every linter below would pass -- if listing breaks.
 # shellcheck source=/dev/null
 source ./list-lint-files.sh || exit 1
 
 status=0
-files=() config_files=() bash_files=() python_files=()
-llf_read_list markdown files || status=1
-llf_read_list config config_files || status=1
-llf_read_list bash bash_files || status=1
-llf_read_list python python_files || status=1
+markdown_files=() config_files=() bash_files=() python_files=()
+for category in markdown config bash python; do
+	llf_read_list "$category" "${category}_files" || status=1
+done
 
+py=""
+for candidate in python3 python; do
+	command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1 && py=$candidate && break
+done
 if ! command -v mdl >/dev/null 2>&1; then
 	printf 'mdl not found on PATH (gem install --user-install mdl, then add the gem bin dir to PATH)\n' >&2
 	status=1
-else
-	# Don't trust check-markdown-links.py's own `#!/usr/bin/env python3` shebang --
-	# on Windows, `python3` often resolves to the broken App Execution Alias stub
-	# (prints an "install from the Microsoft Store" message and exits nonzero)
-	# instead of a real interpreter, even when python3/python is genuinely
-	# installed under a different PATH entry. Pick whichever name actually runs.
-	py=""
-	for candidate in python3 python; do
-		if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
-			py="$candidate"
-			break
-		fi
-	done
-	if [ -z "$py" ]; then
-		printf 'no working python3/python interpreter found on PATH\n' >&2
-		status=1
-	elif [ "${#files[@]}" -gt 0 ]; then
-		# Guarded: mdl with no files reads stdin.
-		mdl "${files[@]}" || status=1
-		"$py" check-markdown-links.py "${files[@]}" || status=1
-	fi
+elif [ -z "$py" ]; then
+	printf 'no working python3/python interpreter found on PATH\n' >&2
+	status=1
+elif [ "${#markdown_files[@]}" -gt 0 ]; then
+	mdl "${markdown_files[@]}" || status=1
+	"$py" check-markdown-links.py "${markdown_files[@]}" || status=1
 fi
 
 ./validate-config.sh "${config_files[@]}" || status=1
-# LINT_VERSIONS_MODE cleared: a full sweep only warns about versions, even
-# if the caller's shell has it exported (see lint-versions.sh).
 LINT_VERSIONS_MODE='' ./lint-bash.sh "${bash_files[@]}" || status=1
 LINT_VERSIONS_MODE='' ./lint-python.sh "${python_files[@]}" || status=1
 

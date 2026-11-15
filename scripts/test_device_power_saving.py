@@ -16,64 +16,70 @@ SPEC = importlib.util.spec_from_file_location(
 )
 POLICY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(POLICY)
+TOKENS = [f"{k}={v}" for k, v in POLICY.PARAMS.items()]
+ORIGINAL = {"111-aaa": 3, "222-bbb": 0}
+DISABLED = {"111-aaa": 2, "222-bbb": 2}
+STUBBED = "nmcli modprobe mkinitcpio grub-mkconfig udevadm iw setpci systemctl"
+CP_ARGS = "$1 == --preserve=all && $2 == --no-preserve=timestamps && $3 == -- && $4 == "
 MODULES = """options snd_hda_intel power_save=0 power_save_controller=N
 options nvidia NVreg_DynamicPowerManagement=0x00
 options mt7921e disable_aspm=Y
 """
 STUB = r"""#!/usr/bin/env python3
-import json, os
+import json, os, subprocess, sys
 from pathlib import Path
-import subprocess, sys
 root = Path(os.environ['HOST'])
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 with (root / 'calls').open('a') as log:
     log.write(json.dumps([name, *args]) + '\n')
+def has(flag):
+    return (root / flag).exists()
 fail = root / 'fail'
-if fail.exists() and fail.read_text() == name:
+failing = fail.exists() and fail.read_text() == name
+if failing and name == 'mkinitcpio':
+    (root / 'boot/initramfs-custom.img').write_text('partial image')
+if failing and name == 'grub-mkconfig':
+    (root / 'boot/grub/grub.cfg').write_text('partial config')
+if failing:
     fail.unlink()
-    if name == 'mkinitcpio':
-        (root / 'boot/initramfs-custom.img').write_text('partial image')
-    if name == 'grub-mkconfig':
-        (root / 'boot/grub/grub.cfg').write_text('partial config')
     sys.exit(42)
-if name == 'nmcli':
+def nmcli():
     store = root / 'wifi.json'
     profiles = json.loads(store.read_text())
     failure = root / 'fail-profile'
-    if args[:2] == ['connection', 'modify'] and failure.exists() and failure.read_text() == args[3]:
+    modify = args[:2] == ['connection', 'modify']
+    if modify and failure.exists() and failure.read_text() == args[3]:
         failure.unlink()
         sys.exit(43)
-    if args == ['-t', '-f', 'UUID,TYPE', 'connection', 'show']:
-        for uuid in profiles:
-            print(uuid + ':802-11-wireless')
-    elif args[:2] == ['-g', '802-11-wireless.powersave']:
-        value = profiles[args[-1]]
-        label = ['default', 'ignore', 'disable', 'enable'][value]
-        if (root / 'blank-powersave').exists():
-            print('')
-        elif (root / 'blank-after-modify').exists() and (root / 'modified').exists():
-            print('')
-        elif (root / 'numeric-powersave').exists():
-            print(f'{value} ({label})')
-        else:
-            print(label)
-    elif args[:2] == ['connection', 'modify']:
+    if modify:
         profiles[args[3]] = int(args[-1])
         (root / 'modified').write_text('')
         store.write_text(json.dumps(profiles))
-elif name == 'setpci':
+    if args == ['-t', '-f', 'UUID,TYPE', 'connection', 'show']:
+        for uuid in profiles:
+            print(uuid + ':802-11-wireless')
+    if args[:2] != ['-g', '802-11-wireless.powersave']:
+        return
+    value = profiles[args[-1]]
+    label = ['default', 'ignore', 'disable', 'enable'][value]
+    blank = has('blank-powersave') or has('blank-after-modify') and has('modified')
+    print('' if blank else f'{value} ({label})' if has('numeric-powersave') else label)
+def setpci():
     store = root / 'lnkctl.json'
     links = json.loads(store.read_text()) if store.exists() else {}
-    if args[1] not in links:
+    write = 'CAP_EXP+10.w=0:3'
+    if args[1] not in links or args[2] == write and has('fail-setpci'):
         sys.exit(1)
     if args[2] == 'CAP_EXP+10.w':
         print(links[args[1]])
-    elif args[2] == 'CAP_EXP+10.w=0:3':
-        if (root / 'fail-setpci').exists():
-            sys.exit(1)
+    if args[2] == write:
         links[args[1]] = format(int(links[args[1]], 16) & ~3, '04x')
         store.write_text(json.dumps(links))
+if name == 'nmcli':
+    nmcli()
+elif name == 'setpci':
+    setpci()
 elif name == 'modprobe':
     print((root / 'etc/modprobe.d/no-power-saving.conf').read_text())
     print((root / 'effective-modules').read_text())
@@ -88,14 +94,8 @@ elif name == 'grub-mkconfig':
 
 class GrubTests(unittest.TestCase):
     def test_comments_do_not_satisfy_policy(self):
-        source = 'GRUB_CMDLINE_LINUX_DEFAULT="quiet" # ' + " ".join(
-            f"{k}={v}" for k, v in POLICY.PARAMS.items()
-        )
-        fixed = POLICY.grub(source)
-        self.assertEqual(
-            POLICY.managed(POLICY.read_grub(fixed)[4]),
-            [f"{k}={v}" for k, v in POLICY.PARAMS.items()],
-        )
+        fixed = POLICY.grub('GRUB_CMDLINE_LINUX_DEFAULT="quiet" # ' + " ".join(TOKENS))
+        self.assertEqual(POLICY.managed(POLICY.read_grub(fixed)[4]), TOKENS)
         self.assertEqual(POLICY.grub(fixed), fixed)
 
     def test_all_duplicate_tokens_replaced_exactly(self):
@@ -133,7 +133,7 @@ class GrubTests(unittest.TestCase):
             POLICY.grub(changed, original)
 
     def test_generated_grub_must_have_effective_policy(self):
-        params = " ".join(f"{k}={v}" for k, v in POLICY.PARAMS.items())
+        params = " ".join(TOKENS)
         POLICY.boot("linux /vmlinuz-test " + params + "\nlinux /vmlinuz-test single")
         for text in (
             "linux /vmlinuz-test quiet",
@@ -170,19 +170,16 @@ class InstallTests(unittest.TestCase):
             'GRUB_TIMEOUT=5\nGRUB_CMDLINE_LINUX_DEFAULT="quiet usbcore.autosuspend=2"\n'
         )
         self.grub.chmod(0o640)
-        for directory in (
-            "etc/udev/rules.d",
-            "etc/modprobe.d",
-            "etc/NetworkManager/conf.d",
-            "boot/grub",
-        ):
+        dirs = "etc/udev/rules.d etc/modprobe.d etc/NetworkManager/conf.d boot/grub"
+        for directory in dirs.split():
             (self.root / directory).mkdir(parents=True)
         (self.root / "boot/grub/grub.cfg").write_text("original config")
         (self.root / "boot/initramfs-custom.img").write_text("original image")
         self.modprobe = self.root / "etc/modprobe.d/no-power-saving.conf"
         self.modprobe.write_text("# original options\n")
         self.modprobe.chmod(0o600)
-        (self.root / "wifi.json").write_text(json.dumps({"111-aaa": 3, "222-bbb": 0}))
+        self.wifi = self.root / "wifi.json"
+        self.wifi.write_text(json.dumps(ORIGINAL))
         (self.root / "effective-modules").write_text("")
         for path, content in (
             ("sys/module/usbcore/parameters/autosuspend", "2"),
@@ -192,21 +189,12 @@ class InstallTests(unittest.TestCase):
             file = self.root / path
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text(content)
-        for name in (
-            "nmcli",
-            "modprobe",
-            "mkinitcpio",
-            "grub-mkconfig",
-            "udevadm",
-            "iw",
-            "setpci",
-            "systemctl",
-        ):
+        for name in STUBBED.split():
             self.tool(name, STUB)
-        self.tool("sleep", "#!/bin/sh\nexit 0\n")  # the late pass's recheck delay
+        self.tool("sleep", "#!/bin/sh\nexit 0\n")
         self.script = self.root / "disable-device-power-saving.sh"
         source = (SCRIPTS / self.script.name).read_text()
-        source = source.replace("if ((EUID != 0)); then", "if false; then")
+        source = source.replace("((EUID == 0)) ||", "true ||")
         for prefix in ("/etc/", "/sys/", "/var/lib/", "/usr/local/"):
             source = source.replace(prefix, str(self.root) + prefix)
         source = source.replace("BOOT_DIR=/boot", "BOOT_DIR=" + str(self.root / "boot"))
@@ -228,32 +216,49 @@ class InstallTests(unittest.TestCase):
         path.write_text(content)
         path.chmod(0o755)
 
-    def run_policy(self, *args, success=True):
-        result = subprocess.run(
-            [
-                # Reset the dispositions a nohup or background runner leaves
-                # ignored (bash can't trap a signal ignored on entry), and
-                # export the script's own PID for stubs that signal it.
-                "env",
-                "--default-signal=HUP,INT,TERM",
-                "bash",
-                "-c",
-                'export POLICY_PID=$$; exec bash "$@"',
-                "bash",
-                str(self.script),
-                *map(str, args),
-            ],
+    def fake(self, name, test, action):
+        self.tool(
+            name,
+            f"""#!/usr/bin/env bash
+if [[ {test} ]]; then
+{action}
+fi
+exec {shutil.which(name)} "$@"
+""",
+        )
+
+    def run_cmd(self, *argv):
+        return subprocess.run(
+            [str(arg) for arg in argv],
             env=self.env,
             text=True,
             capture_output=True,
             timeout=20,
             check=False,
         )
+
+    def run_policy(self, *args, success=True):
+        result = self.run_cmd(
+            "env",
+            "--default-signal=HUP,INT,TERM",
+            "bash",
+            "-c",
+            'export POLICY_PID=$$; exec bash "$@"',
+            "bash",
+            self.script,
+            *args,
+        )
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertFalse(list(self.root.rglob(".device-power.*")))
+        return result
+
+    def assert_unchanged(self, *args):
+        before = self.originals()
+        result = self.run_policy(*args, success=False)
+        self.assertEqual(self.originals(), before)
         return result
 
     def originals(self, include_boot=True):
@@ -280,10 +285,7 @@ class InstallTests(unittest.TestCase):
     def test_install_and_complete_undo(self):
         before = self.originals(include_boot=False)
         self.run_policy()
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 2, "222-bbb": 2},
-        )
+        self.assertEqual(json.loads(self.wifi.read_text()), DISABLED)
         self.assertEqual(self.modprobe.stat().st_mode & 0o777, 0o600)
         self.assertEqual(
             [path.stat().st_mode & 0o777 for path in self.late],
@@ -299,10 +301,7 @@ class InstallTests(unittest.TestCase):
         self.run_policy("--undo", self.latest())
         self.assertFalse(any(path.exists() for path in self.late))
         self.assertEqual(self.originals(include_boot=False), before)
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 3, "222-bbb": 0},
-        )
+        self.assertEqual(json.loads(self.wifi.read_text()), ORIGINAL)
         calls = (self.root / "calls").read_text()
         self.assertIn('["udevadm", "control", "--reload"]', calls)
         self.assertFalse((self.state / "current").exists())
@@ -364,22 +363,11 @@ class InstallTests(unittest.TestCase):
         (self.root / "calls").write_text("")
         return bus
 
-    def run_late(self):
-        return subprocess.run(
-            [str(self.late[2])],
-            env=self.env,
-            text=True,
-            capture_output=True,
-            timeout=20,
-            check=False,
-        )
-
     def test_late_pass_clears_aspm_downstream_first(self):
         bus = self.late_fixture()
-        # An unwritable control only warns; it must not fail the unit.
         (bus / "fixture/power/control").unlink()
         (bus / "fixture/power/control").mkdir()
-        result = self.run_late()
+        result = self.run_cmd(self.late[2])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("warning: cannot write", result.stderr)
         self.assertEqual(
@@ -407,7 +395,7 @@ class InstallTests(unittest.TestCase):
     def test_late_pass_fails_on_aspm_write_error(self):
         self.late_fixture()
         (self.root / "fail-setpci").write_text("")
-        self.assertEqual(self.run_late().returncode, 1)
+        self.assertEqual(self.run_cmd(self.late[2]).returncode, 1)
 
     def test_failed_late_start_keeps_install(self):
         self.tool("systemctl", '#!/bin/sh\n[ "$1" = start ] && exit 5\nexit 0\n')
@@ -428,40 +416,25 @@ class InstallTests(unittest.TestCase):
     def test_undo_refuses_later_dropin_or_profile_changes(self):
         self.run_policy()
         self.modprobe.write_text("# changed by user")
-        before = self.originals()
-        self.run_policy("--undo", self.latest(), success=False)
-        self.assertEqual(self.originals(), before)
+        self.assert_unchanged("--undo", self.latest())
 
     def test_build_and_reload_failures_restore_originals(self):
         for command in ("mkinitcpio", "grub-mkconfig", "udevadm", "systemctl"):
             with self.subTest(command=command):
-                before = self.originals()
                 (self.root / "fail").write_text(command)
-                result = self.run_policy(success=False)
-                self.assertIn("restored", result.stderr)
-                self.assertEqual(self.originals(), before)
-                self.assertEqual(
-                    json.loads((self.root / "wifi.json").read_text()),
-                    {"111-aaa": 3, "222-bbb": 0},
-                )
+                self.assertIn("restored", self.assert_unchanged().stderr)
+                self.assertEqual(json.loads(self.wifi.read_text()), ORIGINAL)
 
     def test_partial_profile_failure_restores_previous_values(self):
-        before = self.originals()
         (self.root / "fail-profile").write_text("222-bbb")
-        self.run_policy(success=False)
-        self.assertEqual(self.originals(), before)
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 3, "222-bbb": 0},
-        )
+        self.assert_unchanged()
+        self.assertEqual(json.loads(self.wifi.read_text()), ORIGINAL)
 
     def test_failed_undo_restores_installed_policy_and_can_retry(self):
         self.run_policy()
         original_run = self.latest()
-        before = self.originals()
         (self.root / "fail").write_text("grub-mkconfig")
-        self.run_policy("--undo", original_run, success=False)
-        self.assertEqual(self.originals(), before)
+        self.assert_unchanged("--undo", original_run)
         self.assertFalse((original_run / "undone").exists())
         self.assertEqual(self.latest(), original_run)
         self.run_policy("--undo", original_run)
@@ -469,15 +442,9 @@ class InstallTests(unittest.TestCase):
     def test_numeric_powersave_output_is_accepted(self):
         (self.root / "numeric-powersave").write_text("")
         self.run_policy()
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 2, "222-bbb": 2},
-        )
+        self.assertEqual(json.loads(self.wifi.read_text()), DISABLED)
         self.run_policy("--undo", self.latest())
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 3, "222-bbb": 0},
-        )
+        self.assertEqual(json.loads(self.wifi.read_text()), ORIGINAL)
 
     def test_undo_reports_unreadable_profile(self):
         self.run_policy()
@@ -486,24 +453,17 @@ class InstallTests(unittest.TestCase):
         self.assertIn("cannot read Wi-Fi policy", result.stdout + result.stderr)
 
     def test_install_reports_unreadable_profile(self):
-        before = self.originals()
         (self.root / "blank-after-modify").write_text("")
-        result = self.run_policy(success=False)
+        result = self.assert_unchanged()
         self.assertIn("cannot read Wi-Fi policy", result.stderr)
         self.assertIn("unrecognised nmcli powersave output", result.stderr)
         self.assertIn("restored", result.stderr)
-        self.assertEqual(self.originals(), before)
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text()),
-            {"111-aaa": 3, "222-bbb": 0},
-        )
+        self.assertEqual(json.loads(self.wifi.read_text()), ORIGINAL)
 
     def test_early_failure_drops_boot_snapshot(self):
-        before = self.originals()
         (self.root / "blank-powersave").write_text("")
-        result = self.run_policy(success=False)
+        result = self.assert_unchanged()
         self.assertIn("cannot read Wi-Fi policy", result.stderr)
-        self.assertEqual(self.originals(), before)
         runs = list(self.state.glob("run.*"))
         self.assertEqual(len(runs), 1)
         self.assertFalse((runs[0] / "boot").exists())
@@ -511,7 +471,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((runs[0] / "pending").exists())
         self.assertIn("partial run kept for diagnosis", result.stderr)
         (self.root / "blank-powersave").unlink()
-        self.run_policy()  # an aborted run doesn't block the next install
+        self.run_policy()
         self.assertTrue((runs[0] / "aborted").exists())
         self.assertEqual(len(list(self.state.glob("run.*"))), 2)
 
@@ -519,14 +479,13 @@ class InstallTests(unittest.TestCase):
         before = self.originals(include_boot=False)
         self.run_policy()
         source = self.latest()
-        profiles = json.loads((self.root / "wifi.json").read_text())
-        profiles["333-ccc"] = 9  # the stub crashes reading this one
-        (self.root / "wifi.json").write_text(json.dumps(profiles))
+        profiles = json.loads(self.wifi.read_text())
+        profiles["333-ccc"] = 9
+        self.wifi.write_text(json.dumps(profiles))
         result = self.run_policy("--undo", source, success=False)
         self.assertIn("nmcli failed", result.stderr)
         self.assertTrue((source / "complete").exists())
         self.assertFalse((source / "undone").exists())
-        # The completed source dropped its /boot copy; undo never reads it.
         self.assertFalse((source / "boot").exists())
         self.assertEqual(self.latest(), source)
         aborted = [r for r in self.state.glob("run.*") if r != source]
@@ -534,20 +493,17 @@ class InstallTests(unittest.TestCase):
         self.assertTrue((aborted[0] / "aborted").exists())
         self.assertFalse((aborted[0] / "boot").exists())
         self.assertFalse((aborted[0] / "pending").exists())
-        # The kept source backup still undoes once the cause is fixed.
         del profiles["333-ccc"]
-        (self.root / "wifi.json").write_text(json.dumps(profiles))
+        self.wifi.write_text(json.dumps(profiles))
         self.run_policy("--undo", source)
         self.assertEqual(self.originals(include_boot=False), before)
 
     def test_only_unfinished_runs_keep_boot_snapshot(self):
-        # A completed install drops its /boot copy.
         self.run_policy()
         installed = self.latest()
         self.assertTrue((installed / "complete").exists())
         self.assertTrue((installed / "before/3").is_file())
         self.assertFalse((installed / "boot").exists())
-        # An install that fails and rolls back keeps it.
         earlier = self.runs()
         (self.root / "fail").write_text("grub-mkconfig")
         self.run_policy(success=False)
@@ -555,7 +511,6 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((failed / "pending").exists())
         self.assertFalse((failed / "complete").exists())
         self.assertTrue((failed / "boot/grub/grub.cfg").is_file())
-        # So does a failed undo; a successful one drops its own copy.
         earlier = self.runs()
         (self.root / "fail").write_text("mkinitcpio")
         self.run_policy("--undo", installed, success=False)
@@ -566,7 +521,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.new_run(earlier) / "boot").exists())
 
     def test_rewritten_files_get_fresh_mtime(self):
-        old = 946684800  # 2000-01-01, before any run
+        old = 946684800
         for path in (self.grub, self.modprobe):
             os.utime(path, (old, old))
         self.run_policy()
@@ -578,22 +533,11 @@ class InstallTests(unittest.TestCase):
 
     def test_undo_refuses_changed_profile(self):
         self.run_policy()
-        (self.root / "wifi.json").write_text(json.dumps({"111-aaa": 3, "222-bbb": 2}))
-        before = self.originals()
-        self.run_policy("--undo", self.latest(), success=False)
-        self.assertEqual(self.originals(), before)
+        self.wifi.write_text(json.dumps({"111-aaa": 3, "222-bbb": 2}))
+        self.assert_unchanged("--undo", self.latest())
 
     def test_incomplete_rollback_can_be_recovered_explicitly(self):
-        real_cp = shutil.which("cp")
-        self.tool(
-            "cp",
-            f"""#!/usr/bin/env bash
-if [[ $1 == --preserve=all && $2 == --no-preserve=timestamps && $3 == -- && $4 == */before/1 ]]; then
-    exit 44
-fi
-exec {real_cp} "$@"
-""",
-        )
+        self.fake("cp", CP_ARGS + "*/before/1", "    exit 44")
         before = self.originals()
         (self.root / "fail").write_text("mkinitcpio")
         result = self.run_policy(success=False)
@@ -601,7 +545,6 @@ exec {real_cp} "$@"
         backups = list(self.state.glob("run.*"))
         self.assertEqual(len(backups), 1)
         self.assertTrue((backups[0] / "pending").exists())
-        # A run still pending recovery keeps the /boot copy --recover restores.
         self.assertTrue((backups[0] / "boot/grub/grub.cfg").is_file())
         self.assertIn("unfinished recovery", self.run_policy(success=False).stderr)
         (self.bin / "cp").unlink()
@@ -614,66 +557,37 @@ exec {real_cp} "$@"
             "grub-mkconfig",
             "#!/usr/bin/env bash\necho 'linux /vmlinuz quiet' >\"$HOST/boot/grub/grub.cfg\"\n",
         )
-        before = self.originals()
-        self.run_policy(success=False)
-        self.assertEqual(self.originals(), before)
+        self.assert_unchanged()
 
     def test_conflicting_modules_fail_before_boot_build(self):
-        before = self.originals()
         (self.root / "effective-modules").write_text(
             MODULES + "options nvidia NVreg_DynamicPowerManagement=3\n"
         )
-        result = self.run_policy(success=False)
+        result = self.assert_unchanged()
         self.assertIn("resolve modprobe.d", result.stderr)
-        self.assertEqual(self.originals(), before)
         self.assertNotIn("mkinitcpio", (self.root / "calls").read_text())
 
     def test_grub_rejection_precedes_all_managed_writes(self):
         self.grub.write_text(
             'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\nGRUB_CMDLINE_LINUX_DEFAULT="other"\n'
         )
-        before = self.originals()
-        self.run_policy(success=False)
-        self.assertEqual(self.originals(), before)
-        self.assertEqual(
-            json.loads((self.root / "wifi.json").read_text())["111-aaa"], 3
-        )
+        self.assert_unchanged()
+        self.assertEqual(json.loads(self.wifi.read_text())["111-aaa"], 3)
 
     def test_partial_copy_does_not_truncate_existing_file(self):
-        real_cp = shutil.which("cp")
-        self.tool(
-            "cp",
-            f"""#!/usr/bin/env bash
-if [[ $1 == --preserve=all && $2 == --no-preserve=timestamps && $3 == -- && $4 == */after/1 ]]; then
-    echo partial >"$5"
-    exit 42
-fi
-exec {real_cp} "$@"
-""",
-        )
-        before = self.originals()
-        self.run_policy(success=False)
-        self.assertEqual(self.originals(), before)
+        self.fake("cp", CP_ARGS + "*/after/1", '    echo partial >"$5"\n    exit 42')
+        self.assert_unchanged()
 
     def test_signal_during_write_rolls_back(self):
-        # The stub signals the main script, not its parent place() subshell,
-        # and the write itself succeeds, so only a signal can cause the
-        # rollback. Exit status 1 is finish's own: without the main INT/TERM/HUP
-        # traps, bash would run finish and then die by the signal instead.
-        real_mv = shutil.which("mv")
         before = self.originals()
         for sig in ("INT", "TERM", "HUP"):
             with self.subTest(signal=sig):
                 (self.root / "signaled").unlink(missing_ok=True)
-                self.tool(
+                self.fake(
                     "mv",
-                    f"""#!/usr/bin/env bash
-if [[ ${{!#}} == */etc/modprobe.d/no-power-saving.conf && ! -e "$HOST/signaled" ]]; then
-    touch "$HOST/signaled"
-    kill -{sig} "$POLICY_PID"
-fi
-exec {real_mv} "$@"
-""",
+                    "${!#} == */etc/modprobe.d/no-power-saving.conf"
+                    ' && ! -e "$HOST/signaled"',
+                    f'    touch "$HOST/signaled"\n    kill -{sig} "$POLICY_PID"',
                 )
                 result = self.run_policy(success=False)
                 self.assertTrue((self.root / "signaled").exists())

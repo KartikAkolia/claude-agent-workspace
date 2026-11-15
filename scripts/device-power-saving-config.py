@@ -11,6 +11,19 @@ PARAMS = {
     "pcie_aspm.policy": "performance",
     "nvme_core.default_ps_max_latency_us": "0",
 }
+EXPECTED = {
+    ("snd_hda_intel", "power_save"): "0",
+    ("snd_hda_intel", "power_save_controller"): "n",
+    ("nvidia", "NVreg_DynamicPowerManagement"): "0",
+    ("mt7921e", "disable_aspm"): "y",
+}
+BOOLS = {"n": ("n", "no", "0", "false"), "y": ("y", "yes", "1", "true")}
+RESCUE = {
+    "single",
+    "recovery",
+    "systemd.unit=rescue.target",
+    "systemd.unit=emergency.target",
+}
 ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?GRUB_CMDLINE_LINUX_DEFAULT\s*=")
 LITERAL = re.compile(
     r"^(\s*(?:export\s+)?GRUB_CMDLINE_LINUX_DEFAULT\s*=\s*)([\"'])(.*)\2([ \t]*(?:#.*)?)$"
@@ -45,25 +58,16 @@ def managed(tokens):
 def grub(text, before=None):
     lines, index, prefix, quote, tokens, suffix = read_grub(text)
     replacement = [f"{key}={value}" for key, value in PARAMS.items()]
+    if before is not None and sorted(managed(tokens)) != sorted(replacement):
+        raise ValueError("managed GRUB parameters changed since install; undo manually")
     if before is not None:
-        if sorted(managed(tokens)) != sorted(replacement):
-            raise ValueError(
-                "managed GRUB parameters changed since install; undo manually"
-            )
-        old_tokens = read_grub(before)[4]
-        replacement = managed(old_tokens)
+        replacement = managed(read_grub(before)[4])
     tokens = [t for t in tokens if t.split("=", 1)[0] not in PARAMS] + replacement
     lines[index] = f"{prefix}{quote}{' '.join(tokens)}{quote}{suffix}\n"
     return "".join(lines)
 
 
 def modules(text):
-    expected = {
-        ("snd_hda_intel", "power_save"): "0",
-        ("snd_hda_intel", "power_save_controller"): "n",
-        ("nvidia", "NVreg_DynamicPowerManagement"): "0",
-        ("mt7921e", "disable_aspm"): "y",
-    }
     effective = {}
     for line in text.splitlines():
         if not re.match(r"^options\s", line):
@@ -74,17 +78,17 @@ def modules(text):
         for token in fields[2:]:
             key, _, value = token.partition("=")
             effective[(fields[1].replace("-", "_"), key)] = value
-    for key, wanted in expected.items():
+    for key, wanted in EXPECTED.items():
         value = effective.get(key, "").lower()
-        if wanted == "n":
-            valid = value in ("n", "no", "0", "false")
-        elif wanted == "y":
-            valid = value in ("y", "yes", "1", "true")
-        else:
-            try:
-                valid = int(value, 16 if value.startswith("0x") else 10) == int(wanted)
-            except ValueError:
-                valid = False
+        base = 16 if value.startswith("0x") else 10
+        try:
+            valid = (
+                value in BOOLS[wanted]
+                if wanted in BOOLS
+                else int(value, base) == int(wanted)
+            )
+        except ValueError:
+            valid = False
         if not valid:
             raise ValueError(
                 f"effective {key[0]}.{key[1]}={value!r}, expected {wanted}; "
@@ -98,16 +102,7 @@ def boot(text):
         if not re.match(r"^\s*linux(?:efi|16)?\s", line):
             continue
         tokens = shlex.split(line, comments=True)[2:]
-        if any(
-            t
-            in (
-                "single",
-                "recovery",
-                "systemd.unit=rescue.target",
-                "systemd.unit=emergency.target",
-            )
-            for t in tokens
-        ):
+        if any(t in RESCUE for t in tokens):
             continue
         effective = dict(t.split("=", 1) for t in tokens if "=" in t)
         if any(effective.get(key) != value for key, value in PARAMS.items()):

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Regression checks using disposable files and synthetic API/service commands.
-
-Run with: python3 scripts/minecraft-fabric/test_install.py
-No packages, services, firewall rules or Minecraft servers are installed.
-"""
+"""Regression checks for install.sh, using disposable files and stub commands."""
 
 import hashlib
 import json
@@ -12,14 +8,19 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from functools import partialmethod
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("install.sh")
 SOURCE = SCRIPT.read_text()
+SYSTEM_MODE = unittest.skipUnless(
+    os.access("/dev/shm", os.W_OK) and Path("/run/systemd/system").is_dir(),
+    "needs systemd and a writable /dev/shm (system mode refuses /tmp)",
+)
 
 
 def section(start, end):
-    return SOURCE[SOURCE.index(start) : SOURCE.index(end, SOURCE.index(start))]
+    return SOURCE[SOURCE.index(start) : SOURCE.index(end, SOURCE.index(start))] + "\n"
 
 
 class InstallerTests(unittest.TestCase):
@@ -51,8 +52,6 @@ exit 3
 """,
         )
         self.tool("ss", "exit 0\n")
-        # Like the real one, it needs root (AS_ROOT, set by a sudo stub) to
-        # read the ruleset, unless NFT_READABLE=user.
         self.tool(
             "nft",
             """if [[ ${NFT_READABLE:-} == user || ${AS_ROOT:-} == 1 ]]; then
@@ -86,32 +85,19 @@ fi
         payload = b"synthetic mod artifact"
         (self.fixtures / "payload").write_bytes(payload)
         digest = hashlib.sha512(payload).hexdigest()
-        for slug, filename in (
-            ("fabric-api", "fabric-api-9.0.jar"),
-            ("geyser", "Geyser-Fabric-9.jar"),
-            ("floodgate", "Floodgate-Fabric-9.jar"),
+        for slug, filename, version in (
+            ("fabric-api", "fabric-api-9.0.jar", "9.0"),
+            ("geyser", "Geyser-Fabric-9.jar", "2.11.3-b1254"),
+            ("floodgate", "Floodgate-Fabric-9.jar", "9.0"),
         ):
-            (self.fixtures / f"{slug}.json").write_text(
-                json.dumps(
-                    [
-                        {
-                            "date_published": "2026-10-23T00:00:00Z",
-                            "version_type": "release",
-                            "version_number": "2.11.3-b1254"
-                            if slug == "geyser"
-                            else "9.0",
-                            "files": [
-                                {
-                                    "filename": filename,
-                                    "primary": True,
-                                    "hashes": {"sha512": digest},
-                                    "url": f"https://fixture/{filename}",
-                                }
-                            ],
-                        }
-                    ]
-                )
-            )
+            jar = {"filename": filename, "primary": True, "hashes": {"sha512": digest}}
+            build = {
+                "date_published": "2026-10-23T00:00:00Z",
+                "version_type": "release",
+                "version_number": version,
+                "files": [jar | {"url": f"https://fixture/{filename}"}],
+            }
+            (self.fixtures / f"{slug}.json").write_text(json.dumps([build]))
         self.tool(
             "curl",
             """import json, os, pathlib, sys
@@ -142,9 +128,7 @@ else:
 
     def tool(self, name, body, python=False):
         path = self.bin / name
-        path.write_text(
-            ("#!/usr/bin/env python3\n" if python else "#!/usr/bin/env bash\n") + body
-        )
+        path.write_text(f"#!/usr/bin/env {'python3' if python else 'bash'}\n{body}")
         path.chmod(0o755)
 
     def bash(self, code, **env):
@@ -162,22 +146,9 @@ else:
         if os.geteuid() == 0:
             self.skipTest("the installer deliberately rejects root")
         result = subprocess.run(
-            [
-                "bash",
-                str(SCRIPT),
-                "--yes",
-                "--type",
-                "java",
-                "--service",
-                "none",
-                "--mc-version",
-                "1.21.1",
-                "--dir",
-                str(self.server),
-                "--heap",
-                "1G",
-                *options,
-            ],
+            ["bash", str(SCRIPT), "--yes", "--type", "java", "--service", "none"]
+            + ["--mc-version", "1.21.1", "--dir", str(self.server), "--heap", "1G"]
+            + list(options),
             env=self.env | env,
             text=True,
             check=False,
@@ -204,16 +175,11 @@ else:
         state.write_text(state.read_text().replace("fabric-api-9.0.jar", old.name))
         (self.fixtures / "loader").write_text("0.20.2")
 
-    def fail_tool(self, name, condition, status=42):
-        real = shutil.which(name)
+    def fail_tool(self, name, condition, status=42, action=None):
+        action = action or f"echo 'injected {name} failure' >&2\n    exit {status}"
         self.tool(
             name,
-            f"""if {condition}; then
-    echo 'injected {name} failure' >&2
-    exit {status}
-fi
-exec {real} "$@"
-""",
+            f'if {condition}; then\n    {action}\nfi\nexec {shutil.which(name)} "$@"\n',
         )
 
     def test_fresh_install_and_unchanged_rerun(self):
@@ -269,7 +235,6 @@ exec {real} "$@"
         self.assertTrue((self.server / "mods/fabric-api-9.0.jar").exists())
         self.assertEqual(other.read_bytes(), b"unselected unmanaged mod")
 
-    # place copies with tee, the source arriving as tee's stdin.
     COPYING = "[[ $(readlink /proc/self/fd/0) == */mods/{} ]]"
 
     def test_copy_failure_restores_launcher_mods_and_state(self):
@@ -305,8 +270,6 @@ exec {real} "$@"
         self.prepare_upgrade()
         before = self.snapshot()
         self.fail_tool("mv", "[[ ${!#} == */.install-state ]]")
-        # The same simulated failure also blocks rollback of the state itself;
-        # that file was never changed, and retained backups must be reported.
         result = self.install(expected=1)
         self.assertIn("artifact recovery failed", result.stderr)
         self.assertEqual(self.snapshot(), before)
@@ -322,26 +285,24 @@ exec {real} "$@"
     def test_sigterm_during_replacement_rolls_back(self):
         self.prepare_upgrade()
         before = self.snapshot()
-        real = shutil.which("tee")
-        self.tool(
-            "tee",
-            f"""if {self.COPYING.format("fabric-api-9.0.jar")}; then
-    kill -TERM "$PPID"
-    exit 143
-fi
-exec {real} "$@"
-""",
-        )
+        copying = self.COPYING.format("fabric-api-9.0.jar")
+        self.fail_tool("tee", copying, action='kill -TERM "$PPID"\n    exit 143')
         self.install(expected=143)
         self.assertEqual(self.snapshot(), before)
 
-    # Reads root may do anywhere; anything else as root is refused (99).
     ROOT_READS = ("find", "test", "sha512sum", "cat", "grep")
 
-    def system_mode_stubs(self, server):
-        """A sudo whose root and minecraft are both us, with $SERVER closed
-        (mode 000) except during a sudo call, as a minecraft-owned 750
-        directory is to the installer."""
+    def system_server(self):
+        if Path("/etc/systemd/system/minecraft-fabric.service").exists():
+            self.skipTest("a real minecraft-fabric system unit exists here")
+        root = Path(os.path.realpath(self.root))
+        homes = (Path("/home").resolve(), Path("/root"), Path.home().resolve())
+        if any(root.is_relative_to(home) for home in homes):
+            self.skipTest("a system unit can't use the stub Java in a home directory")
+        base = tempfile.TemporaryDirectory(prefix="fabric-system-", dir="/dev/shm")
+        self.addCleanup(base.cleanup)
+        self.server = server = Path(os.path.realpath(base.name)) / "server with spaces"
+        self.env["SERVER"] = str(server)
         real_id, real_stat = shutil.which("id"), shutil.which("stat")
         self.tool(
             "id",
@@ -362,7 +323,6 @@ if [[ $user == root ]]; then
     case $1 in
     {" | ".join(self.ROOT_READS)} | systemctl | nft) ;;
     install)
-        # Only creating the directory itself; its ownership is simulated.
         [[ $2 == -d && $3 == -o && $5 == -g && $7 == -m && $9 == "$SERVER" && $# == 9 ]] || exit 99
         set -- install -d -m "$8" "$9"
         ;;
@@ -383,38 +343,27 @@ exit "$status"
 """,
         )
         self.addCleanup(lambda: server.exists() and server.chmod(0o700))
+        return server
 
-    def assert_root_only_read_the_server(self, server):
-        for call in (self.fixtures / "sudo-calls").read_text().splitlines():
+    def sudo_calls(self, reset=False):
+        calls = self.fixtures / "sudo-calls"
+        if reset:
+            calls.write_text("")
+        return calls.read_text()
+
+    def assert_root_only_read_the_server(self):
+        for call in self.sudo_calls().splitlines():
             user, command = call.split(" ", 1)
-            if user == "root" and f"{server}/" in command:
+            if user == "root" and f"{self.server}/" in command:
                 self.assertIn(command.split(" ", 1)[0], self.ROOT_READS, call)
 
-    @unittest.skipUnless(
-        os.access("/dev/shm", os.W_OK) and Path("/run/systemd/system").is_dir(),
-        "needs systemd and a writable /dev/shm (system mode refuses /tmp)",
-    )
+    @SYSTEM_MODE
     def test_system_mode_writes_as_owner_and_adopts_through_sudo(self):
-        if Path("/etc/systemd/system/minecraft-fabric.service").exists():
-            self.skipTest("a real minecraft-fabric system unit exists here")
-        root = Path(os.path.realpath(self.root))
-        homes = (Path("/home").resolve(), Path("/root"), Path.home().resolve())
-        if any(root.is_relative_to(home) for home in homes):
-            self.skipTest("a system unit can't use the stub Java in a home directory")
-        base = tempfile.TemporaryDirectory(prefix="fabric-system-", dir="/dev/shm")
-        self.addCleanup(base.cleanup)
-        server = Path(os.path.realpath(base.name)) / "server with spaces"
-        self.system_mode_stubs(server)
-        options = ("--service", "system", "--dir", str(server))
-        self.install(*options, SERVER=str(server))
-        self.assert_root_only_read_the_server(server)
-        # System mode already uses sudo, so the firewall check may read the
-        # ruleset with it.
-        self.assertIn(
-            "root nft list ruleset", (self.fixtures / "sudo-calls").read_text()
-        )
-        unit = (self.fixtures / "system-unit").read_text()
-        self.assertIn("User=minecraft", unit)
+        server = self.system_server()
+        self.install("--service", "system")
+        self.assert_root_only_read_the_server()
+        self.assertIn("root nft list ruleset", self.sudo_calls())
+        self.assertIn("User=minecraft", (self.fixtures / "system-unit").read_text())
         server.chmod(0o700)
         self.assertEqual(
             (server / "mods/fabric-api-9.0.jar").read_bytes(), b"synthetic mod artifact"
@@ -423,35 +372,27 @@ exit "$status"
         self.assertEqual((server / ".install-state").stat().st_mode & 0o7777, 0o644)
         self.assertFalse(list(server.rglob(".install-file.*")))
 
-        # A legacy install: the jar is unrecorded, readable only through sudo,
-        # and byte-for-byte the resolved build, so it's adopted.
         (server / ".install-state").unlink()
         server.chmod(0o000)
-        (self.fixtures / "sudo-calls").write_text("")
-        result = self.install(*options, SERVER=str(server))
-        # Checked through peek's sudo fallback. peek gives the command no
-        # stdin (MC-2), so the checklist is a file that root's sha512sum reads.
+        self.sudo_calls(reset=True)
+        result = self.install("--service", "system")
         self.assertIn("fabric-api 9.0 already present", result.stdout)
-        self.assert_root_only_read_the_server(server)
-        self.assertIn(
-            f"root sha512sum -c --status {self.root}",
-            (self.fixtures / "sudo-calls").read_text(),
-        )
+        self.assert_root_only_read_the_server()
+        self.assertIn(f"root sha512sum -c --status {self.root}", self.sudo_calls())
         server.chmod(0o700)
         self.assertIn(
             "mod_fabric-api=fabric-api-9.0.jar", (server / ".install-state").read_text()
         )
 
-        # A failed update is rolled back by the owner too.
         (server / "fabric-server-launch.jar").write_bytes(b"previous launcher")
         (server / "mods/fabric-api-9.0.jar").write_bytes(b"previous mod")
         server.chmod(0o000)
         (self.fixtures / "loader").write_text("0.20.2")
-        (self.fixtures / "sudo-calls").write_text("")
+        self.sudo_calls(reset=True)
         self.fail_tool("tee", self.COPYING.format("fabric-api-9.0.jar"))
-        result = self.install(*options, expected=42, SERVER=str(server))
+        result = self.install("--service", "system", expected=42)
         self.assertIn("restored the previous", result.stderr)
-        self.assert_root_only_read_the_server(server)
+        self.assert_root_only_read_the_server()
         server.chmod(0o700)
         self.assertEqual(
             (server / "fabric-server-launch.jar").read_bytes(), b"previous launcher"
@@ -460,33 +401,20 @@ exit "$status"
             (server / "mods/fabric-api-9.0.jar").read_bytes(), b"previous mod"
         )
 
-    @unittest.skipUnless(
-        os.access("/dev/shm", os.W_OK) and Path("/run/systemd/system").is_dir(),
-        "needs systemd and a writable /dev/shm (system mode refuses /tmp)",
-    )
+    @SYSTEM_MODE
     def test_system_mode_floodgate_locale_is_read_and_set_as_owner(self):
-        if Path("/etc/systemd/system/minecraft-fabric.service").exists():
-            self.skipTest("a real minecraft-fabric system unit exists here")
-        root = Path(os.path.realpath(self.root))
-        homes = (Path("/home").resolve(), Path("/root"), Path.home().resolve())
-        if any(root.is_relative_to(home) for home in homes):
-            self.skipTest("a system unit can't use the stub Java in a home directory")
-        base = tempfile.TemporaryDirectory(prefix="fabric-system-", dir="/dev/shm")
-        self.addCleanup(base.cleanup)
-        self.server = server = Path(os.path.realpath(base.name)) / "server with spaces"
-        self.system_mode_stubs(server)
-        options = ("--service", "system", "--dir", str(server), "--type", "floodgate")
-        self.install(*options, SERVER=str(server))
-        # The configs and log a first start leaves.
+        server = self.system_server()
+        options = ("--service", "system", "--type", "floodgate")
+        self.install(*options)
         server.chmod(0o700)
         self.geyser_config("java:\n  auth-type: online\n")
         self.floodgate_config(self.FLOODGATE)
         self.server_log(f"{self.WARNING}\n")
         server.chmod(0o000)
-        (self.fixtures / "sudo-calls").write_text("")
-        self.install(*options, SERVER=str(server))
-        self.assert_root_only_read_the_server(server)
-        calls = (self.fixtures / "sudo-calls").read_text()
+        self.sudo_calls(reset=True)
+        self.install(*options)
+        self.assert_root_only_read_the_server()
+        calls = self.sudo_calls()
         self.assertIn("minecraft grep -qF is not a supported Floodgate language", calls)
         self.assertIn("minecraft sed -i", calls)
         self.assertIn(f"minecraft tee -a -- {server}/.install-state", calls)
@@ -495,20 +423,17 @@ exit "$status"
         self.assertIn("floodgate_locale=set", (server / ".install-state").read_text())
 
     def without_sudo(self):
-        """A PATH holding every command but sudo."""
         tools = self.root / "tools"
         tools.mkdir()
-        for directory in os.environ["PATH"].split(os.pathsep):
-            if not os.path.isdir(directory):
-                continue
-            for name in os.listdir(directory):
-                path = os.path.join(directory, name)
-                if (
-                    name != "sudo"
-                    and not (tools / name).exists()
-                    and os.access(path, os.X_OK)
-                ):
-                    (tools / name).symlink_to(path)
+        found = (
+            (name, os.path.join(directory, name))
+            for directory in filter(os.path.isdir, os.environ["PATH"].split(os.pathsep))
+            for name in os.listdir(directory)
+            if name != "sudo"
+        )
+        for name, path in found:
+            if not (tools / name).exists() and os.access(path, os.X_OK):
+                (tools / name).symlink_to(path)
         (self.bin / "sudo").unlink()
         return f"{self.bin}:{tools}"
 
@@ -523,12 +448,16 @@ exit "$status"
                 result.stderr,
             )
 
-    def geyser_config(self, text=None):
-        config = self.server / "config/Geyser-Fabric/config.yml"
+    def server_file(self, name, text=None):
+        path = self.server / name
         if text is not None:
-            config.parent.mkdir(parents=True, exist_ok=True)
-            config.write_text(text)
-        return config.read_text()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return path.read_text()
+
+    geyser_config = partialmethod(server_file, "config/Geyser-Fabric/config.yml")
+    floodgate_config = partialmethod(server_file, "config/floodgate/config.yml")
+    server_log = partialmethod(server_file, "logs/latest.log")
 
     def test_geyser_rerun_only_undoes_floodgate_auth(self):
         self.install()
@@ -541,7 +470,6 @@ exit "$status"
         self.geyser_config(f"java:\n  auth-type: 'Floodgate'\n{other}")
         self.install("--type", "geyser")
         self.assertEqual(self.geyser_config(), f"java:\n  auth-type: online\n{other}")
-        # Older configs keep it under remote:; a missing key means online.
         self.geyser_config("remote:\n  auth-type: floodgate\n")
         self.install("--type", "geyser")
         self.assertEqual(self.geyser_config(), "remote:\n  auth-type: online\n")
@@ -555,40 +483,23 @@ exit "$status"
         result = self.install("--type", "floodgate", expected=1)
         self.assertIn("couldn't find auth-type", result.stderr)
 
-    def floodgate_config(self, text=None):
-        config = self.server / "config/floodgate/config.yml"
-        if text is not None:
-            config.parent.mkdir(parents=True, exist_ok=True)
-            config.write_text(text)
-        return config.read_text()
-
     FLOODGATE = "replace-spaces: true\n\n# default-locale: en_US\n\ndisconnect:\n  invalid-key: x\n"
-
     WARNING = "[21:13:59] [main/WARN]: en_ is not a supported Floodgate language."
     SET = FLOODGATE.replace("# default-locale: en_US", "default-locale: en_US")
-
-    def server_log(self, text):
-        log = self.server / "logs/latest.log"
-        log.parent.mkdir(exist_ok=True)
-        log.write_text(text)
 
     def test_floodgate_locale_set_once_after_its_warning(self):
         self.install()
         self.geyser_config("java:\n  auth-type: online\n")
         floodgate = ("--type", "floodgate")
         state = self.server / ".install-state"
-        # Before Floodgate's first start, the step says why it was skipped.
         result = self.install(*floodgate)
         self.assertIn("rerun this after that to check its locale", result.stdout)
         self.floodgate_config(self.FLOODGATE)
-        # No log yet, or a log without the warning: nothing changes.
         self.install(*floodgate)
         self.assertEqual(self.floodgate_config(), self.FLOODGATE)
         self.server_log("[main/INFO]: Loading extensions...\n")
         self.install(*floodgate)
         self.assertEqual(self.floodgate_config(), self.FLOODGATE)
-        # A value set by hand, or a config without the template line, stays
-        # even when the log has the warning.
         self.server_log(f"[main/INFO]: Loading 93 mods\n{self.WARNING}\n")
         for config in (
             self.FLOODGATE.replace("# default-locale: en_US", "default-locale: de_DE"),
@@ -603,14 +514,11 @@ exit "$status"
                 self.install(*floodgate)
                 self.assertEqual(self.floodgate_config(), config)
         self.assertNotIn("floodgate_locale", state.read_text())
-        # Otherwise the template line is uncommented, and that's recorded.
         self.floodgate_config(self.FLOODGATE)
         result = self.install(*floodgate)
         self.assertEqual(self.floodgate_config(), self.SET)
         self.assertIn("default-locale is now en_US", result.stdout)
         self.assertIn("\nfloodgate_locale=set\n", state.read_text())
-        # Commented out again by hand, it stays so, across reruns and starts
-        # that log the warning again.
         self.floodgate_config(self.FLOODGATE)
         for _ in range(2):
             self.server_log(f"{self.WARNING}\n")
@@ -641,8 +549,7 @@ exit "$status"
 
     def firewall(self, ruleset=DROP, **env):
         (self.fixtures / "ruleset").write_text(ruleset)
-        (self.fixtures / "sudo-calls").write_text("")
-        # Only the ruleset read is expected; it never prompts (-n).
+        self.sudo_calls(reset=True)
         self.tool(
             "sudo",
             """printf '%s\\n' "$*" >>"$FIXTURES/sudo-calls"
@@ -656,8 +563,9 @@ server_type=java
 assume_yes=true
 sudo_ready=${SUDO_READY:-false}
 """
-            + section("ask() {", "\n# --- helpers")
-            + section("# --- firewall", "# --- first boot")
+            + section("ask() {", "\nas_owner() {")
+            + section('ports=("$java_port/tcp")', "\nif ! command -v ss")
+            + section("firewall_note=''", "\nalive() {")
             + 'printf "%s\\n" "$firewall_note"\n',
             **env,
         )
@@ -674,11 +582,9 @@ sudo_ready=${SUDO_READY:-false}
                 False,
             ),
             (self.DROP, {"NFT_READABLE": "user"}, drop_note, False),
-            # Through sudo only when this run already uses it.
             (self.DROP, {"SUDO_READY": "true"}, drop_note, True),
             (self.DROP, {"ACTIVE_UNITS": "nftables"}, unread.format("nftables"), False),
             (self.DROP, {"ACTIVE_UNITS": "iptables"}, unread.format("iptables"), False),
-            # Read and found open, so an active service doesn't matter.
             (accept, {"SUDO_READY": "true", "ACTIVE_UNITS": "nftables"}, "", True),
             (self.DROP, {}, "", False),
         ):
@@ -687,8 +593,9 @@ sudo_ready=${SUDO_READY:-false}
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip()[: len(expected)], expected)
                 self.assertEqual(bool(result.stdout.strip()), bool(expected))
-                calls = (self.fixtures / "sudo-calls").read_text()
-                self.assertEqual(calls, "-n nft list ruleset\n" if sudo else "")
+                self.assertEqual(
+                    self.sudo_calls(), "-n nft list ruleset\n" if sudo else ""
+                )
         result = self.install(ACTIVE_UNITS="nftables")
         self.assertIn(
             f"Firewall:        warning: {unread.format('nftables')}; make sure it allows 25565/tcp",
@@ -697,11 +604,8 @@ sudo_ready=${SUDO_READY:-false}
 
     def test_package_install_marks_sudo_ready(self):
         result = self.bash(
-            """pm=pacman
-sudo_ready=false
-sudo() { :; }
-"""
-            + section("pkg_install() {", "\npm=$(detect_pm)")
+            "pm=pacman\nsudo_ready=false\nsudo() { :; }\n"
+            + section("pkg_install() {", "\npm=''")
             + 'pkg_install jre-openjdk-headless\necho "sudo_ready=$sudo_ready"\n'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -768,7 +672,7 @@ unit_file_for() { if [[ $1 == "$SCOPE" ]]; then echo "$FIXTURES/../unit"; else e
 state_in() { cat "$FIXTURES/service-state"; }
 ctl_in() { echo "$*" >>"$FIXTURES/service-calls"; if [[ $2 == stop ]]; then echo "$STOP_STATE" >"$FIXTURES/service-state"; fi; }
 confirm() { return 0; }
-sudo() { "$@"; } # simulated privilege boundary; all paths are disposable
+sudo() { "$@"; }
 need_sudo() { :; }
 warn() { :; }
 die() { echo "$*" >&2; exit 1; }
@@ -777,7 +681,7 @@ die() { echo "$*" >&2; exit 1; }
                 "was_running=false stopped_units=()",
                 "if [[ $service_mode == system ]]; then\n\tsudo install -d",
             )
-            + '\nprintf "was_running=%s\\n" "$was_running"\n',
+            + 'printf "was_running=%s\\n" "$was_running"\n',
             SCOPE=scope,
             STOP_STATE=stop_state,
         )
@@ -818,7 +722,7 @@ warn() { echo "$*" >&2; }
 sleep() { SECONDS=$((SECONDS + 121)); }
 """
             + section("shut_down_boot() {", "\nfirst_boot() {")
-            + '\nif shut_down_boot; then echo stopped; else echo "blocked:$boot_pid:$boot_stop_failed"; exit 1; fi\n',
+            + 'if shut_down_boot; then echo stopped; else echo "blocked:$boot_pid:$boot_stop_failed"; exit 1; fi\n',
             WRAPPER_ALIVE=str(wrapper_alive).lower(),
             JAVA_ALIVE=str(java_alive).lower(),
         )
@@ -852,10 +756,7 @@ sleep() { SECONDS=$((SECONDS + 121)); }
                     WARNING=self.WARNING,
                     SERVER=str(self.server),
                 )
-                self.assertIn(
-                    "auth-type: floodgate",
-                    (self.server / "config/Geyser-Fabric/config.yml").read_text(),
-                )
+                self.assertIn("auth-type: floodgate", self.geyser_config())
                 self.assertEqual(self.floodgate_config(), f"{locale}: en_US\n")
                 self.assertEqual(
                     "floodgate_locale=set"
@@ -867,8 +768,6 @@ sleep() { SECONDS=$((SECONDS + 121)); }
     def test_effective_geyser_ports(self):
         self.server.mkdir()
         (self.server / "server.properties").write_text("server-port=25566\n")
-        directory = self.server / "config/Geyser-Fabric"
-        directory.mkdir(parents=True)
         cases = [
             ("", "19132 19132"),
             ("bedrock:\n  port: 19133\n  clone-remote-port: true\n", "25566 0"),
@@ -884,7 +783,7 @@ sleep() { SECONDS=$((SECONDS + 121)); }
         ]
         for config, expected in cases:
             with self.subTest(config=config):
-                (directory / "config.yml").write_text(config)
+                self.geyser_config(config)
                 result = self.bash(
                     """STATE_FILE=.install-state
 JAVA_PORT=25565
@@ -894,17 +793,15 @@ peek() { "$@" 2>/dev/null; }
 info() { :; }
 die() { exit 1; }
 """
-                    + section("read_geyser_ports() {", "\nread_existing\n")
-                    + '\nread_existing\nread_geyser_ports\necho "$bedrock_port $signaling_port"\n'
+                    + section("readonly YAML_WALK=", "\nread_existing\n")
+                    + 'read_existing\nread_geyser_ports\necho "$bedrock_port $signaling_port"\n'
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
     def test_java_install_ignores_unused_geyser_settings(self):
         self.install()
-        directory = self.server / "config/Geyser-Fabric"
-        directory.mkdir(parents=True)
-        (directory / "config.yml").write_text("bedrock: {port: 19133}\n")
+        self.geyser_config("bedrock: {port: 19133}\n")
         self.install()
         self.install("--type", "geyser", expected=1)
 
@@ -935,13 +832,9 @@ warn() { echo "$*" >&2; }
 
     def test_firewall_ports_follow_effective_listeners(self):
         result = self.bash(
-            """java_port=25566
-bedrock_port=19134
-signaling_port=19135
-server_type=geyser
-"""
-            + section('ports=("$java_port/tcp")', "if systemctl is-active -q firewalld")
-            + '\nprintf "%s\\n" "${ports[@]}"\n'
+            "java_port=25566\nbedrock_port=19134\nsignaling_port=19135\nserver_type=geyser\n"
+            + section('ports=("$java_port/tcp")', "\nif ! command -v ss")
+            + 'printf "%s\\n" "${ports[@]}"\n'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -965,11 +858,8 @@ java_args=()
 unit_path=$FIXTURES/generated.service
 sudo() { if [[ $1 == tee ]]; then "$@"; fi; }
 """
-            + section("systemd_quote() {", "# The launcher command")
-            + section(
-                "if [[ $service_mode != none ]]; then\n\tif [[ $service_mode == system ]]; then",
-                "# --- firewall",
-            )
+            + section("systemd_quote() {", "\nprintf -v java_cmd")
+            + section("ordering='' hardening=''", "\nfirewall_note=''")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         unit = self.fixtures / "generated.service"
@@ -986,9 +876,6 @@ sudo() { if [[ $1 == tee ]]; then "$@"; fi; }
             timeout=15,
         )
         self.assertEqual(check.returncode, 0, check.stderr)
-        # verify still exits 0 after an ignored setting, such as "Invalid
-        # environment assignment" or an unknown key, but names the unit file
-        # in each warning. Warnings about other units on the host don't count.
         self.assertNotIn(unit.name, check.stderr)
 
 

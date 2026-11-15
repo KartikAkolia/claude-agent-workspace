@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Installer regressions. No root, package installation, or host changes required.
-
-Mandatory style gate: no nested shell if statements, including generated shell
-blocks. Run with shfmt on PATH: python3 scripts/test_install_fedora.py.
-"""
+"""install-fedora.sh regressions and the mandatory no-nested-if gate; needs shfmt."""
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -34,29 +31,31 @@ def shfmt_json(source):
 
 
 WRAPPERS = {"as_user", "run", "command", "exec", "env"}
+RC_EDIT = 'as_user() { "$@"; }; TARGET_HOME="$FIXTURE"; write_bashrc_block'
 
 
-def python_commands(node):
-    """Yields the arguments of every python3 command, after any wrapper words."""
+def walk(node, depth=0):
     if isinstance(node, list):
         for item in node:
-            yield from python_commands(item)
+            yield from walk(item, depth)
         return
     if not isinstance(node, dict):
         return
-    if node.get("Type") == "CallExpr":
-        words = [
-            "".join(part.get("Value", "?") for part in arg.get("Parts", []))
-            for arg in node.get("Args", [])
-        ]
+    yield node, depth
+    for value in node.values():
+        yield from walk(value, depth + (node.get("Type") == "IfClause"))
+
+
+def python_commands(tree):
+    for node, _ in walk(tree):
+        args = node.get("Args", []) if node.get("Type") == "CallExpr" else []
+        words = ["".join(p.get("Value", "?") for p in a.get("Parts", [])) for a in args]
         while words and (
             words[0] in WRAPPERS or words[0].startswith("-") or "=" in words[0]
         ):
             words = words[1:]
         if words and re.fullmatch(r"(.*/)?python3(\.\d+)?", words[0]):
             yield words[1:]
-    for value in node.values():
-        yield from python_commands(value)
 
 
 def write_os_release(directory, os_id, version):
@@ -74,8 +73,11 @@ def wait_for_text(path, text, timeout=10):
     return text in path.read_text()
 
 
-# Stubs for test_whole_dry_run_changes_nothing: read-only queries answer, and
-# anything that would change the host is recorded in $FIXTURE/forbidden.
+def kill_group(pid):
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
+
+
 DRY_RUN_STUBS = r"""
 forbid() { printf '%s\n' "$*" >>"$FIXTURE/forbidden"; return 99; }
 for cmd in dnf python3 setenforce setsebool kernel-install runuser setpriv curl \
@@ -145,20 +147,17 @@ class InstallerTests(unittest.TestCase):
         return result
 
     def test_cpu_matrix(self):
-        for level in (1, 2, 3):
-            for variant in ("cachyos", "rt", "lts", "server"):
-                expected = variant
-                if level == 1:
-                    expected = "none"
-                if level == 2 and variant in ("cachyos", "rt"):
-                    expected = "lts"
-                with self.subTest(level=level, variant=variant):
-                    result = self.ok(
-                        f"KERNEL_VARIANT={variant}; "
-                        f"cpu_supports_level() {{ (($1 <= {level})); }}; "
-                        'select_kernel_variant; echo "$KERNEL_VARIANT"'
-                    )
-                    self.assertEqual(result.stdout.strip(), expected)
+        variants = ("cachyos", "rt", "lts", "server")
+        for level, variant in [(lv, v) for lv in (1, 2, 3) for v in variants]:
+            downgraded = level == 2 and variant in ("cachyos", "rt")
+            expected = "none" if level == 1 else "lts" if downgraded else variant
+            with self.subTest(level=level, variant=variant):
+                result = self.ok(
+                    f"KERNEL_VARIANT={variant}; "
+                    f"cpu_supports_level() {{ (($1 <= {level})); }}; "
+                    'select_kernel_variant; echo "$KERNEL_VARIANT"'
+                )
+                self.assertEqual(result.stdout.strip(), expected)
 
     def test_uid_zero_rejected_including_alias(self):
         for user in ("root", "alias"):
@@ -171,10 +170,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("UID 0", result.stderr)
 
     def edit_rc(self, home):
-        return shell(
-            'as_user() { "$@"; }; TARGET_HOME="$FIXTURE"; write_bashrc_block',
-            env={"FIXTURE": str(home)},
-        )
+        return shell(RC_EDIT, env={"FIXTURE": str(home)})
 
     def test_bashrc_malformed_markers_preserved(self):
         fixtures = [
@@ -239,8 +235,6 @@ class InstallerTests(unittest.TestCase):
             code = 'update_dnf_conf "$FIXTURE"'
             self.ok(code, env={"FIXTURE": str(conf)})
             first = conf.read_bytes()
-            # The edit gets a fresh mtime; the one-time backup keeps the
-            # original's (P4-7: copystat used to backdate the edit).
             self.assertGreater(conf.stat().st_mtime, 1_000_000_000 + 86400)
             self.assertEqual(
                 Path(str(conf) + ".bak.install-fedora").stat().st_mtime,
@@ -251,7 +245,6 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn(b"defaultyes=False", first)
             self.assertIn(b"keep=True", first)
             self.assertEqual(conf.stat().st_mode & 0o777, 0o640)
-            # An unchanged file gets the distinct EDITOR_UNCHANGED status.
             rerun = shell(code, env={"FIXTURE": str(conf)})
             self.assertEqual(rerun.returncode, 3, rerun.stderr)
             self.assertEqual(conf.read_bytes(), first)
@@ -268,14 +261,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("[custom]\nfastestmirror=False", conf.read_text())
 
     def test_editors_ignore_planted_modules(self):
-        # Without -I, `python3 -` puts the cwd (and PYTHONPATH) first on sys.path,
-        # so a shutil.py in the directory sudo ran from would execute as root.
         with tempfile.TemporaryDirectory() as td:
             planted = Path(td) / "planted"
             planted.mkdir()
             marker = Path(td) / "imported"
-            # The editors' direct non-builtin imports; -I keeps the whole
-            # directory off sys.path, so transitive imports are covered too.
             for name in ("pathlib", "re", "shutil", "signal", "tempfile"):
                 (planted / f"{name}.py").write_text(
                     f"open({str(marker)!r}, 'w').write({name!r})\n"
@@ -296,11 +285,7 @@ class InstallerTests(unittest.TestCase):
             conf.write_text("[main]\n")
             env = {"FIXTURE": td, "PYTHONPATH": str(planted)}
             self.ok('update_dnf_conf "$FIXTURE/dnf.conf"', env=env, cwd=planted)
-            self.ok(
-                'as_user() { "$@"; }; TARGET_HOME="$FIXTURE"; write_bashrc_block',
-                env=env,
-                cwd=planted,
-            )
+            self.ok(RC_EDIT, env=env, cwd=planted)
             self.assertFalse(marker.exists())
             self.assertIn("max_parallel_downloads=10", conf.read_text())
             self.assertIn(BEGIN, (Path(td) / ".bashrc").read_text())
@@ -341,7 +326,6 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("CachyOS rt needs an x86-64-v3 CPU; using the LTS", result.stdout)
 
     def test_rerun_reports_kernel_that_is_not_default(self):
-        # After an interrupted first run the stock kernel can still be the default.
         image = "/boot/vmlinuz-7.3.1-1.cachyos1.el10.x86_64"
         for default, reported in (("/boot/vmlinuz-stock", True), (image, False)):
             with self.subTest(default=default):
@@ -356,7 +340,6 @@ class InstallerTests(unittest.TestCase):
                     'run() { echo "RUN $*"; }; step_kernel; '
                     'printf "%s\\n" "${SUMMARY[@]}"'
                 )
-                # Only install_kernel_packages restoring the existing default.
                 self.assertEqual(
                     set(re.findall(r"RUN grubby --set-default (\S+)", result.stdout)),
                     {default},
@@ -368,8 +351,6 @@ class InstallerTests(unittest.TestCase):
                 )
 
     def test_group_signal_keeps_logged_summary(self):
-        # A dropped SSH session or a timeout signals the whole process group,
-        # tee included, unlike test_failure_and_signal_preserve_summary.
         code = (
             f"source {shlex.quote(str(SCRIPT))}\n"
             'start_log "$LOG"; SUMMARY_READY=1; note "already completed"; '
@@ -377,37 +358,35 @@ class InstallerTests(unittest.TestCase):
             "echo READY; sleep 30"
         )
         for sig in (signal.SIGHUP, signal.SIGTERM):
-            with self.subTest(signal=sig.name), tempfile.TemporaryDirectory() as td:
+            with (
+                self.subTest(signal=sig.name),
+                tempfile.TemporaryDirectory() as td,
+                open(Path(td) / "terminal", "w") as out,
+            ):
                 log, terminal = Path(td) / "log", Path(td) / "terminal"
                 log.touch()
-                with terminal.open("w") as out:
-                    proc = subprocess.Popen(
-                        ["bash", "-c", code],
-                        env=os.environ | {"LOG": str(log)},
-                        stdout=out,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-                    try:
-                        self.assertTrue(wait_for_text(log, "READY"))
-                        os.killpg(proc.pid, sig)
-                        proc.wait(timeout=10)
-                    finally:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                for path in (log, terminal):
-                    self.assertTrue(
-                        wait_for_text(path, "already completed"),
-                        f"{path.name}: {path.read_text()!r}",
-                    )
+                proc = subprocess.Popen(
+                    ["bash", "-c", code],
+                    env=os.environ | {"LOG": str(log)},
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                self.addCleanup(kill_group, proc.pid)
+                self.assertTrue(wait_for_text(log, "READY"))
+                os.killpg(proc.pid, sig)
+                proc.wait(timeout=10)
+                lost = [
+                    f"{path.name}: {path.read_text()!r}"
+                    for path in (log, terminal)
+                    if not wait_for_text(path, "already completed")
+                ]
+                self.assertEqual(lost, [])
 
     def test_user_commands_do_not_inherit_run_lock(self):
         with tempfile.TemporaryDirectory() as td:
             result = self.ok(
                 'acquire_lock "$FIXTURE/lock"; '
-                # Control: children normally inherit the lock fd.
                 "sh -c '[ -e /proc/self/fd/9 ]'; "
                 "runuser() { sh -c '[ ! -e /proc/self/fd/9 ]'; }; "
                 "TARGET_USER=audit; TARGET_HOME=/home/audit; as_user true; "
@@ -417,8 +396,6 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("another install-fedora run is active", result.stderr)
 
     def test_missing_flock_is_reported_as_missing(self):
-        # P5-5: acquire_lock runs before preflight's require_commands, so it
-        # must name a missing flock rather than claim another run is active.
         with tempfile.TemporaryDirectory() as td:
             result = shell(
                 'have() { [[ "$1" != flock ]]; }; acquire_lock "$FIXTURE/lock"',
@@ -429,8 +406,6 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn("another install-fedora run is active", result.stderr)
 
     def test_log_tee_does_not_hold_run_lock(self):
-        # CR2-6: the lock is taken before the log starts, so tee must close
-        # fd 9 or it would keep the lock after the script exits.
         with tempfile.TemporaryDirectory() as td:
             result = self.ok(
                 'acquire_lock "$FIXTURE/lock"; start_log "$FIXTURE/log"; '
@@ -444,8 +419,6 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn("TEE-CLEAN", result.stderr)
 
     def test_second_run_does_not_write_into_active_log(self):
-        # CR2-6: main takes the lock before starting the log, so a concurrent
-        # run dies on the lock without appending to the first run's log.
         main_src = SCRIPT.read_text().split("\nmain() {", 1)[1]
         lock_at = main_src.index('acquire_lock "$LOCK_FILE"')
         log_at = main_src.index('start_log "$LOG_FILE"')
@@ -508,17 +481,15 @@ class InstallerTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("dry run: nothing was modified", result.stdout)
-                # Every note is marked as hypothetical, and nothing claims a
-                # reboot is needed now (CR-9: a dry run must not report state).
                 summary = result.stdout.split("Summary (dry run", 1)[1]
                 notes = [s for s in summary.splitlines() if s.startswith("  - ")]
                 self.assertTrue(notes)
-                for note in notes:
-                    self.assertTrue(note.startswith("  - [would] "), note)
+                unmarked = [n for n in notes if not n.startswith("  - [would] ")]
+                self.assertEqual(unmarked, [])
                 self.assertNotIn("Reboot required", summary)
                 self.assertIn("A real run would need a reboot", summary)
-                for command in planned:
-                    self.assertIn(command, result.stdout)
+                missing = [c for c in planned if c not in result.stdout]
+                self.assertEqual(missing, [])
 
     def test_soft_failure_sets_partial(self):
         self.ok(
@@ -604,7 +575,6 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("check that the loaded policy defines it", result.stderr)
 
     def test_keep_selinux_preflight_needs_boolean_tools_only_when_enabled(self):
-        # selinuxenabled exits 0 when SELinux is enabled.
         for missing, selinuxenabled_status, error in [
             ("[gs]etsebool", 1, None),
             ("[gs]etsebool", 0, "required command missing: getsebool"),
@@ -681,7 +651,6 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "unknown")
 
     def test_firmware_without_secure_boot_support_is_disabled(self):
-        # Non-secboot OVMF (OVMF_CODE.4m.fd) has EFI variables but no SecureBoot.
         result = self.ok(
             "efi_booted() { return 0; }; have() { [[ $1 != mokutil ]]; }; "
             'compgen() { [[ "$2" == *SecureBoot-* ]] && return 1; echo var; }; '
@@ -712,13 +681,12 @@ class InstallerTests(unittest.TestCase):
             original = b"user configuration remains intact\n"
             rc.write_bytes(original)
             result = shell(
-                'TARGET_HOME="$FIXTURE"; as_user() { "$@"; }; '
                 'python3() { [[ "$1" == -I ]] || exit 98; shift; '
                 "command python3 -I -c '"
                 "import os,sys; sys.argv=sys.argv[1:]; "
                 "os.replace=lambda *args: os._exit(143); "
                 'exec(compile(sys.stdin.read(), "editor", "exec"))\' "$@"; }; '
-                "write_bashrc_block",
+                + RC_EDIT,
                 env={"FIXTURE": td},
             )
             self.assertEqual(result.returncode, 143, result.stderr)
@@ -888,40 +856,20 @@ class InstallerTests(unittest.TestCase):
 
     def test_no_nested_if_statements(self):
         def check_shell(source):
-            def walk(node, depth=0):
-                if isinstance(node, list):
-                    for item in node:
-                        walk(item, depth)
-                    return
-                if not isinstance(node, dict):
-                    return
-                current = node.get("Type") == "IfClause"
-                self.assertFalse(current and depth, f"nested if at {node.get('Pos')}")
-                for value in node.values():
-                    walk(value, depth + int(current))
-
-            walk(shfmt_json(source))
+            for node, depth in walk(shfmt_json(source)):
+                nested = node.get("Type") == "IfClause" and depth
+                self.assertFalse(nested, f"nested if at {node.get('Pos')}")
 
         with self.assertRaises(AssertionError):
             check_shell("if true; then if true; then :; fi; fi")
         source = SCRIPT.read_text()
         check_shell(source)
-        # Heredoc contents are not parsed as shell by the outer shell parser.
-        rc_code = source.split('block = b"""', 1)[1].split('"""', 1)[0]
-        check_shell(rc_code)
-        # Apply the same rule to embedded Python editors.
+        check_shell(source.split('block = b"""', 1)[1].split('"""', 1)[0])
         for block in source.split("<<'PYTHON'\n")[1:]:
             tree = ast.parse(block.split("\nPYTHON", 1)[0])
-            for node in ast.walk(tree):
-                if isinstance(node, ast.If):
-                    descendants = [
-                        child
-                        for stmt in node.body + node.orelse
-                        for child in ast.walk(stmt)
-                    ]
-                    self.assertFalse(
-                        any(isinstance(child, ast.If) for child in descendants)
-                    )
+            ifs = [n for n in ast.walk(tree) if isinstance(n, ast.If)]
+            inner = [c for n in ifs for s in n.body + n.orelse for c in ast.walk(s)]
+            self.assertFalse(any(isinstance(c, ast.If) for c in inner))
 
 
 if __name__ == "__main__":

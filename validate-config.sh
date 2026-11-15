@@ -1,65 +1,39 @@
 #!/usr/bin/env bash
-# Validates that JSON/YAML files parse cleanly -- nothing else catches a typo
-# in .claude/settings.json or a workflow file before it silently breaks
-# hook/tool wiring at runtime. Takes file paths as arguments, like
-# check-markdown-links.py, so both the pre-commit hook (staged files) and
-# lint-markdown.sh/CI (all tracked files) can share this one script.
+# Checks that the given JSON and YAML files parse cleanly: JSON with python -m json.tool, every YAML
+# document with Ruby's Psych, aliases allowed and only plain types, dates and symbols loaded.
 set -uo pipefail
 
-if [ "$#" -eq 0 ]; then
-	exit 0
-fi
+[ "$#" -gt 0 ] || exit 0
 
 py=""
 for candidate in python3 python; do
-	if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
-		py="$candidate"
-		break
-	fi
+	command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1 && py=$candidate && break
 done
 
 status=0
 for f in "$@"; do
-	case "$f" in
-	*.json)
-		if [ -z "$py" ]; then
-			printf 'validate-config: no working python3/python interpreter found on PATH (needed for %s)\n' "$f" >&2
-			status=1
-			continue
-		fi
-		if ! "$py" -m json.tool "$f" >/dev/null; then
-			printf 'validate-config: %s: invalid JSON\n' "$f" >&2
-			status=1
-		fi
-		;;
-	*.yml | *.yaml)
-		if ! command -v ruby >/dev/null 2>&1; then
-			printf 'validate-config: ruby not found on PATH (needed for %s)\n' "$f" >&2
-			status=1
-			continue
-		fi
-		# Every document in the file is fully loaded -- as Psych.safe_load
-		# does, but with aliases allowed and once per document, since
-		# safe_load reads only the first -- so a syntax error anywhere, or an
-		# alias to an anchor that isn't defined, fails. The class loader is
-		# safe_load's restricted one: plain YAML types, plus dates and
-		# symbols; a !ruby/object tag is refused, never instantiated. Ruby's
-		# own message says where it broke.
-		if ! ruby -ryaml -rdate -e 'begin
-			loader = Psych::ClassLoader::Restricted.new(%w[Date DateTime Time Symbol], [])
-			scanner = Psych::ScalarScanner.new(loader)
-			Psych.parse_stream(File.read(ARGV[0]), filename: ARGV[0]).children.each do |doc|
-				Psych::Visitors::ToRuby.new(scanner, loader).accept(doc)
-			end
-		rescue Psych::Exception => e
-			warn "#{ARGV[0]}: #{e.message}"
-			exit 1
-		end' "$f"; then
-			printf 'validate-config: %s: invalid YAML\n' "$f" >&2
-			status=1
-		fi
-		;;
-	esac
+	if [[ $f == *.json && -z $py ]]; then
+		printf 'validate-config: no working python3/python interpreter found on PATH (needed for %s)\n' "$f" >&2
+		status=1
+	elif [[ $f == *.json ]] && ! "$py" -m json.tool "$f" >/dev/null; then
+		printf 'validate-config: %s: invalid JSON\n' "$f" >&2
+		status=1
+	elif [[ $f == *.yml || $f == *.yaml ]] && ! command -v ruby >/dev/null 2>&1; then
+		printf 'validate-config: ruby not found on PATH (needed for %s)\n' "$f" >&2
+		status=1
+	elif [[ $f == *.yml || $f == *.yaml ]] && ! ruby -ryaml -rdate -e 'begin
+		loader = Psych::ClassLoader::Restricted.new(%w[Date DateTime Time Symbol], [])
+		scanner = Psych::ScalarScanner.new(loader)
+		Psych.parse_stream(File.read(ARGV[0]), filename: ARGV[0]).children.each do |doc|
+			Psych::Visitors::ToRuby.new(scanner, loader).accept(doc)
+		end
+	rescue Psych::Exception => e
+		warn "#{ARGV[0]}: #{e.message}"
+		exit 1
+	end' "$f"; then
+		printf 'validate-config: %s: invalid YAML\n' "$f" >&2
+		status=1
+	fi
 done
 
 exit "$status"
