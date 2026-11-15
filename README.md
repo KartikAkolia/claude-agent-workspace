@@ -32,11 +32,11 @@ gem install --user-install --no-document mdl --bindir ~/.local/bin
 
 ## This repo's own tooling
 
-`lint-markdown.sh` is the repo's one lint entry point (the name predates what it's grown into — kept as-is since the pre-commit hook and CI both call it by name). It runs, across every tracked file outside the five read-only reference clones:
+`lint-markdown.sh` is the repo's one lint entry point (the name predates what it's grown into). It runs, across every tracked file outside the five read-only reference clones:
 
 - `mdl` plus `check-markdown-links.py` (catches local cross-references to files that no longer exist) on markdown.
 - `validate-config.sh` on JSON/YAML — just confirms it parses, catching a typo in `.claude/settings.json` or similar before it silently breaks hook/tool wiring at runtime.
-- `lint-bash.sh` (`shellcheck` + `shfmt -d` + `bash -n`, or `sh -n` for a `#!/bin/sh` script) on every shell script, found by shebang rather than a `.sh` extension since not all of them have one (`.githooks/pre-commit`). CI installs the shellcheck and shfmt versions recorded in `.lint-versions`, which the pre-commit hook keeps at your newest installed ones — bumping the file, re-linting every shell script with the new version, and failing the commit until the bump is staged — except for a line you've changed yourself or marked `# hold`. The full rules are under "Sync mode" in `lint-versions.sh`.
+- `lint-bash.sh` (`shellcheck` + `shfmt -d` + `bash -n`, or `sh -n` for a `#!/bin/sh` script) on every shell script, found by shebang rather than a `.sh` extension since not all of them have one (`.githooks/pre-commit`). CI installs the shellcheck and shfmt versions recorded in `.lint-versions`, which the pre-commit hook keeps at your newest installed ones — bumping the file, re-linting every shell script with the new version, and failing the commit until the bump is staged — except for a line you've changed yourself or marked `# hold`. The full rules are under [Sync mode](docs/repo-tooling.md#sync-mode) in `docs/repo-tooling.md`.
 - `lint-python.sh` (`ruff check` + `ruff format --check`, run via `uvx` so nothing needs a system-wide install) on every `.py` file — at exactly the `ruff` version in `.lint-versions`, set by hand, so local and CI never drift.
 
 `.githooks/pre-commit` runs the same four checks against whatever's staged, so `git commit` blocks on a style violation, a broken local link, invalid config, or a lint finding. Hooks come from `.githooks/`, not `.git/hooks/` — set once per clone with `git config core.hooksPath .githooks`.
@@ -60,6 +60,7 @@ Full breakdown — exact versions, which packages come from third-party apt repo
 - `SPEC.md` — what this project is, architecture, acceptance criteria.
 - `ROADMAP.md` / `TASKS.md` — phased plan and active-phase detail.
 - `docs/handoff.md` — continuity notes across sessions; older entries and closed items are in `docs/archival.md`.
+- `docs/scripts.md` — every tracked script with its purpose, doc, tests and who it runs as; `docs/repo-tooling.md` holds the detailed contracts of the lint, hook, mirror and Trilium tooling.
 - `docs/debian-host-claude-setup.md` — the `dell-optiplex` Debian desktop's equivalent setup (`apt`-based, x86-64, user `kartik`).
 - `docs/raspberry-pi-host-setup.md` — the Raspberry Pi 5 host's equivalent setup (Debian `aarch64`, user `pi`).
 - `docs/raspberry-pi-5-arch-linux-arm.md` — generic guide to installing Arch Linux ARM on a Raspberry Pi 5: the `linux-rpi` kernel swap, NVMe boot, EEPROM, hardening and recovery. Researched, not yet run on hardware.

@@ -2,5 +2,30 @@
   "enabledPlugins": {
     "code-simplifier@claude-plugins-official": true,
     "pr-review-toolkit@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(shellcheck *)",
+      "Bash(./lint-bash.sh *)",
+      "Bash(./lint-python.sh *)",
+      "Bash(pacman -Q *)",
+      "Bash(./list-lint-files.sh *)",
+      "Bash(nvim --version)",
+      "Bash(./lint-markdown.sh *)",
+      "Bash(systemctl --user show-environment)",
+      "Bash(systemctl is-active *)",
+      "Bash(pacman -Si *)",
+      "Bash(systemctl is-enabled *)",
+      "Bash(./validate-config.sh *)",
+      "Bash(findmnt *)",
+      "Bash(lspci *)",
+      "Bash(loginctl show-session *)",
+      "Bash(loginctl list-sessions *)",
+      "Bash(shfmt --version)",
+      "Bash(xrandr --listproviders)",
+      "Bash(pacman -Qq *)",
+      "Bash(systemctl status *)",
+      "Bash(xrandr --query)"
+    ]
   }
 }

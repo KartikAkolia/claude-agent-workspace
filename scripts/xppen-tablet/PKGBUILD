@@ -1,5 +1,7 @@
-# Local package of the official XP-Pen Linux driver (prebuilt binary).
-# Group allowed to change the driver's settings; the desktop user must be in it.
+# Local package of the official XP-Pen Linux driver (prebuilt binary); see README.md.
+# _confgroup may change the driver's settings (the desktop user must be in it).
+# shellcheck disable=SC2034,SC2154 # makepkg reads these globals and sets srcdir/pkgdir.
+# Docs: scripts/xppen-tablet/README.md
 _confgroup=wheel
 pkgname=xppen-tablet
 _pkgver=4.0.15
@@ -14,9 +16,7 @@ depends=('dbus' 'fontconfig' 'freetype2' 'glib2' 'libglvnd' 'libice' 'libpng'
 	'libsm' 'libusb' 'libx11' 'libxcb' 'libxext' 'libxi' 'libxrandr'
 	'libxrender' 'libxtst' 'systemd-libs' 'zlib')
 options=('!strip' '!debug')
-# Resets the config folder's permissions after every install and upgrade.
 install=xppen-tablet.install
-# The binary hardcodes its writable config under /usr/lib/pentablet/conf/xppen.
 backup=('usr/lib/pentablet/conf/xppen/config.xml'
 	'usr/lib/pentablet/conf/xppen/dialogpos.ini'
 	'usr/lib/pentablet/conf/xppen/language.ini'
@@ -37,35 +37,24 @@ package() {
 	cp -a "${app}/usr/lib/pentablet" "${pkgdir}/usr/lib/"
 	chmod 0755 "${pkgdir}/usr/lib/pentablet/PenTablet.sh" \
 		"${pkgdir}/usr/lib/pentablet/PenTablet"
-
-	# The GUI saves into this folder, so it must be writable, but only by
-	# $_confgroup rather than the vendor's 0777/0666 for everyone. No sticky
-	# bit, so members can rename a temp file over the root-owned files (Qt's
-	# atomic save); setgid keeps those temp files in the group.
+	# Writable only by $_confgroup, never the vendor's 0777/0666; setgid and no sticky bit for Qt's atomic save.
 	local conf="${pkgdir}/usr/lib/pentablet/conf/xppen"
 	chgrp "${_confgroup}" "${conf}" "${conf}/"{config.xml,*.ini}
 	chmod 2775 "${conf}"
 	chmod 0664 "${conf}/"{config.xml,*.ini}
-	# The .install reapplies these on install and upgrade with its own copy of
-	# the group (makepkg ships that file as-is), so the two must agree.
 	grep -qx "_xppen_confgroup=${_confgroup}" "${srcdir}/${install}" || {
 		echo "${install}: set _xppen_confgroup=${_confgroup} to match _confgroup" >&2
 		return 1
 	}
-
 	install -Dm755 "${srcdir}/xppentablet" "${pkgdir}/usr/bin/xppentablet"
-
 	install -Dm644 "${app}/usr/share/applications/xppentablet.desktop" \
 		"${pkgdir}/usr/share/applications/xppentablet.desktop"
 	install -Dm644 "${app}/etc/xdg/autostart/xppentablet.desktop" \
 		"${pkgdir}/etc/xdg/autostart/xppentablet.desktop"
 	install -Dm644 "${app}/usr/share/icons/hicolor/256x256/apps/xppentablet.png" \
 		"${pkgdir}/usr/share/icons/hicolor/256x256/apps/xppentablet.png"
-
-	# Replaces the vendor's world-writable (0666) rule with seat-scoped uaccess ACLs.
 	install -Dm644 "${srcdir}/70-xppen-tablet.rules" \
 		"${pkgdir}/usr/lib/udev/rules.d/70-xppen-tablet.rules"
-
 	install -Dm644 "${app}/usr/lib/pentablet/doc/EULA" \
 		"${pkgdir}/usr/share/licenses/${pkgname}/EULA"
 }

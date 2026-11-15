@@ -1,3 +1,2 @@
 #!/bin/sh
-# PenTablet.sh derives the binary from its own name, so it can't be symlinked.
 exec /usr/lib/pentablet/PenTablet.sh "$@"

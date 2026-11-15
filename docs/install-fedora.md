@@ -22,6 +22,8 @@ EPEL on EL, and enabling `fstrim.timer`, which `--no-guest-tools` doesn't
 skip. `--keep-selinux` also doesn't stop the kernel step from turning on one
 SELinux boolean; see [Kernel](#kernel). It never reboots by itself.
 
+Those defaults are Kartik's choice. `--hostname` sets a new static hostname; it must be dot-separated DNS labels of at most 253 characters, so an FQDN is fine. SELinux is disabled with `selinux=0` on every kernel's command line plus `SELINUX=disabled` in `/etc/selinux/config`, and an enforcing system is switched to permissive at once, so it's fully off only after a reboot. The guest agent is `qemu-guest-agent` on KVM/QEMU and `open-vm-tools` on VMware; bare metal and other hypervisors get none. `qemu-guest-agent` is device-activated and only starts when the VM has an `org.qemu.guest_agent.0` channel; without one the summary says to add it, and the run doesn't count that as a failure.
+
 Exit status 0 means every step finished, 2 means some requested packages
 didn't install, and anything else is a fatal error or a signal. The summary,
 including any pending reboot, still prints after a failure or Ctrl-C, but not
@@ -54,8 +56,9 @@ before touching the hostname or any config.
 
 A lock on `/run/install-fedora.lock` rejects a second concurrent run.
 Commands run as the target user, including the upstream installers, don't
-inherit the lock, so nothing they leave running can keep holding it. Next,
-`dnf check --dependencies --duplicates` must pass. Any existing RPM dependency
+inherit the lock, so nothing they leave running can keep holding it.
+The lock is taken before logging starts, so a second run is rejected before it can write into the active run's log, and the `tee` that writes the log closes the lock descriptor, so it can't keep holding the lock either. Taking the lock checks for `flock` itself, ahead of preflight, so a missing `flock` isn't reported as another active run.
+Next, `dnf check --dependencies --duplicates` must pass. Any existing RPM dependency
 or duplicate problem, even in an unrelated package, stops the run, typically
 after an interrupted DNF upgrade. Repair it first: DNF4 has
 `dnf remove --duplicates`; on DNF5 check `dnf remove --help`. Review the
@@ -77,6 +80,7 @@ directory, synced, given the original's metadata, checked for concurrent
 changes, then swapped in atomically. The first original is kept as
 `*.bak.install-fedora`. A power cut or SIGKILL can leave a stray
 `.install-fedora-*` temporary file, which is safe to delete.
+The original's metadata means its mode and extended attributes, so the SELinux label survives, plus its owner for `dnf.conf`; the modification time is set fresh, because `shutil.copystat` alone would backdate the edit. The `dnf.conf` editor exits 3 when the file already matches, which the shell reads as `EDITOR_UNCHANGED` and logs as already tuned instead of noting a change ([FED-7](script-audit-2026-11-14.md#low)); keep the two values equal.
 
 Both editors run as `python3 -I`, which ignores `PYTHON*` variables, user
 site-packages and the working directory. Without it, a module such as
@@ -94,6 +98,7 @@ asking for CachyOS or RT gets LTS, which the summary notes, and a CPU below
 v2 keeps the stock kernel.
 If Secure Boot is enabled or its state can't be read, the unsigned COPR kernel
 is skipped.
+Secure Boot counts as disabled on a BIOS boot or when `mokutil` reports it disabled or unsupported. A missing `SecureBoot` EFI variable, as on non-secboot OVMF firmware, counts as disabled only when other EFI variables are readable; an unreadable efivarfs counts as unknown.
 
 A freshly installed CachyOS kernel becomes the boot default. On reruns the
 current default is left alone, so a deliberate `grubby --set-default` rollback
@@ -101,17 +106,21 @@ to the stock kernel sticks. The script can't tell that rollback from a first
 run interrupted before it set the default, so when the newest CachyOS kernel
 isn't the default on a rerun, the summary says so and gives the
 `grubby --set-default` command instead of changing it.
+Before installing the kernel packages, the script records the boot default and restores it once DNF returns, also after a failure or an interruption, because RPM scriptlets can change it before the boot files are complete; a fresh install is then made the default explicitly. A rerun that finds the kernel and its `-devel-matched` package installed skips DNF for them, so it never upgrades the kernel.
 
 A missing `-devel-matched` package is installed on rerun. If an interrupted
 RPM transaction left the kernel without its initramfs or boot entry, the
 script regenerates them with `kernel-install` and keeps the existing default;
 select the CachyOS kernel yourself afterwards if you want it.
+The COPR `-core` package ships the kernel as `/lib/modules/<release>/vmlinuz` and doesn't own the `/boot` files, which `kernel-install` creates, so the script works out the release from that path rather than from `/boot`.
 
 With `--keep-selinux` on a host where SELinux is enabled, the kernel step
 still runs `setsebool -P domain_kernel_load_modules on` if `getsebool` shows
 the boolean off. This persistent policy change lets every SELinux domain have
 the kernel load modules, and the summary lists it. It happens only when the
 kernel step runs, so to keep SELinux without it, pass `--kernel none`.
+
+The build-tools step also installs `kernel-devel` for the running kernel, unless that's a CachyOS kernel, whose headers come from `-devel-matched`. Those headers can be gone from the repositories when the running kernel is older than the newest one; the run then exits 2, and the summary says to update the kernel, reboot and rerun.
 
 A reboot still pending from an earlier run is detected from the current boot
 default and SELinux state, and reported in the summary.
@@ -128,6 +137,7 @@ from upstream install scripts pinned to a version and checked against a
 SHA-256 before they run. Updating either means changing its URL and checksum
 in the script. The pinned zoxide installer still downloads the latest zoxide
 binary. Both depend on trusting the upstream HTTPS services.
+Only the installer scripts are checksummed here, not the release binaries they fetch. The zoxide installer also installs man pages, so `~/.local/share/man` is created and checked writable along with `~/.local/bin`.
 
 `--dry-run` makes no writes and no DNF repository queries, so it can't tell
 whether a distro package exists. It may show an upstream download where a real
@@ -135,6 +145,7 @@ run would use `dnf`. Its summary marks every note `[would]`, since nothing was
 installed, and says a real run would need a reboot rather than that one is
 required. `OS_RELEASE_FILE` overrides OS detection, but only together with
 `--dry-run`.
+Steps word their notes as results, such as `firewalld masked`, and the summary adds the dry-run marking, so a new step doesn't need different wording per mode.
 
 ## Validation
 

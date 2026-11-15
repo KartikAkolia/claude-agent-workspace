@@ -1,27 +1,8 @@
 #!/usr/bin/env bash
-# install-fedora.sh — post-install setup for EL10 (Rocky / AlmaLinux /
-# CentOS Stream / RHEL 10) and Fedora, on VMs and bare metal.
-#
-# Replicates the rocky10 VM setup from 2026-11-06:
-#   dnf.conf tuning, CRB + EPEL (EL only), build toolchain + kernel headers,
-#   CachyOS kernel (COPR), SELinux off (selinux=0 + config), firewalld off,
-#   guest agent on KVM/QEMU (or open-vm-tools on VMware), fstrim.timer,
-#   OpenJDK, fzf + zoxide + starship with a managed ~/.bashrc block,
-#   and optionally Cockpit removal / a new hostname.
-#
-# Control-flow rule: never nest if statements; use guard clauses and helpers.
-# Enforced by scripts/test_install_fedora.py.
-# Nothing prompts:
-# behaviour is set by flags (see --help). Use --dry-run to print the commands
-# without changing anything.
-#
-# Network trust: fallback installers are pinned and SHA-256 checked, then run
-# as a non-root user with no_new_privs and a clean environment. They fetch
-# upstream release binaries over HTTPS; zoxide also installs local man pages.
-# Release binaries remain trusted upstream content, not independently signed here.
-#
-# Not supported: Fedora Atomic / rpm-ostree systems (Silverblue, Kinoite,
-# Bazzite) — they need rpm-ostree, not dnf.
+# install-fedora.sh: post-install setup for EL10 (Rocky/Alma/CentOS Stream/RHEL 10) and Fedora.
+# Flags only, no prompts (see --help; --dry-run changes nothing).
+# Never nest if statements here or in the embedded code; scripts/test_install_fedora.py enforces it.
+# Docs: docs/install-fedora.md
 
 set -Eeuo pipefail
 
@@ -36,11 +17,8 @@ readonly USER_PATH="/usr/local/bin:/usr/bin:/bin"
 readonly BASHRC_BEGIN="# >>> install-fedora.sh >>>"
 readonly BASHRC_END="# <<< install-fedora.sh <<<"
 readonly LOCK_FILE="/run/install-fedora.lock"
-# Exit status of update_dnf_conf's editor when the file already matches.
 readonly EDITOR_UNCHANGED=3
 
-# Defaults (the user chose SELinux off, firewalld off and the CachyOS kernel
-# as defaults; Cockpit removal is opt-in).
 DRY_RUN=0
 TARGET_USER=""
 NEW_HOSTNAME=""
@@ -53,9 +31,8 @@ DO_BUILD_TOOLS=1
 DO_CLI_TOOLS=1
 DO_GUEST_TOOLS=1
 
-# Filled in by detect_system.
 OS_ID=""
-OS_FAMILY="" # el | fedora
+OS_FAMILY=""
 OS_VERSION=""
 IS_DNF5=0
 VIRT="none"
@@ -66,8 +43,6 @@ SUMMARY=()
 PARTIAL_FAILURE=0
 SUMMARY_READY=0
 BOOT_DEFAULT_TO_RESTORE=""
-
-# OS_RELEASE_FILE lets --dry-run be exercised against a sample os-release.
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 
 usage() {
@@ -113,7 +88,6 @@ die() {
 }
 note() { SUMMARY+=("$*"); }
 
-# Runs a command, or prints it under --dry-run.
 run() {
 	if ((DRY_RUN)); then
 		printf '[dry-run] %s\n' "${*@Q}"
@@ -122,8 +96,6 @@ run() {
 	"$@"
 }
 
-# Runs a command as the target user with that user's HOME. Fd 9, the run lock,
-# is closed so nothing a user command or installer leaves running holds it.
 as_user() {
 	run runuser -u "$TARGET_USER" -- setpriv --no-new-privs env -i \
 		HOME="$TARGET_HOME" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
@@ -146,15 +118,9 @@ pkg_available() {
 	[[ -n "$result" ]]
 }
 
-# Best-effort install: tries the whole list at once, then one at a time so a
-# single missing package doesn't block the rest. Missing ones are reported.
 dnf_install_soft() {
 	(($#)) || return 0
-	if ((DRY_RUN)); then
-		run dnf install -y "$@"
-		return 0
-	fi
-	dnf install -y "$@" && return 0
+	run dnf install -y "$@" && return 0
 	warn "batch install failed; retrying one package at a time"
 	local pkg failed=()
 	for pkg in "$@"; do
@@ -194,16 +160,14 @@ parse_args() {
 		esac
 		case "$opt" in
 		--user | --hostname | --kernel | --java)
-			if ((! has_val)); then
-				(($# >= 2)) || die "$opt needs a value"
+			((has_val)) || (($# >= 2)) || die "$opt needs a value"
+			((has_val)) || {
 				val="$2"
 				shift
-			fi
+			}
 			[[ -n "$val" ]] || die "$opt needs a non-empty value"
 			;;
-		*)
-			((! has_val)) || die "$opt does not take a value"
-			;;
+		*) ((! has_val)) || die "$opt does not take a value" ;;
 		esac
 		case "$opt" in
 		--dry-run) DRY_RUN=1 ;;
@@ -234,12 +198,10 @@ parse_args() {
 	21 | 25 | none) ;;
 	*) die "--java must be 21, 25 or none (got '$JAVA_VERSION')" ;;
 	esac
-	# Dot-separated DNS labels (an FQDN is fine), 253 characters at most.
 	local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
-	if [[ -n "$NEW_HOSTNAME" ]] &&
-		{ ((${#NEW_HOSTNAME} > 253)) || [[ ! "$NEW_HOSTNAME" =~ ^$label(\.$label)*$ ]]; }; then
+	[[ -z "$NEW_HOSTNAME" ]] ||
+		{ ((${#NEW_HOSTNAME} <= 253)) && [[ "$NEW_HOSTNAME" =~ ^$label(\.$label)*$ ]]; } ||
 		die "invalid hostname: '$NEW_HOSTNAME'"
-	fi
 }
 
 detect_system() {
@@ -262,25 +224,13 @@ detect_system() {
 	*) die "unsupported OS '$ID' — this script targets EL10 and Fedora" ;;
 	esac
 
-	if [[ -e /run/ostree-booted ]]; then
-		die "rpm-ostree (Atomic) systems are not supported; use rpm-ostree instead"
-	fi
-
-	if ((! DRY_RUN)) && ((EUID != 0)); then
-		die "run as root: sudo ./$SCRIPT_NAME"
-	fi
-
-	if have dnf && [[ "$(readlink -f "$(command -v dnf)")" == *dnf5 ]]; then
-		IS_DNF5=1
-	fi
-
-	if have systemd-detect-virt; then
-		VIRT="$(systemd-detect-virt 2>/dev/null || true)"
-		[[ -n "$VIRT" ]] || VIRT="none"
-	fi
+	[[ ! -e /run/ostree-booted ]] || die "rpm-ostree (Atomic) systems are not supported; use rpm-ostree instead"
+	((DRY_RUN || EUID == 0)) || die "run as root: sudo ./$SCRIPT_NAME"
+	have dnf && [[ "$(readlink -f "$(command -v dnf)")" == *dnf5 ]] && IS_DNF5=1
+	have systemd-detect-virt && VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+	VIRT="${VIRT:-none}"
 
 	TARGET_USER="${TARGET_USER:-${SUDO_USER:-}}"
-	# Only the CLI tools step needs a user; don't reject e.g. SUDO_USER=root without it.
 	((DO_CLI_TOOLS)) || TARGET_USER=""
 	detect_target_user
 
@@ -344,20 +294,16 @@ step_hostname() {
 step_package_health() {
 	CURRENT_STEP="RPM integrity"
 	((DRY_RUN)) && return 0
-	# Exclude obsoletes checks: COPR's metapackage has self-matching legacy Provides.
 	dnf check --dependencies --duplicates ||
 		die "RPM dependency/duplicate errors detected; repair interrupted package transactions, pass 'dnf check --dependencies --duplicates', then rerun"
 }
 detect_pending_reboot() {
 	have grubby || return 0
-	local boot runtime
+	local boot
 	boot="$(grubby --default-kernel 2>/dev/null || true)"
-	if [[ -n "$boot" && "$boot" != "/boot/vmlinuz-$(uname -r)" ]]; then
-		NEED_REBOOT=1
-	fi
+	[[ -z "$boot" || "$boot" == "/boot/vmlinuz-$(uname -r)" ]] || NEED_REBOOT=1
 	((DISABLE_SELINUX)) && have getenforce || return 0
-	runtime="$(getenforce 2>/dev/null || true)"
-	[[ "$runtime" != Disabled ]] || return 0
+	[[ "$(getenforce 2>/dev/null || true)" != Disabled ]] || return 0
 	all_kernels_disable_selinux && NEED_REBOOT=1
 	return 0
 }
@@ -378,24 +324,18 @@ step_dnf_conf() {
 	esac
 }
 update_dnf_conf() {
-	# -I: ignore PYTHON* variables, user site-packages and the cwd, so a module
-	# planted in the directory sudo was run from is never imported as root.
+	# -I keeps the cwd and PYTHON* off sys.path, so a planted module never runs as root.
 	python3 -I - "$1" <<'PYTHON'
 import os, pathlib, re, shutil, signal, sys, tempfile
-def interrupted(signum, _frame):
-    raise SystemExit(128 + signum)
 for signum in (signal.SIGHUP, signal.SIGTERM):
-    signal.signal(signum, interrupted)
+    signal.signal(signum, lambda signum, _frame: sys.exit(128 + signum))
 p = pathlib.Path(sys.argv[1])
 if p.is_symlink():
     sys.exit("refusing symlinked dnf.conf")
 old = p.read_bytes() if p.exists() else b""
-lines = old.decode().splitlines(keepends=True)
-section = None
-seen = False
-out = []
+section, seen, out = None, False, []
 keys = "defaultyes=True\nmax_parallel_downloads=10\nfastestmirror=True\n"
-for line in lines:
+for line in old.decode().splitlines(keepends=True):
     match = re.match(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$", line)
     section = match[1] if match else section
     if match and section == "main":
@@ -407,7 +347,7 @@ for line in lines:
     out.append(line)
 new = (("" if seen else "[main]\n" + keys) + "".join(out)).encode()
 if new == old:
-    sys.exit(3)  # EDITOR_UNCHANGED in the shell
+    sys.exit(3)
 fd, tmp = tempfile.mkstemp(prefix=".install-fedora-", dir=p.parent)
 try:
     with os.fdopen(fd, "wb") as f:
@@ -415,12 +355,10 @@ try:
         f.flush()
         os.fsync(f.fileno())
     if p.exists():
-        # Mode, flags and xattrs (SELinux label) from the old file, but a
-        # fresh mtime: copystat would otherwise backdate the edit.
         shutil.copystat(p, tmp)
         os.utime(tmp)
         os.chown(tmp, p.stat().st_uid, p.stat().st_gid)
-    if not p.exists():
+    else:
         os.chmod(tmp, 0o644)
     if p.exists() and not os.path.lexists(str(p) + ".bak.install-fedora"):
         shutil.copy2(p, str(p) + ".bak.install-fedora")
@@ -428,10 +366,8 @@ try:
         sys.exit("dnf.conf changed concurrently; refusing replacement")
     os.replace(tmp, p)
     directory = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    os.fsync(directory)
+    os.close(directory)
 finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
@@ -449,11 +385,9 @@ enable_crb() {
 		return 0
 	fi
 	ensure_dnf_plugins
-	if ((IS_DNF5)); then
-		run dnf config-manager setopt crb.enabled=1
-		return 0
-	fi
-	run dnf config-manager --set-enabled crb
+	local args=(--set-enabled crb)
+	((IS_DNF5 == 0)) || args=(setopt crb.enabled=1)
+	run dnf config-manager "${args[@]}"
 }
 step_repos() {
 	CURRENT_STEP="repositories"
@@ -483,11 +417,9 @@ step_build_tools() {
 	CURRENT_STEP="build tools"
 	((DO_BUILD_TOOLS)) || return 0
 	log "Installing compiler toolchain, -devel libraries and kernel headers"
-	if [[ "$OS_FAMILY" == el ]]; then
-		run dnf group install -y "Development Tools"
-	else
-		run dnf group install -y development-tools c-development
-	fi
+	local groups=(development-tools c-development)
+	[[ "$OS_FAMILY" != el ]] || groups=("Development Tools")
+	run dnf group install -y "${groups[@]}"
 	dnf_install_soft \
 		cmake meson ninja-build pkgconf-pkg-config clang llvm gdb perl \
 		python3-devel python3-pip \
@@ -495,22 +427,15 @@ step_build_tools() {
 		readline-devel sqlite-devel ncurses-devel libcurl-devel \
 		libxml2-devel elfutils-libelf-devel \
 		kernel-devel kernel-headers dkms
-	# Headers for the running kernel; absent from the repos when the running
-	# kernel is older than the newest available one. A running CachyOS kernel
-	# gets its headers from kernel-cachyos*-devel-matched (step_kernel).
 	if [[ "$(uname -r)" == *cachy* ]]; then
 		log "Running a CachyOS kernel; its headers come from the -devel-matched package"
-	elif ! pkg_installed "kernel-devel-$(uname -r)"; then
-		run dnf install -y "kernel-devel-$(uname -r)" ||
-			{
-				PARTIAL_FAILURE=1
-				note "kernel-devel-$(uname -r) unavailable; update the kernel, reboot and rerun"
-			}
+	elif ! pkg_installed "kernel-devel-$(uname -r)" && ! run dnf install -y "kernel-devel-$(uname -r)"; then
+		PARTIAL_FAILURE=1
+		note "kernel-devel-$(uname -r) unavailable; update the kernel, reboot and rerun"
 	fi
 	note "Build toolchain processed; see incomplete package notices, if any"
 }
 
-# Returns text: enabled, disabled, or unknown. Failed probes are not disabled.
 efi_booted() { [[ -d /sys/firmware/efi ]]; }
 secure_boot_state() {
 	local state="" var value
@@ -520,21 +445,9 @@ secure_boot_state() {
 		echo enabled
 		return 0
 		;;
-	*"doesn't support Secure Boot"*)
-		# mokutil's message when the firmware has no SecureBoot variable.
+	*"doesn't support Secure Boot"* | *"SecureBoot disabled"*)
 		echo disabled
 		return 0
-		;;
-	*"SecureBoot disabled"* | *"EFI variables are not supported on this system"*)
-		# Only a BIOS boot independently proves Secure Boot is inapplicable.
-		efi_booted || {
-			echo disabled
-			return 0
-		}
-		[[ "$state" != *"SecureBoot disabled"* ]] || {
-			echo disabled
-			return 0
-		}
 		;;
 	esac
 	efi_booted || {
@@ -543,26 +456,17 @@ secure_boot_state() {
 	}
 	var="$(compgen -G '/sys/firmware/efi/efivars/SecureBoot-*' | head -n1 || true)"
 	[[ -n "$var" ]] || {
-		missing_secure_boot_variable_state
+		state=disabled
+		compgen -G '/sys/firmware/efi/efivars/*-*' >/dev/null || state=unknown
+		echo "$state"
 		return 0
 	}
-	value="$(od -An -t u1 -j4 -N1 "${var:-/nonexistent}" 2>/dev/null | tr -d ' ' || true)"
+	value="$(od -An -t u1 -j4 -N1 "$var" 2>/dev/null | tr -d ' ' || true)"
 	case "$value" in
 	1) echo enabled ;;
 	0) echo disabled ;;
 	*) echo unknown ;;
 	esac
-}
-
-# Firmware without Secure Boot support (e.g. OVMF_CODE.4m.fd, the non-secboot
-# OVMF build) never creates the SecureBoot variable. Trust its absence only
-# when other EFI variables are readable; an unreadable efivarfs stays unknown.
-missing_secure_boot_variable_state() {
-	compgen -G '/sys/firmware/efi/efivars/*-*' >/dev/null || {
-		echo unknown
-		return 0
-	}
-	echo disabled
 }
 
 cpu_supports_level() {
@@ -613,9 +517,6 @@ step_kernel() {
 	fi
 	allow_kernel_module_loading
 }
-# Reruns keep the boot default so a deliberate rollback sticks, but the stock
-# kernel can also still be the default after an interrupted first run. Report
-# it instead of guessing which one this is.
 report_kernel_not_default() {
 	local pkg="$1" image
 	((DRY_RUN == 0)) || return 0
@@ -627,8 +528,6 @@ selinux_kept_and_enabled() {
 	((DISABLE_SELINUX == 0)) || return 1
 	have selinuxenabled && selinuxenabled
 }
-# --keep-selinux on an SELinux host: this persistent policy change goes in the
-# summary rather than happening silently, and only when the boolean is off.
 allow_kernel_module_loading() {
 	selinux_kept_and_enabled || return 0
 	[[ "$(getsebool domain_kernel_load_modules 2>/dev/null)" != *"--> on" ]] || return 0
@@ -638,17 +537,13 @@ allow_kernel_module_loading() {
 }
 install_kernel_packages() {
 	local pkg="$1" fresh="$2"
-	# Do not upgrade an already complete installation or change a deliberate rollback.
 	if ((fresh == 0)) && pkg_installed "$pkg-devel-matched"; then
 		log "$pkg and its development package already installed; boot default preserved"
 		return 0
 	fi
 	ensure_dnf_plugins
 	run dnf copr enable -y "$COPR_CACHYOS"
-	# RPM scriptlets can change the default before boot-file generation finishes.
-	if ((DRY_RUN == 0)); then
-		BOOT_DEFAULT_TO_RESTORE="$(grubby --default-kernel)"
-	fi
+	((DRY_RUN)) || BOOT_DEFAULT_TO_RESTORE="$(grubby --default-kernel)"
 	((fresh == 0)) || NEED_REBOOT=1
 	run dnf install -y "$pkg" "$pkg-devel-matched" || {
 		restore_boot_default
@@ -666,7 +561,6 @@ restore_boot_default() {
 }
 kernel_boot_image() {
 	local version
-	# COPR owns /lib/modules/<release>/vmlinuz; kernel-install creates /boot files.
 	version="$(rpm -ql "$1-core" | sed -nE 's#^/(usr/)?lib/modules/([^/]+)/vmlinuz$#\2#p' | sort -Vu | tail -n1)"
 	[[ -n "$version" ]] || return 1
 	printf '/boot/vmlinuz-%s\n' "$version"
@@ -710,9 +604,7 @@ set_kernel_default() {
 }
 
 all_kernels_disable_selinux() {
-	local info
-	info="$(grubby --info=ALL)" || return 1
-	awk '
+	grubby --info=ALL | awk '
  /^args=/ {
   count++; line=$0; sub(/^args="?/, "", line); sub(/"$/, "", line)
   n=split(line, a, /[[:space:]]+/); found=0
@@ -720,13 +612,12 @@ all_kernels_disable_selinux() {
   if (!found) bad=1
  }
  END { exit !(count && !bad) }
- ' <<<"$info"
+ '
 }
 step_selinux() {
 	CURRENT_STEP="SELinux"
 	((DISABLE_SELINUX)) || return 0
-	local runtime
-	runtime=unknown
+	local runtime=unknown
 	have getenforce && runtime="$(getenforce)"
 	[[ "$runtime" == Disabled ]] || NEED_REBOOT=1
 	if ((DRY_RUN)) || ! all_kernels_disable_selinux; then
@@ -734,16 +625,15 @@ step_selinux() {
 		run grubby --update-kernel=ALL --args=selinux=0
 		note "selinux=0 configured on all kernels"
 	fi
-	if [[ -f /etc/selinux/config ]] && ! grep -q '^SELINUX=disabled$' /etc/selinux/config; then
+	[[ ! -f /etc/selinux/config ]] || grep -q '^SELINUX=disabled$' /etc/selinux/config ||
 		run sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
-	fi
 	[[ "$runtime" != Enforcing ]] || run setenforce 0
 }
 
 step_firewall() {
 	CURRENT_STEP="firewalld"
 	((DISABLE_FIREWALL)) || return 0
-	local units
+	local units hint=""
 	units="$(systemctl list-unit-files --no-legend firewalld.service 2>/dev/null || true)"
 	if [[ "$units" != firewalld.service* ]]; then
 		log "firewalld not installed"
@@ -758,11 +648,8 @@ step_firewall() {
 	run systemctl stop firewalld
 	[[ "$(systemctl is-enabled firewalld 2>/dev/null)" == masked ]] || run systemctl disable firewalld
 	run systemctl mask firewalld
-	if [[ "$VIRT" == none ]]; then
-		note "firewalld masked — review exposed listening services on this host"
-	else
-		note "firewalld masked"
-	fi
+	[[ "$VIRT" != none ]] || hint=" — review exposed listening services on this host"
+	note "firewalld masked$hint"
 }
 
 step_cockpit() {
@@ -788,8 +675,6 @@ step_guest_tools() {
 	kvm | qemu)
 		log "KVM/QEMU guest: installing qemu-guest-agent"
 		pkg_installed qemu-guest-agent || run dnf install -y qemu-guest-agent
-		# Starts only when the VM has an org.qemu.guest_agent.0 channel; the
-		# unit is device-activated, so a missing channel is not an error here.
 		run systemctl enable qemu-guest-agent
 		if run systemctl start qemu-guest-agent; then
 			note "qemu-guest-agent installed and running"
@@ -821,12 +706,10 @@ step_java() {
 	fi
 	log "Installing $pkg"
 	dnf_install_soft "$pkg"
-	if ((DRY_RUN)) || pkg_installed "$pkg"; then
-		note "OpenJDK $JAVA_VERSION installed ($pkg)"
-	fi
+	((DRY_RUN)) || pkg_installed "$pkg" || return 0
+	note "OpenJDK $JAVA_VERSION installed ($pkg)"
 }
 
-# Downloads an upstream installer and runs it as the target user.
 run_user_installer() {
 	local url="$1" digest="$2"
 	shift 2
@@ -834,7 +717,6 @@ run_user_installer() {
 		printf '[dry-run] verify installer SHA-256 and run without privilege escalation as %s: %s\n' "$TARGET_USER" "$url"
 		return 0
 	fi
-	# no_new_privs inherited from as_user prevents sudo/setuid escalation.
 	# shellcheck disable=SC2016
 	as_user sh -c '
   set -eu
@@ -878,10 +760,8 @@ step_cli_tools() {
 	fi
 	log "Installing fzf"
 	pkg_installed fzf || run dnf install -y fzf
-
 	ensure_zoxide
 	ensure_starship
-
 	write_bashrc_block
 	note "fzf, zoxide (z/zi) and starship set up for $TARGET_USER"
 }
@@ -892,13 +772,10 @@ write_bashrc_block() {
 		printf '[dry-run] validate markers and atomically update %s as %s\n' "$rc" "$TARGET_USER"
 		return 0
 	fi
-	# -I keeps the caller's cwd off sys.path, as in update_dnf_conf.
 	as_user python3 -I - "$rc" "$BASHRC_BEGIN" "$BASHRC_END" <<'PYTHON'
 import os, pathlib, shutil, signal, sys, tempfile
-def interrupted(signum, _frame):
-    raise SystemExit(128 + signum)
 for signum in (signal.SIGHUP, signal.SIGTERM):
-    signal.signal(signum, interrupted)
+    signal.signal(signum, lambda signum, _frame: sys.exit(128 + signum))
 p = pathlib.Path(sys.argv[1])
 begin, end = (s.encode() for s in sys.argv[2:])
 if p.is_symlink() or (p.exists() and not p.is_file()):
@@ -906,8 +783,7 @@ if p.is_symlink() or (p.exists() and not p.is_file()):
 if p.exists() and p.stat().st_uid != os.getuid():
     sys.exit(".bashrc must be owned by target user")
 old = p.read_bytes() if p.exists() else b""
-out = []
-inside = False
+out, inside = [], False
 for line in old.splitlines(keepends=True):
     marker = line.rstrip(b"\r\n")
     if marker == begin and inside:
@@ -946,7 +822,6 @@ try:
         f.flush()
         os.fsync(f.fileno())
     if p.exists():
-        # Keep the old mode and xattrs but give the edit a fresh mtime.
         shutil.copystat(p, tmp)
         os.utime(tmp)
     if p.exists() and not os.path.lexists(str(p) + ".bak.install-fedora"):
@@ -955,19 +830,14 @@ try:
         sys.exit(".bashrc changed concurrently; refusing replacement")
     os.replace(tmp, p)
     directory = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    os.fsync(directory)
+    os.close(directory)
 finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PYTHON
 }
 
-# Steps word their notes as results ("firewalld masked"). A dry run changes
-# nothing, so each note is marked as what a real run would report, and the
-# reboot notice is conditional, rather than rewording every note per mode.
 print_summary() {
 	local line mark="" reboot="Reboot required for the kernel / SELinux changes. After rebooting, verify with:"
 	printf '\n'
@@ -982,20 +852,14 @@ print_summary() {
 		printf '  - %s%s\n' "$mark" "$line"
 	done
 	((${#SUMMARY[@]})) || printf '  - %snothing changed\n' "$mark"
-	if ((NEED_REBOOT)); then
-		printf '\n'
-		log "$reboot"
-		printf '    uname -r                 # CachyOS kernel if one was installed\n'
-		printf '    getenforce               # Disabled, unless --keep-selinux\n'
-		printf '    sudo grubby --default-kernel\n'
-	fi
+	((NEED_REBOOT)) || return 0
+	printf '\n'
+	log "$reboot"
+	printf '    uname -r                 # CachyOS kernel if one was installed\n'
+	printf '    getenforce               # Disabled, unless --keep-selinux\n'
+	printf '    sudo grubby --default-kernel\n'
 }
 
-# Copies all output to the log. tee ignores HUP and TERM so a signal to the whole
-# process group (dropped SSH, timeout) can't kill it and take the summary with
-# it. INT stays as it is: listing it here would reset it and lose Ctrl-C. The
-# log starts after the lock, so tee closes the lock fd: a concurrent run never
-# writes into the active run's log, and tee can't outlive us holding the lock.
 start_log() {
 	exec > >(
 		exec 9>&-
@@ -1004,9 +868,6 @@ start_log() {
 	) 2>&1
 	printf '\n--- %s run %s ---\n' "$SCRIPT_NAME" "$(date -Is)"
 }
-# Fixed fd 9, so as_user can close it for user commands and installers.
-# Runs before preflight, so it checks for flock itself: a missing flock must
-# not read as "another run is active".
 acquire_lock() {
 	require_commands flock
 	exec 9>"$1"
@@ -1017,9 +878,6 @@ main() {
 	parse_args "$@"
 	trap 'on_error $LINENO' ERR
 	detect_system
-	# After detect_system's root check. The lock comes first so a second run
-	# fails before it can append to the active run's log; preflight is still
-	# logged.
 	((DRY_RUN)) || acquire_lock "$LOCK_FILE"
 	((DRY_RUN)) || start_log "$LOG_FILE"
 	preflight

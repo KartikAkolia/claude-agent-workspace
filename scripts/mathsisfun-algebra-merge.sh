@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# Combine all per-page PDFs into one book, in urls.txt crawl order.
-#
-# Every URL in urls.txt needs a non-empty PDF in pdf_dir. If any are missing,
-# this lists them and stops without writing the book, unless --allow-missing
-# is given, in which case it merges the rest and still lists what it left out.
-# A URL whose slug an earlier URL already took counts as missing, since
-# render.py refuses to render it over that PDF; the same URL listed twice is
-# merged once.
+# Combine the per-page PDFs into one book, in urls.txt crawl order. A URL with
+# no non-empty PDF stops the merge unless --allow-missing is given.
+# Docs: docs/mathsisfun-pdf-scrape.md
 set -euo pipefail
 
 usage() {
@@ -53,29 +48,24 @@ command -v pdfunite >/dev/null 2>&1 || {
 	exit 1
 }
 
+# Must match slugify() in mathsisfun-algebra-render.py, or PDFs go unfound.
 slugify() {
-	# Must stay identical to slugify() in mathsisfun-algebra-render.py: drops
-	# the leading section (/algebra/, /data/, ...) and .html, then turns every
-	# run of non-alphanumerics into one dash. LC_ALL=C keeps A-Z/a-z ASCII-only,
-	# matching Python's re.
 	printf '%s' "$1" |
 		LC_ALL=C sed -E 's#^https?://[^/]+##; s#^/[^/]+/##; s#\.html$##; s#[^A-Za-z0-9]+#-#g; s#^-+|-+$##g'
 }
 
-declare -A slug_owner=() # slug -> first URL that claimed it, as in render.py
+declare -A slug_owner=()
 files=()
 missing=()
 total=0
 while IFS= read -r url || [ -n "$url" ]; do
-	# Trim surrounding whitespace (CR included, for CRLF files) the same way
-	# render.py's str.strip() does, so both derive the same slug.
 	url="${url#"${url%%[![:space:]]*}"}"
 	url="${url%"${url##*[![:space:]]}"}"
 	[ -z "$url" ] && continue
 	slug=$(slugify "$url")
 	slug="${slug:-index}"
 	owner="${slug_owner[$slug]-}"
-	[ "$owner" = "$url" ] && continue # listed twice: merge it once
+	[ "$owner" = "$url" ] && continue
 	total=$((total + 1))
 	if [ -n "$owner" ]; then
 		printf 'warning: %s has the same slug (%s) as %s, so it has no PDF of its own\n' "$url" "$slug" "$owner" >&2
@@ -84,12 +74,9 @@ while IFS= read -r url || [ -n "$url" ]; do
 	fi
 	slug_owner[$slug]="$url"
 	f="$pdf_dir/$slug.pdf"
-	if [ -s "$f" ]; then
-		files+=("$f")
-	else
-		printf 'warning: no PDF for %s (expected non-empty %s)\n' "$url" "$f" >&2
-		missing+=("$url")
-	fi
+	[ -s "$f" ] && files+=("$f") && continue
+	printf 'warning: no PDF for %s (expected non-empty %s)\n' "$url" "$f" >&2
+	missing+=("$url")
 done <"$urls_file"
 
 if [ "$total" -eq 0 ]; then
@@ -108,15 +95,8 @@ fi
 
 pdfunite "${files[@]}" "$combined"
 
-pages=""
-if command -v pdfinfo >/dev/null 2>&1; then
-	pages=$(pdfinfo "$combined" 2>/dev/null | awk '/^Pages:/ { print $2 }') || pages=""
-fi
-if [ -n "$pages" ]; then
-	printf 'wrote %s (%d files, %s pages)\n' "$combined" "${#files[@]}" "$pages"
-else
-	printf 'wrote %s (%d files)\n' "$combined" "${#files[@]}"
-fi
+pages=$(pdfinfo "$combined" 2>/dev/null | awk '/^Pages:/ { print $2 }') || pages=""
+printf 'wrote %s (%d files%s)\n' "$combined" "${#files[@]}" "${pages:+, $pages pages}"
 if [ "${#missing[@]}" -gt 0 ]; then
 	printf 'left out %d of %d URLs (--allow-missing), see the warnings above\n' "${#missing[@]}" "$total" >&2
 fi

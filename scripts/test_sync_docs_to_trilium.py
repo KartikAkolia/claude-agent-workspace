@@ -3,12 +3,9 @@
 # requires-python = ">=3.11"
 # dependencies = ["markdown==3.11.3"]
 # ///
-"""Offline regression tests for the Trilium documentation sync.
+"""Offline regression tests for sync-docs-to-trilium.py (markdown pinned above).
 
-Run: uv run --script scripts/test_sync_docs_to_trilium.py -v -- as
-lint-python.yml does. markdown is pinned above (the one place), to the
-version these pass with, so CI and a local run test the same thing; bump it
-there by hand, like the linters in .lint-versions.
+Run: uv run --script scripts/test_sync_docs_to_trilium.py -v
 """
 
 import contextlib
@@ -16,6 +13,7 @@ import http.client
 import importlib.util
 import io
 import os
+import re
 import subprocess
 import tempfile
 import traceback
@@ -32,14 +30,6 @@ spec.loader.exec_module(sync)
 P = sync.PATH_LABEL
 
 
-def note(note_id, name, value="", **extra):
-    return {
-        "noteId": note_id,
-        "attributes": [{"type": "label", "name": name, "value": value}],
-        **extra,
-    }
-
-
 def tree_note(note_id, parents, labels=None, title="t", **extra):
     return {
         "noteId": note_id,
@@ -54,56 +44,32 @@ def tree_note(note_id, parents, labels=None, title="t", **extra):
     }
 
 
-class FakeApi:
-    def __init__(self, roots=(), notes=(), descendants=()):
-        self.roots, self.notes = roots, notes
-        self.children = descendants
-        self.writes = []
-
-    def search(self, query):
-        return self.roots if query == f"#{sync.ROOT_LABEL}" else self.notes
-
-    def create(self, *args):
-        self.writes.append(("create", args))
-        return "new"
-
-    def call(self, *args, **kwargs):
-        self.writes.append((args, kwargs))
-
-    def descendants(self, note_id):
-        return self.children
-
-
 class TreeApi(sync.Etapi):
-    """An in-memory Trilium behind the real Etapi: only call() is replaced, so
-    search, create, labelling and descendants run as written."""
-
     def __init__(self, notes, create_fails=None):
         super().__init__("https://trilium.invalid", "token", False)
         self.notes = {n["noteId"]: n for n in notes}
         for n in notes:
-            for p in n["parentNoteIds"]:
-                if p in self.notes:
-                    self.notes[p]["childNoteIds"].append(n["noteId"])
-        # None, or (whether the note is made anyway, the error to raise).
+            for p in filter(self.notes.__contains__, n["parentNoteIds"]):
+                self.notes[p]["childNoteIds"].append(n["noteId"])
         self.create_fails = create_fails
         self.requests = []
 
     def deleted(self):
         return [path.rsplit("/", 1)[1] for m, path, _ in self.requests if m == "DELETE"]
 
+    def writes(self):
+        return [r for r in self.requests if r[0] != "GET"]
+
     def writes_to(self, note_id):
         return [
             r
-            for r in self.requests
-            if r[0] != "GET"
-            and (
-                note_id in r[1] or (isinstance(r[2], dict) and note_id in r[2].values())
-            )
+            for r in self.writes()
+            if note_id in r[1] or (isinstance(r[2], dict) and note_id in r[2].values())
         ]
 
     def call(self, method, path, body=None, raw_text=False):
         self.requests.append((method, path, body))
+        note_id = path.rsplit("/", 1)[1]
         if method == "GET" and path.startswith("/notes?"):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
             name = query["search"][0].lstrip("#")
@@ -113,35 +79,32 @@ class TreeApi(sync.Etapi):
                 if any(a["name"] == name for a in n["attributes"])
             ]
             return {"results": found}
+        if method == "GET" and note_id not in self.notes:
+            raise sync.EtapiError(f"GET {path}: HTTP 404: NOTE_NOT_FOUND", 404)
         if method == "GET":
-            note_id = path.rsplit("/", 1)[1]
-            if note_id not in self.notes:
-                raise sync.EtapiError(f"GET {path}: HTTP 404: NOTE_NOT_FOUND", 404)
             return self.notes[note_id]
         if method == "DELETE":
-            gone = self.notes.pop(path.rsplit("/", 1)[1])
-            for p in gone["parentNoteIds"]:
-                if p in self.notes:
-                    self.notes[p]["childNoteIds"].remove(gone["noteId"])
+            gone = self.notes.pop(note_id)
+            for p in filter(self.notes.__contains__, gone["parentNoteIds"]):
+                self.notes[p]["childNoteIds"].remove(note_id)
             return None
-        if path == "/create-note":
-            made, error = self.create_fails or (True, None)
-            new = tree_note(body["noteId"], [body["parentNoteId"]], title=body["title"])
-            if made:
-                self.notes[new["noteId"]] = new
-                self.notes[body["parentNoteId"]]["childNoteIds"].append(new["noteId"])
-            if error:
-                raise error
-            return {"note": new, "branch": {}}
         if path == "/attributes":
             attrs = self.notes[body["noteId"]]["attributes"]
             attrs.append({k: body[k] for k in ("type", "name", "value")})
             return attrs[-1]
-        return {}
+        if path != "/create-note":
+            return {}
+        made, error = self.create_fails or (True, None)
+        new = tree_note(body["noteId"], [body["parentNoteId"]], title=body["title"])
+        if made:
+            self.notes[new["noteId"]] = new
+            self.notes[body["parentNoteId"]]["childNoteIds"].append(new["noteId"])
+        if error:
+            raise error
+        return {"note": new, "branch": {}}
 
 
 def docs_tree(*extra):
-    """The root note, the docs folder note and a live doc, docs/a.md."""
     return [
         tree_note("R", ["root"], {sync.ROOT_LABEL: ""}),
         tree_note("D", ["R"], {P: "docs", "sorted": ""}, "docs"),
@@ -151,7 +114,6 @@ def docs_tree(*extra):
 
 
 def run_sync(api, files, scope=("docs",), prune=True):
-    """Run sync() on docs whose title is "A", returning what it printed."""
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         sync.sync(
@@ -176,8 +138,6 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(unresolved, [])
 
     def test_deleted_relative_target_does_not_fall_back_to_root(self):
-        # docs/target.md is gone (no note ID); target.md at the repo root
-        # still has one, and a relative link must not land on it.
         renderer = sync.Renderer({"target.md": "root"})
         html, unresolved = renderer("docs/source.md", "[link](target.md)")
         self.assertNotIn('href="#root/root"', html)
@@ -205,25 +165,21 @@ class SyncTests(unittest.TestCase):
                 )
 
     def test_unmatched_scope_stops_before_writes(self):
-        api = FakeApi()
+        api = TreeApi([])
         with self.assertRaisesRegex(SystemExit, "Nothing to sync or prune"):
-            sync.sync(
-                api,
-                ["docs/a.md"],
-                {"docs/a.md": ("A", "body")},
-                ["docs", "typo"],
-                {"docs", "docs/a.md"},
-                True,
-            )
-        self.assertEqual(api.writes, [])
+            run_sync(api, ["docs/a.md"], scope=["docs", "typo"])
+        self.assertEqual(api.writes(), [])
 
     def test_prune_preserves_unmanaged_descendants(self):
-        root = note("root-id", sync.ROOT_LABEL)
-        stale = note("stale-id", sync.PATH_LABEL, "docs/old", parentNoteIds=["root-id"])
-        api = FakeApi([root], [stale], ["manual-id"])
-        with contextlib.redirect_stdout(io.StringIO()):
-            sync.sync(api, [], {}, ["docs"], set(), True)
-        self.assertEqual(api.writes, [])
+        api = TreeApi(
+            [
+                tree_note("R", ["root"], {sync.ROOT_LABEL: ""}),
+                tree_note("S", ["R"], {P: "docs/old"}),
+                tree_note("M", ["S"]),
+            ]
+        )
+        run_sync(api, [])
+        self.assertEqual(api.writes(), [])
 
 
 class PruneTests(unittest.TestCase):
@@ -238,7 +194,6 @@ class PruneTests(unittest.TestCase):
             docs_tree(
                 tree_note("MINE", ["root"]),
                 tree_note("C", ["D", "MINE"], {P: "docs/cloned.md"}),
-                # A system parent such as _share isn't a clone.
                 tree_note("SH", ["D", "_share"], {P: "docs/shared.md"}),
             )
         )
@@ -283,7 +238,6 @@ class DuplicateTests(unittest.TestCase):
         labels = {P: "docs/b.md", sync.HASH_LABEL: "h", "readOnly": ""}
         api = TreeApi(
             docs_tree(
-                # Listed first, under the same parent, as Duplicate leaves it.
                 tree_note(
                     "COPY", ["D"], labels, "B (dup)", utcDateCreated=stamp.format(3)
                 ),
@@ -297,7 +251,7 @@ class DuplicateTests(unittest.TestCase):
         self.assertNotRegex(message, r"COPY .*likely the original")
         self.assertIn(f"remove the {P} and {sync.HASH_LABEL} labels", message)
         self.assertIn("Don't delete a note", message)
-        self.assertEqual([r for r in api.requests if r[0] != "GET"], [])
+        self.assertEqual(api.writes(), [])
 
 
 class ProtectedTests(unittest.TestCase):
@@ -368,7 +322,7 @@ class CreateTests(unittest.TestCase):
         with patch.object(api, "call", collide), self.assertRaises(sync.EtapiError):
             api.create("D", "New", {P: "docs/new.md"})
         self.assertEqual(api.deleted(), [])
-        self.assertEqual(len(api.notes), 4)  # the other note is still there
+        self.assertEqual(len(api.notes), 4)
 
 
 SECRET = "SECRET-token-abc123"
@@ -377,7 +331,6 @@ SECRET = "SECRET-token-abc123"
 class TokenTests(unittest.TestCase):
     def test_header_error_never_shows_the_token(self):
         api = sync.Etapi("http://127.0.0.1:9", SECRET + "\r", False)
-        # http.client checks headers before connecting; fail loudly if not.
         no_network = AssertionError("tried to connect")
         with (
             patch.object(http.client.HTTPConnection, "connect", side_effect=no_network),
@@ -394,7 +347,7 @@ class TokenTests(unittest.TestCase):
 
         def fake_sync(api, *args):
             sent.append(api.token)
-            api.call("GET", "/notes/x")  # the connection is refused below
+            api.call("GET", "/notes/x")
 
         refused = ConnectionRefusedError("refused")
         env = {"TRILIUM_ETAPI_TOKEN": SECRET + "\r\n"}
@@ -427,10 +380,6 @@ class TokenTests(unittest.TestCase):
 
 
 class ReferenceClonesTests(unittest.TestCase):
-    """reference-clones.tsv is the one list of mirrors, and list-lint-files.sh
-    the one parser of it; this script reads that parser's output (a stale
-    copy of the rules once made every sync exit before writing anything)."""
-
     MIRRORS = frozenset(
         {
             "dwm-titus-main",
@@ -446,8 +395,6 @@ class ReferenceClonesTests(unittest.TestCase):
         self.addCleanup(sync.reference_clones.cache_clear)
 
     def lister_copy(self, text):
-        # A copy of the real list-lint-files.sh beside its own
-        # reference-clones.tsv, as REPO_ROOT for this script to read.
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         lister = (sync.REPO_ROOT / "list-lint-files.sh").read_text(encoding="utf-8")
         (root / "list-lint-files.sh").write_text(lister, encoding="utf-8")
@@ -456,16 +403,12 @@ class ReferenceClonesTests(unittest.TestCase):
         return root
 
     def test_real_file_names_the_five_mirrors(self):
-        # Unstubbed: what an actual run of this script excludes, through
-        # the real list-lint-files.sh on the real reference-clones.tsv.
         self.assertEqual(sync.reference_clones(), self.MIRRORS)
         table = sync.reference_clone_table()
         self.assertEqual({c for c, _, _ in table}, self.MIRRORS)
         self.assertTrue(all(r.startswith("ChrisTitusTech/") for _, r, _ in table))
 
     def test_refresh_lookup_maps_each_repo_to_its_mirror(self):
-        # llf_reference_clone_for is how refresh-reference-clone.sh picks the
-        # one directory it may rsync into; GitHub names are case-insensitive.
         script = (
             'source "$1" || exit 1; shift; for repo in "$@"; do '
             'llf_reference_clone_for "$repo" || exit 1; '
@@ -473,15 +416,9 @@ class ReferenceClonesTests(unittest.TestCase):
         )
         table = sync.reference_clone_table()
         repos = [repo.upper() for _, repo, _ in table]
+        lister = str(sync.REPO_ROOT / "list-lint-files.sh")
         result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                script,
-                "_",
-                str(sync.REPO_ROOT / "list-lint-files.sh"),
-                *repos,
-            ],
+            ["bash", "-c", script, "_", lister, *repos],
             capture_output=True,
             text=True,
             check=False,
@@ -513,18 +450,14 @@ class ReferenceClonesTests(unittest.TestCase):
             None: "missing or unreadable",
         }
         for text, message in cases.items():
-            with self.subTest(text=text):
-                sync.reference_clones.cache_clear()
-                root = self.lister_copy(text)
-                with (
-                    patch.object(sync, "REPO_ROOT", root),
-                    self.assertRaises(SystemExit) as stop,
-                ):
-                    sync.reference_clones()
-                self.assertIn(
-                    "Can't read the reference-clone list", str(stop.exception)
-                )
-                self.assertIn(message, str(stop.exception))
+            sync.reference_clones.cache_clear()
+            expected = f"(?s)Can't read the reference-clone list.*{re.escape(message)}"
+            with (
+                self.subTest(text=text),
+                patch.object(sync, "REPO_ROOT", self.lister_copy(text)),
+                self.assertRaisesRegex(SystemExit, expected),
+            ):
+                sync.reference_clones()
 
     def test_no_bash_stops_the_run(self):
         with (

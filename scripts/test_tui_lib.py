@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""lib/tui.sh wiring for the three whiptail TUIs.
-
-Starts each TUI with a PATH holding only dirname and readlink (all it needs
-to find the lib), so it stops at require_tools before drawing anything: no
-whiptail, display, audio or camera command ever runs.
-
-Run: python3 scripts/test_tui_lib.py
-"""
+"""lib/tui.sh wiring for the whiptail TUIs and sync-root-gtk-theme.sh."""
 
 import os
 import re
@@ -18,34 +11,43 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LIB = HERE / "lib" / "tui.sh"
-# Each TUI, and the tools its require_tools call names, in order.
 TUIS = {
     "audio-tui.sh": "whiptail pactl jq",
     "display-tui.sh": "whiptail xrandr awk mktemp rm",
     "webcam-tui.sh": "whiptail v4l2-ctl awk grep",
 }
-# The lib's original interface, which sync-root-gtk-theme.sh is held to
-# below, and everything the lib provides now. The TUIs are held to every
-# function the lib defines (LIB_FUNCS), so one added later is covered too.
+TUI_TOOLS = ("dirname", "readlink")
 SHARED = ("wt", "die", "require_tools")
-INTERFACE = (*SHARED, "run_or_report", "normalize_int", "int_le")
+INTERFACE = (*SHARED, "pick_menu", "run_or_report", "normalize_int", "int_le")
 LIB_FUNCS = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_]*)\(\) \{$", LIB.read_text())
 BASH = shutil.which("bash")
+SYNC = HERE / "sync-root-gtk-theme.sh"
+SYNC_TOOLS = ("dirname", "readlink", "realpath", "sort", "basename", "sed", "head")
+MARKER_LIB = """readonly PROG="${0##*/}"
+: >"$TUI_LIB_SOURCED"
+die() { printf 'error: %s\\n' "$1" >&2; exit 1; }
+require_tools() { :; }
+wt() { :; }
+"""
 
 
-def run_tui(script, workdir):
-    """Run a TUI with only dirname and readlink on PATH."""
+def run_script(script, workdir, tools, *args):
     bindir = Path(workdir) / "bin"
     bindir.mkdir(exist_ok=True)
-    for tool in ("dirname", "readlink"):
+    for tool in tools:
         link = bindir / tool
         if not link.exists():
             link.symlink_to(shutil.which(tool))
     return subprocess.run(
-        [BASH, str(script)],
+        [BASH, str(script), *args],
         check=False,
         cwd=workdir,
-        env={"PATH": str(bindir), "HOME": str(workdir)},
+        env={
+            "PATH": str(bindir),
+            "HOME": str(workdir),
+            "KARTIK_HOME": str(workdir),
+            "TUI_LIB_SOURCED": str(Path(workdir) / "sourced"),
+        },
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -55,55 +57,60 @@ def run_tui(script, workdir):
 
 class TuiLibTests(unittest.TestCase):
     def test_shared_helpers_live_only_in_the_lib(self):
-        lib = LIB.read_text()
         for name in INTERFACE:
             self.assertIn(name, LIB_FUNCS, f"lib/tui.sh doesn't define {name}()")
-        prog = re.search(r"(?m)^readonly PROG=", lib)
-        self.assertIsNotNone(prog, "lib/tui.sh doesn't set PROG")
+        self.assertRegex(LIB.read_text(), r"(?m)^readonly PROG=", "lib sets no PROG")
+        own_func = rf"(?m)^({'|'.join(LIB_FUNCS)})\(\)"
         for tui in TUIS:
             text = (HERE / tui).read_text()
             with self.subTest(tui=tui):
-                for name in LIB_FUNCS:
-                    own = re.search(rf"(?m)^{name}\(\)", text)
-                    self.assertIsNone(own, f"{tui} defines its own {name}()")
-                own_prog = re.search(r"(?m)^readonly PROG=", text)
-                self.assertIsNone(own_prog, f"{tui} sets its own PROG")
-                finds = re.search(r'(?m)^tui_lib=.*/lib/tui\.sh"$', text)
-                self.assertIsNotNone(finds, f"{tui} doesn't look for lib/tui.sh")
-                sources = re.search(r'(?m)^\. "\$tui_lib"$', text)
-                self.assertIsNotNone(sources, f"{tui} doesn't source the lib")
+                self.assertNotRegex(text, own_func, f"{tui} defines a lib function")
+                self.assertNotRegex(text, r"(?m)^readonly PROG=", f"{tui} sets PROG")
+                self.assertRegex(text, r'(?m)^tui_lib=.*/lib/tui\.sh"$', "no lib path")
+                self.assertRegex(text, r'(?m)^\. "\$tui_lib"$', "lib not sourced")
 
     def test_lib_is_found_from_the_repo_and_through_a_symlink(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            for tui, tools in TUIS.items():
-                link = Path(tmp) / f"link-{tui}"
-                link.symlink_to(HERE / tui)
-                for script in (HERE / tui, link):
-                    with self.subTest(script=str(script)):
-                        result = run_tui(script, tmp)
-                        self.assertEqual(result.returncode, 1, result.stderr)
-                        self.assertEqual(
-                            result.stderr,
-                            f"error: missing required tool(s): {tools}\n",
-                        )
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        cases = []
+        for tui, tools in TUIS.items():
+            (tmp / f"link-{tui}").symlink_to(HERE / tui)
+            cases += [(HERE / tui, tools), (tmp / f"link-{tui}", tools)]
+        for script, tools in cases:
+            with self.subTest(script=str(script)):
+                result = run_script(script, tmp, TUI_TOOLS)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(
+                    result.stderr, f"error: missing required tool(s): {tools}\n"
+                )
 
     def test_a_missing_lib_is_a_clear_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            for tui in TUIS:
-                copy = Path(tmp) / tui
-                shutil.copy(HERE / tui, copy)
-                with self.subTest(tui=tui):
-                    result = run_tui(copy, tmp)
-                    self.assertEqual(result.returncode, 1, result.stderr)
-                    lib = os.path.join(os.path.realpath(tmp), "lib", "tui.sh")
-                    self.assertIn(f"{lib} is missing", result.stderr)
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        lib = os.path.join(os.path.realpath(tmp), "lib", "tui.sh")
+        for tui in TUIS:
+            copy = Path(tmp) / tui
+            shutil.copy(HERE / tui, copy)
+            with self.subTest(tui=tui):
+                result = run_script(copy, tmp, TUI_TOOLS)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{lib} is missing", result.stderr)
 
     def test_lib_number_and_error_helpers(self):
-        # wt is replaced after sourcing, so run_or_report's msgbox text is
-        # printed instead of drawn.
         script = r"""
 . "$1"
-wt() { printf 'MSG[%s]\n' "$2"; }
+unset PICK RC
+wt() {
+	[ "$1" = --menu ] || {
+		printf 'MSG[%s]\n' "$2"
+		return
+	}
+	printf '%s' "${PICK-$*}" >&2
+	return "${RC:-0}"
+}
+pick_menu T "nothing to pick"; printf 'rc=%s\n' "$?"
+r=$(pick_menu T E a A b B); printf 'pick[%s]=%s\n' "$r" "$?"
+r=$(PICK=b pick_menu T E a A b B); printf 'pick[%s]=%s\n' "$r" "$?"
+r=$(PICK= pick_menu T E a A); printf 'pick[%s]=%s\n' "$r" "$?"
+r=$(PICK=a RC=1 pick_menu T E a A); printf 'pick[%s]=%s\n' "$r" "$?"
 for v in 08 -007 -0 0 0250 0x10 abc ""; do printf 'n[%s]=%s\n' "$v" "$(normalize_int "$v")"; done
 for p in "9223372036854775807 9223372036854775808" "-9223372036854775809 -9223372036854775808" \
 	"-1 0" "0 -1" "150 150" "151 150" "99999999999999999999 150" "-20 -3"; do
@@ -126,6 +133,12 @@ run_or_report "quiet failed" false; printf 'rc=%s\n' "$?"
         self.assertEqual(
             result.stdout.splitlines(),
             [
+                "MSG[nothing to pick]",
+                "rc=1",
+                "pick[--menu T 0 0 0 a A b B]=0",
+                "pick[b]=0",
+                "pick[]=1",
+                "pick[]=1",
                 "n[08]=8",
                 "n[-007]=-7",
                 "n[-0]=0",
@@ -151,56 +164,16 @@ run_or_report "quiet failed" false; printf 'rc=%s\n' "$?"
         )
 
 
-SYNC = HERE / "sync-root-gtk-theme.sh"
-# Tools sync-root-gtk-theme.sh needs to reach its exit points below.
-SYNC_TOOLS = ("dirname", "readlink", "realpath", "sort", "basename", "sed", "head")
-# A stand-in lib that records being sourced, so a run shows whether it was.
-MARKER_LIB = """readonly PROG="${0##*/}"
-: >"$TUI_LIB_SOURCED"
-die() { printf 'error: %s\\n' "$1" >&2; exit 1; }
-require_tools() { :; }
-wt() { :; }
-"""
-
-
-def run_sync(script, workdir, *args):
-    """Run sync-root-gtk-theme.sh as the current (non-root) user, with a PATH
-    that has no sudo and no whiptail, so --check/--apply stop at the root
-    hint and --pick stops at its whiptail check -- nothing privileged or
-    interactive ever runs."""
-    bindir = Path(workdir) / "bin"
-    bindir.mkdir(exist_ok=True)
-    for tool in SYNC_TOOLS:
-        link = bindir / tool
-        if not link.exists():
-            link.symlink_to(shutil.which(tool))
-    return subprocess.run(
-        [BASH, str(script), *args],
-        check=False,
-        cwd=workdir,
-        env={
-            "PATH": str(bindir),
-            "HOME": str(workdir),
-            "KARTIK_HOME": str(workdir),
-            "TUI_LIB_SOURCED": str(Path(workdir) / "sourced"),
-        },
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-
-
 class SyncRootGtkThemeTests(unittest.TestCase):
-    """sync-root-gtk-theme.sh runs its --check/--apply paths as root, so it
-    must reuse lib/tui.sh's wt() (no copy of its own) and source that
-    kartik-writable file only on --pick, which runs as kartik."""
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.copy = self.tmp / SYNC.name
+        shutil.copy(SYNC, self.copy)
 
     def test_no_own_copy_of_the_shared_helpers(self):
         text = SYNC.read_text()
         for name in SHARED:
-            own = re.search(rf"(?m)^\s*{name}\(\)", text)
-            self.assertIsNone(own, f"sync-root-gtk-theme.sh defines its own {name}()")
+            self.assertNotRegex(text, rf"(?m)^\s*{name}\(\)", f"defines its own {name}")
 
     def test_lib_is_sourced_only_inside_the_pick_arm(self):
         lines = SYNC.read_text().splitlines()
@@ -219,32 +192,26 @@ class SyncRootGtkThemeTests(unittest.TestCase):
             )
 
     def test_only_pick_sources_the_lib_at_runtime(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / SYNC.name
-            shutil.copy(SYNC, copy)
-            (Path(tmp) / "lib").mkdir()
-            (Path(tmp) / "lib" / "tui.sh").write_text(MARKER_LIB)
-            sourced = Path(tmp) / "sourced"
-            for args in (["--check"], ["--apply"], ["--list"], ["--help"]):
-                with self.subTest(args=args):
-                    run_sync(copy, tmp, *args)
-                    self.assertFalse(sourced.exists(), f"{args} sourced lib/tui.sh")
-            result = run_sync(copy, tmp, "--pick")
-            self.assertTrue(sourced.exists(), "--pick didn't source lib/tui.sh")
-            self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn("needs whiptail", result.stderr)
+        (self.tmp / "lib").mkdir()
+        (self.tmp / "lib" / "tui.sh").write_text(MARKER_LIB)
+        sourced = self.tmp / "sourced"
+        for args in (["--check"], ["--apply"], ["--list"], ["--help"]):
+            with self.subTest(args=args):
+                run_script(self.copy, self.tmp, SYNC_TOOLS, *args)
+                self.assertFalse(sourced.exists(), f"{args} sourced lib/tui.sh")
+        result = run_script(self.copy, self.tmp, SYNC_TOOLS, "--pick")
+        self.assertTrue(sourced.exists(), "--pick didn't source lib/tui.sh")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("needs whiptail", result.stderr)
 
     def test_a_missing_lib_only_stops_pick(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / SYNC.name
-            shutil.copy(SYNC, copy)
-            lib = os.path.join(os.path.realpath(tmp), "lib", "tui.sh")
-            result = run_sync(copy, tmp, "--pick")
-            self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn(f"{lib} is missing", result.stderr)
-            result = run_sync(copy, tmp, "--check")
-            self.assertNotIn("is missing", result.stderr)
-            self.assertIn("needs root", result.stderr)
+        lib = os.path.join(os.path.realpath(self.tmp), "lib", "tui.sh")
+        result = run_script(self.copy, self.tmp, SYNC_TOOLS, "--pick")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"{lib} is missing", result.stderr)
+        result = run_script(self.copy, self.tmp, SYNC_TOOLS, "--check")
+        self.assertNotIn("is missing", result.stderr)
+        self.assertIn("needs root", result.stderr)
 
 
 if __name__ == "__main__":
