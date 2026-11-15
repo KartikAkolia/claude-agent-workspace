@@ -35,7 +35,7 @@ When running elsewhere, pass an absolute root explicitly:
 It:
 
 - finds `qmllint-qt6`, `qmllint`, or `/usr/lib*/qt6/bin/qmllint`;
-- adds common Qt/Quickshell QML roots such as `/usr/lib64/qt6/qml`, `/usr/lib/qt6/qml`, and `/usr/lib/qt6/qml`;
+- adds QML roots in this order: any `--qml-root` paths, then whichever of `/usr/lib64/qt6/qml`, `/usr/lib/qt6/qml`, `/usr/local/lib64/qt6/qml` and `/usr/local/lib/qt6/qml` exist, then the path `qmake6 -query QT_INSTALL_QML` prints when `qmake6` is on `PATH`;
 - discovers `qs.*` imports in the target files;
 - creates temporary `qmldir` files and symlinks for local QML types;
 - sets `QMLLS_BUILD_DIRS` and `QML_IMPORT_PATH` for the lint process.

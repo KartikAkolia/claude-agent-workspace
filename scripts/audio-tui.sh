@@ -2,6 +2,7 @@
 # audio-tui.sh — whiptail front end for PipeWire/PulseAudio via pactl: default
 # devices, per-app stream routing, volume/mute, card profiles and ports.
 # No set -e: whiptail's Cancel/Esc status is normal control flow here.
+# Docs: docs/desktop-tuis.md
 set -uo pipefail
 
 tui_lib="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/tui.sh"

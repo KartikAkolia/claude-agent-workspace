@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Checks that the given JSON and YAML files parse cleanly: JSON with python -m json.tool, every YAML
 # document with Ruby's Psych, aliases allowed and only plain types, dates and symbols loaded.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 [ "$#" -gt 0 ] || exit 0

@@ -13,6 +13,7 @@
 #   -h           show this help
 # Env defaults: CANON_VIDEO_NR, CANON_DEVICE, CANON_LABEL, CANON_WB (Daylight),
 # CANON_ISO (100); flags beat them. Stop with Ctrl-C, once.
+# Docs: docs/canon-4000d-usb-webcam.md
 
 set -u -o pipefail
 

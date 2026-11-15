@@ -2,6 +2,7 @@
 # install-c920-udev-rule.sh: install c920-apply-settings, c920-settings@.service and a udev rule
 # that re-applies the Logitech C920 (046d:08e5) "stable" fix on every plug-in, then apply it now.
 # Usage: scripts/install-c920-udev-rule.sh [EXPOSURE 3-2047, default 250] [FOCUS 0-250 step 5, default 0]
+# Docs: docs/logitech-c920-webcam.md
 
 set -euo pipefail
 

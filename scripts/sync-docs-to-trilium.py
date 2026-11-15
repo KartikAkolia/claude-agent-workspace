@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["markdown>=3.6"]
 # ///
+# Docs: docs/repo-tooling.md
 """Mirror this repo's Markdown docs into Trilium as read-only text notes.
 
 Notes are matched by a workspaceDocPath label and rewritten only when their

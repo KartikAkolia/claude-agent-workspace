@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Helpers shared by audio-tui.sh, display-tui.sh, webcam-tui.sh and
 # sync-root-gtk-theme.sh --pick, which source this file. Not run on its own.
+# Docs: docs/desktop-tuis.md
 
 readonly PROG="${0##*/}"
 

@@ -2,6 +2,7 @@
 # shellcheck shell=bash
 # pacman scriptlet: reapply the settings folder's packaged group and modes on every install and
 # upgrade (pacman keeps an existing folder's mode). Keep _xppen_confgroup equal to PKGBUILD's _confgroup.
+# Docs: scripts/xppen-tablet/README.md
 _xppen_confgroup=wheel
 
 _xppen_fix_conf() {

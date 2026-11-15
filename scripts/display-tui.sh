@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # display-tui.sh — whiptail front end for xrandr on X11: resolution, refresh
 # rate, layout, mirroring, rotation, and turning displays on or off.
+# Docs: docs/desktop-tuis.md
 set -uo pipefail
 
 tui_lib="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/tui.sh"

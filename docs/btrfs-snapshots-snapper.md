@@ -38,8 +38,8 @@ The script (idempotent, safe to re-run):
 1. `sudo apt install -y snapper`
 2. `sudo snapper -c root create-config /` — creates `/etc/snapper/configs/root` and a nested `/.snapshots` subvolume that stores the snapshot data.
 3. Sets `ALLOW_USERS` to the invoking user (`"kartik"` on `asus-vivobook`) and `SYNC_ACL="yes"` in that config, so Kartik can run `snapper create`/`list`/`diff` day-to-day without `sudo` — the privileged Btrfs work is delegated to the root-owned `snapperd` D-Bus service, which checks `ALLOW_USERS` itself.
-4. Enables and starts `snapper-timeline.timer`, `snapper-cleanup.timer`, `snapper-boot.timer`.
-5. Restarts `snapperd.service` — the package's postinst enables/starts it *before* step 2 creates the config, so it comes up with nothing loaded and every non-root `snapper` call fails with `"No permissions."` until it's restarted, even though the config on disk is already correct. Hit this for real on the first run; the script now handles it.
+4. Restarts `snapperd.service` — the package's postinst enables/starts it *before* step 2 creates the config, so it comes up with nothing loaded and every non-root `snapper` call fails with `"No permissions."` until it's restarted, even though the config on disk is already correct. Hit this for real on the first run; the script now handles it.
+5. Enables and starts `snapper-timeline.timer`, `snapper-cleanup.timer`, `snapper-boot.timer`: hourly timeline snapshots, a daily cleanup that prunes them to the `TIMELINE_LIMIT_*` limits below, and the one-per-boot snapshot. All three ship with the package.
 6. Prints the resulting config, timer state, and creates one test snapshot **as the real invoking user** (via `sudo -u`, not just `snapper create` bare) to confirm the non-root permission actually took effect — a check run as root would trivially pass regardless, since root always bypasses `ALLOW_USERS`.
 
 Everything else is left at the packaged defaults (`TIMELINE_LIMIT_HOURLY=10`, `_DAILY=10`, `_MONTHLY=10`, `_YEARLY=10`, `NUMBER_LIMIT=50`) — sane out of the box, and 408G free on this disk at time of writing leaves plenty of headroom.

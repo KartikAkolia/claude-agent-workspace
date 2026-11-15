@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Docs: docs/mathsisfun-pdf-scrape.md
 """Crawl one mathsisfun.com section breadth-first and print each page that fetched.
 
 Usage: python3 mathsisfun-algebra-discover.py [start_url] > urls.txt

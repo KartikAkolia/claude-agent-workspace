@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Docs: docs/mathsisfun-pdf-scrape.md
 """Render every URL in urls.txt to a PDF through one persistent Chrome profile, so
 the ad-consent modal is dismissed once. Needs playwright and google-chrome.
 

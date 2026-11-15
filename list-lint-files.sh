@@ -3,6 +3,7 @@
 # node_modules and the reference clones in reference-clones.tsv, which only this script parses.
 # Sourced, it provides the llf_* helpers the lint scripts and the pre-commit hook share.
 # shellcheck disable=SC2034
+# Docs: docs/repo-tooling.md
 LLF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
 
 llf_load_reference_clones() {

@@ -2,6 +2,7 @@
 # Flags markdown links, reference definitions and multi-segment `backtick/paths.md` that name
 # missing local files (gitignored targets are skipped). --index reads files and targets from the
 # git index; --real-root is where targets outside the repo are looked for.
+# Docs: docs/repo-tooling.md
 import os
 import re
 import subprocess

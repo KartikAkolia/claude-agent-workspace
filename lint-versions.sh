@@ -3,6 +3,7 @@
 # (the pre-commit hook) writes a newer installed shellcheck/shfmt into its line, never an older one, and fails until
 # that's staged -- unless the line is held ("# hold", staged or in the tree), staged unlike HEAD's, or has an unstaged
 # edit other than that bump. Usage: get <tool> | changed <tool> | sync
+# Docs: docs/repo-tooling.md
 LV_DIR="${LINT_VERSIONS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)}"
 readonly LV_DIR
 readonly LV_NAME=.lint-versions

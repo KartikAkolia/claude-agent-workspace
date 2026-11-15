@@ -3,6 +3,7 @@
 # GRUB, mkinitcpio), keeping a recoverable backup per run. Needs
 # device-power-saving-config.py beside it. Reboot after install or undo.
 # Usage: disable-device-power-saving.sh [--undo BACKUP_DIRECTORY | --recover BACKUP_DIRECTORY]
+# Docs: docs/device-power-saving.md
 set -euo pipefail
 
 ((EUID == 0)) || exec sudo -- bash "$0" "$@"

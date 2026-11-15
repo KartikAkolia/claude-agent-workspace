@@ -2,6 +2,7 @@
 # Install or update a standalone Fabric Minecraft server, optionally with Geyser
 # and Floodgate for Bedrock clients. Reruns update the launcher and managed mods
 # and keep the world. Run it as a normal user; see --help for the options.
+# Docs: docs/minecraft-fabric-server.md
 set -euo pipefail
 
 readonly FABRIC_META=https://meta.fabricmc.net/v2

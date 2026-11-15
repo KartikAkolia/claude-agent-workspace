@@ -1,6 +1,7 @@
 # Local package of the official XP-Pen Linux driver (prebuilt binary); see README.md.
 # _confgroup may change the driver's settings (the desktop user must be in it).
 # shellcheck disable=SC2034,SC2154 # makepkg reads these globals and sets srcdir/pkgdir.
+# Docs: scripts/xppen-tablet/README.md
 _confgroup=wheel
 pkgname=xppen-tablet
 _pkgver=4.0.15

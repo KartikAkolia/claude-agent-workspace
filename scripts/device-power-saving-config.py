@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Docs: docs/device-power-saving.md
 """Literal GRUB editing and effective module checks for the power policy script."""
 
 import re

@@ -2,6 +2,7 @@
 # Lints the given Python files with ruff check and ruff format --check, run through uvx at exactly the
 # ruff version in .lint-versions -- the staged copy's under the pre-commit hook (LINT_VERSIONS_MODE=sync
 # or index), where it runs even with no files so a changed ruff line is still checked.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 [ "$#" -gt 0 ] || [[ ${LINT_VERSIONS_MODE:-} =~ ^(sync|index)$ ]] || exit 0

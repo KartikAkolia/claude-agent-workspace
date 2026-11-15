@@ -96,6 +96,7 @@ where they are, and GTK uses them only if they're installed system-wide.
   which prints a loud `TEST MODE` warning. Each read goes through `setpriv` with that user's uid, gid and groups — a real drop, never
   a read as root. So a symlink swapped in under `kartik`'s config, even after the script's own
   checks, can only ever expose a file `kartik` can already read, never `/root`.
+  `setpriv` needs no PAM session or TTY, which is why it works under `pkexec`. A real run also refuses a `ROOT_HOME` that isn't uid 0's passwd home, so a value left exported from a test session can't redirect it, and when the script re-runs itself under `sudo` it forwards `KARTIK_HOME`/`ROOT_HOME` only in test mode.
 - **Settings files** (`~/.gtkrc-2.0`, both `settings.ini`) are filtered to an allowlist of
   appearance keys: theme, icon theme, cursor theme and size, font, prefer-dark, the `gtk-xft-*`
   font-rendering keys, decoration layout, animations, button/menu images and toolbar style. A value
@@ -105,6 +106,7 @@ where they are, and GTK uses them only if they're installed system-wide.
   in the destination directory, set to `0644 root:root`, and renamed into place with `mv -T`; a
   leftover symlink there is replaced, never written through. The source must also resolve inside `~`
   and be owned by `kartik`, or it's skipped (defense in depth on top of the as-`kartik` read).
+  In `settings.ini` only the `[Settings]` group is read. In `.gtkrc-2.0` only top-level `key = value` lines count, so any line inside, opening or closing a `{…}` block is dropped. The character rule is an allowlist: a kept value holds only letters, digits, spaces and `._+,:@-`, with no `..`, and an unquoted `.gtkrc-2.0` value must be a number or a bare identifier. When a source is missing, unsafe or unreadable as `kartik`, `--apply` removes root's copy only if the script wrote it (or it's a symlink) and leaves anything else at that path alone.
 - **Themes, icon themes and cursor themes are NOT copied.** `~/.themes`, `~/.local/share/themes`,
   `~/.icons` and `~/.local/share/icons` are left alone. Root's settings still name them; GTK uses
   them only if they're installed system-wide (`/usr/share` or `/usr/local/share`), else it falls
@@ -118,6 +120,7 @@ where they are, and GTK uses them only if they're installed system-wide.
   `~` or a tree changed between check and copy). Install it system-wide by a route you trust — the
   distro or AUR package if one exists, or a manual copy into `/usr/local/share/themes` or
   `/usr/local/share/icons` that you have reviewed.
+  A GTK theme counts as system-wide only if `/usr/share/themes/<name>` or `/usr/local/share/themes/<name>` has a `gtk-2.0`, `gtk-3.0` or `gtk-4.0` subdirectory; an icon or cursor theme counts if its directory exists under `/usr/share/icons` or `/usr/local/share/icons`. The names come from the gtk-3.0 `settings.ini` only, read as `kartik` and only if it passes the source checks, and his own theme and icon directories are probed as him too.
 - **Guards.** If a directory between `/root` and a settings target is a symlink, `--apply` refuses
   rather than writing through it. Anything at a target that the script didn't write (its files carry
   a managed header line) is backed up to `*.bak-<epoch>` first.
@@ -141,18 +144,21 @@ The copies go under `/root` because only root should see them and `/root` is mod
 Copies don't follow `kartik`'s later edits, so re-run `--apply` after a theme switch (KDE System
 Settings, or the script's own `--set`/`--pick`, which print the command). `--check` diffs the
 filtered settings it would write against what's in `/root`, reporting `DRIFT` on any difference,
-`UNSAFE` for a symlink or a non-root-owned/world-writable file, `STALE` for a copy whose source is
-gone, `UNSAFE`/`LEGACY` for a leftover `/root` directory, and `NOTE` for a user-local-only theme.
+`UNSAFE` for a symlink or a non-root-owned or group/world-writable file, `STALE` for a copy whose source is
+gone or unsafe, `UNSAFE`/`LEGACY` for a leftover `/root` directory, and `NOTE` for a user-local-only theme.
 A change to a key that is never copied, such as `gtk-modules`, is not drift.
+`--apply` ends with a `--- verify ---` pass that runs the same checks, and both modes exit 1 if any target failed or anything still drifts or is unsafe. A `NOTE` doesn't count.
 
 `--set` and `--pick` rewrite the invoking user's own GTK config, so they refuse to run as root
 (use `--apply` for root), and they follow a symlinked dotfile only when it resolves inside that
 user's home and is theirs — never out to a file like `/etc/sudoers`. They validate all three
 settings files first and change nothing if any present one is unsafe, then write each and report
 it, so the three can't end up disagreeing after a mid-way abort. Every path printed in a `NOTE`
-or inside the one copy-pasteable command (the trust-install hint) is quoted with `printf %q`, and a
+or inside a copy-pasteable command (the trust-install hint, plus the `pkexec` line printed after `--set`/`--pick`, in their as-root refusal and in the `sudo`-not-found message) is quoted with `printf %q`, and a
 theme name with a slash or control character is skipped, so a crafted name can't become a command
 when pasted.
+
+`--list`, `--set` and `--pick` work on `KARTIK_HOME` (default `/home/kartik`), not on `$HOME` or a passwd lookup, so another user has to set it, and `--set` refuses a file there that the caller doesn't own anyway. `--set` accepts only a name `--list` finds: a directory under `~/.themes`, `~/.local/share/themes`, `/usr/local/share/themes` or `/usr/share/themes` with a `gtk-2.0`, `gtk-3.0` or `gtk-4.0` subdirectory. That leaves out window-manager-only directories (Metacity or xfwm4), such as the `-hdpi`/`-xhdpi` siblings some theme packages ship. The file, or a symlinked dotfile's target, must also sit in a directory the user can write. Each file is rewritten through a temp file in its own directory, which gets the original's mode and owner before `mv` replaces the original, so a failure can't leave a half-written config and a `0644` file doesn't turn `0600` (SYS-4 in the [script audit](script-audit-2026-11-14.md)).
 
 ```bash
 pkexec /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --check
@@ -168,7 +174,7 @@ it through `pkexec` trusts `kartik`'s account with root: whoever can edit the fi
 `pkexec` run controls what runs as root. That's inherent to running a script from a user's
 checkout, not something the script can check its way out of, so it doesn't refuse (that would
 block the route above). It prints a `WARNING` whenever the file, or a directory on its path, can
-be changed by a non-root user. To get rid of the trust and the warning, install a root-owned copy
+be changed by a non-root user. A path counts as changeable when it isn't owned by root, or is group- or world-writable without the sticky bit (a sticky root-owned directory such as `/tmp` lets others add entries but not replace root's); the check reads metadata only. To get rid of the trust and the warning, install a root-owned copy
 and run that instead (re-install after changing the repo copy):
 
 ```bash

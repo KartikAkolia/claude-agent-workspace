@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full local lint sweep of every tracked file list-lint-files.sh finds: mdl and check-markdown-links.py
 # on markdown, validate-config.sh on JSON/YAML, lint-bash.sh and lint-python.sh on shell and Python.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1

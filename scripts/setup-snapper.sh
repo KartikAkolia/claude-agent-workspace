@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # setup-snapper.sh: install Snapper and a "root" config (the name Debian's apt hook and
-# snapper-boot.service expect) for a Btrfs root on Debian/apt; historical, see
-# docs/btrfs-snapshots-snapper.md. Verifies ALLOW_USERS as the invoking non-root user.
+# snapper-boot.service expect) for a Btrfs root on Debian/apt; historical. Verifies ALLOW_USERS
+# as the invoking non-root user.
+# Docs: docs/btrfs-snapshots-snapper.md
 
 set -euo pipefail
 

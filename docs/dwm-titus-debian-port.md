@@ -180,6 +180,17 @@ The `dwm-packages.sh` build profile turned out to be incomplete relative to what
 | gamemode.x86_64 / gamemode.i686 | gamemode + `libgamemode0:i386`/`libgamemodeauto0:i386` | installed — **not** `gamemode:i386`, which conflicts with the native `gamemode` metapackage over daemon ownership. The 32-bit runtime libs are the actual thing 32-bit games need; installing the full `gamemode:i386` metapackage alongside native `gamemode` is a resolver conflict by design in Debian's packaging. |
 | mangohud.x86_64 / mangohud.i686 | mangohud + mangohud:i386 | **blocked** — dependency `libspdlog1.15-fmt10` had no installable candidate anywhere in sid at the time (a mid-transition gap in the archive, not a naming issue). Retry later with `sudo apt-get install mangohud mangohud:i386`; it may resolve once the spdlog transition finishes. |
 
+`dwm-titus-debian-install.sh` leaves this profile out. To add it on an x86_64 host with the `contrib` component enabled (for `steam-installer`):
+
+```bash
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install -y steam-installer gamescope gamemode libgamemode0:i386 libgamemodeauto0:i386
+sudo apt install -y mangohud mangohud:i386
+```
+
+mangohud gets its own command so that, while it's blocked, its failure doesn't stop the rest of the profile.
+
 Note: dwm-titus's `install.sh` normally pulls a COPR-patched gamescope on Fedora. No COPR equivalent was needed here — Debian sid ships its own gamescope build directly in main.
 
 ## Build and install
@@ -193,7 +204,7 @@ sudo make install
 
 ```
 
-`make install` is designed to be run once, as root, and handles the root/non-root split itself: it re-execs the build step as the invoking user via `SUDO_USER`/`runuser` (never builds as root), runs `install-system` for the system-wide pieces, then drops back to the target user for `install-user`. No manual profile-splitting or separate `install-system`/`install-user` invocations were needed.
+`make install` is designed to be run once, as root, and handles the root/non-root split itself: it re-execs the build step as the invoking user via `SUDO_USER`/`runuser` (never builds as root), runs `install-system` for the system-wide pieces, then drops back to the target user for `install-user`. No manual profile-splitting or separate `install-system`/`install-user` invocations were needed. It takes the target user from `SUDO_USER`, falling back to `USER`, and refuses to install when that user is root, as from a plain root shell, so run it with `sudo` from your own account.
 
 Installed artifacts, confirmed on disk after the run:
 
@@ -222,7 +233,7 @@ These are identical regardless of distro — `install.sh` does them outside dnf/
 
 Debian GNU/Linux forky/sid, hostname `dell-optiplex`, at 192.168.0.222, user `kartik`. SSH reachable via password auth; from this Windows machine, `plink -batch -pw <password> -hostkey "SHA256:GTy8F9rJKk8xzModEE3ZGyWHR0RV777caDjSc9AY2cI" kartik@192.168.0.222 "<command>"` is the working non-interactive pattern (the `-hostkey` flag is needed once per session since `-batch` mode can't interactively confirm a new host key). `sudo` requires a password (no passwordless sudo configured) — piped via `echo <password> | sudo -S <command>`.
 
-A standalone reference script, `dwm-titus-debian-install.sh` at this repo's root, captures the package-install commands from this port, including the build-time-discovered `libx11-xcb-dev`/`libxcb-res0-dev` additions.
+A standalone reference script, `dwm-titus-debian-install.sh` at this repo's root, captures the package-install commands from this port, including the build-time-discovered `libx11-xcb-dev`/`libxcb-res0-dev` additions. The gaming profile's commands aren't in it; they're under **gaming** above.
 
 ## Outcome
 

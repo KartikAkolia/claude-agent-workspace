@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Combine the per-page PDFs into one book, in urls.txt crawl order. A URL with
 # no non-empty PDF stops the merge unless --allow-missing is given.
+# Docs: docs/mathsisfun-pdf-scrape.md
 set -euo pipefail
 
 usage() {

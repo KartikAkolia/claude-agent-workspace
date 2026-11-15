@@ -2,6 +2,7 @@
 # Refreshes one ChrisTitusTech reference-clone mirror from its GitHub tarball with rsync --delete, printing
 # what changes; gitignored local-only paths in the mirror are left alone, and a sync touching over half its
 # tracked files needs --force-large-change.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 die() {

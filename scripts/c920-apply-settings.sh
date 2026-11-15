@@ -2,6 +2,7 @@
 # c920-apply-settings.sh: apply the Logitech C920 "stable" v4l2 settings to one capture node and
 # re-apply until they hold (right after plug-in it drops some writes). Run by c920-settings@.service.
 # Usage: c920-apply-settings.sh DEVICE EXPOSURE FOCUS
+# Docs: docs/logitech-c920-webcam.md
 
 set -uo pipefail
 

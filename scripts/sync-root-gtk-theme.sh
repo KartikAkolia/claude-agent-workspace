@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Give root filtered, root-owned copies of the invoking user's GTK appearance
 # settings so pkexec'd GTK apps (GParted) match, and list/set/pick GTK themes.
-# Design and threat model: docs/gparted-root-theme-fix.md.
+# Docs: docs/gparted-root-theme-fix.md (design and threat model)
 set -euo pipefail
 
 PROG="${0##*/}"

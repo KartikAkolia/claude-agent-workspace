@@ -1,7 +1,7 @@
 # Linter versions CI runs -- see lint-versions.sh.
 # shellcheck/shfmt: the pre-commit hook bumps these to the newest installed
 # version, except a line you've changed yourself or marked `# hold`; the
-# full rules are under "Sync mode" in lint-versions.sh.
+# full rules are under "Sync mode" in docs/repo-tooling.md.
 # ruff: set by hand; lint-python.sh runs exactly this via uvx.
 # mdl: set by hand; lint-markdown.yml gem-installs exactly this, and the
 # pre-commit hook warns when the installed mdl is a different version.

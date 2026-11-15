@@ -2,6 +2,7 @@
 # Lints the given shell scripts (bash and POSIX sh) with shellcheck, shfmt -d and bash -n or sh -n,
 # after checking both linters against .lint-versions; when a commit changes a linter's version
 # (LINT_VERSIONS_MODE=sync or index), every tracked shell script is linted with it, as CI will.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 [ "$#" -gt 0 ] || [[ ${LINT_VERSIONS_MODE:-} =~ ^(sync|index)$ ]] || exit 0

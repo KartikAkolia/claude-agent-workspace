@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Debian apt equivalents of the Fedora package profiles in dwm-titus-main/scripts/dwm-packages.sh.
 # Afterwards build dwm from the dwm-titus tree with `sudo make install`. The gaming profile,
-# the non-package steps and the packages Debian lacks are in docs/dwm-titus-debian-port.md.
+# the non-package steps and the packages Debian lacks are in its doc.
+# Docs: docs/dwm-titus-debian-port.md
 
 set -euo pipefail
 

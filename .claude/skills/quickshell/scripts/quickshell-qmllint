@@ -1,4 +1,5 @@
 #!/bin/sh
+# Docs: .claude/skills/quickshell/references/linting.md
 set -eu
 
 usage() {

@@ -2,6 +2,7 @@
 # Lints exactly what a commit contains: exports the index (minus the reference clones), then runs the index's
 # own copy of this hook and lint scripts there over the staged markdown, config, shell and Python files --
 # every file of a kind whose linter version changes, every link after a delete or rename.
+# Docs: docs/repo-tooling.md
 set -uo pipefail
 
 run_in_export() {

@@ -2,6 +2,7 @@
 # install-brother-dcp-l2665dw.sh: install Brother's CUPS driver for the DCP-L2665DW via its pinned
 # linux-brprinter-installer (Debian/Ubuntu only). Run it in a terminal; at the prompts accept the
 # EULA and choose the IP URI. Exit 0 queue verified, 1 failed, 2 kept queue unverifiable.
+# Docs: docs/brother-dcp-l2665dw-printer.md
 
 set -euo pipefail
 
