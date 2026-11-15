@@ -149,33 +149,38 @@ def check(repo_root, files, index=None, real_root=None):
     return broken, unreadable
 
 
-args, use_index, real_root, bad_usage = [], False, None, False
-argv = iter(sys.argv[1:])
-for a in argv:
-    if a == "--index":
-        use_index = True
-    elif a == "--real-root":
-        real_root = next(argv, None)
-        bad_usage = bad_usage or not real_root
-    elif a.startswith("--real-root="):
-        real_root = a.split("=", 1)[1]
-    else:
-        args.append(a)
-if bad_usage or not args:
-    print(USAGE, file=sys.stderr)
-    sys.exit(2)
+def main() -> None:
+    args, use_index, real_root, bad_usage = [], False, None, False
+    argv = iter(sys.argv[1:])
+    for a in argv:
+        if a == "--index":
+            use_index = True
+        elif a == "--real-root":
+            real_root = next(argv, None)
+            bad_usage = bad_usage or not real_root
+        elif a.startswith("--real-root="):
+            real_root = a.split("=", 1)[1]
+        else:
+            args.append(a)
+    if bad_usage or not args:
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
 
-repo_root = os.path.dirname(os.path.abspath(__file__))
-index = indexed_paths(repo_root) if use_index else None
-if use_index and index is None:
-    print(
-        "check-markdown-links: could not read the git index (git ls-files failed)",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-broken, unreadable = check(repo_root, args, index, real_root)
-for f, why in unreadable:
-    print(f"{f}: {why}")
-for f, lineno, target in broken:
-    print(f"{f}:{lineno}: broken reference to {target}")
-sys.exit(1 if broken or unreadable else 0)
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    index = indexed_paths(repo_root) if use_index else None
+    if use_index and index is None:
+        print(
+            "check-markdown-links: could not read the git index (git ls-files failed)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    broken, unreadable = check(repo_root, args, index, real_root)
+    for f, why in unreadable:
+        print(f"{f}: {why}")
+    for f, lineno, target in broken:
+        print(f"{f}:{lineno}: broken reference to {target}")
+    sys.exit(1 if broken or unreadable else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -26,7 +26,7 @@ staged_ruff() {
 		if [ -f "$LV_FILE" ]; then
 			printf 'lint-python: %s is not staged -- git add it and commit again\n' "$LV_NAME" >&2
 		else
-			printf 'lint-python: %s is missing -- create it with a ruff=X.Y.Z line (see lint-versions.sh), stage it, and commit again\n' "$LV_FILE" >&2
+			printf 'lint-python: %s is missing -- create it with a ruff=X.Y.Z line (format: docs/repo-tooling.md), stage it, and commit again\n' "$LV_FILE" >&2
 		fi
 		;;
 	*) printf 'lint-python: could not read %s from HEAD (see the git error above)\n' "$LV_NAME" >&2 ;;

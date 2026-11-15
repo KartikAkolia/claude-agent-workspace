@@ -33,6 +33,12 @@ Usage: install.sh [options]
   --accept-eula      agree to https://aka.ms/MinecraftEULA (eula=true)
   --yes              take the default for every unanswered question
                      (never accepts the EULA or opens the firewall)
+
+Run it as a normal user. sudo is needed only for a system unit, package
+installs, firewall changes, stopping a system unit for this directory and
+reading an existing server directory you can't read.
+Java listens on TCP 25565; Geyser on UDP 19132 for gameplay and TCP 19132
+for NetherNet signaling.
 EOF
 }
 

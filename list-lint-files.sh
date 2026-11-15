@@ -127,16 +127,19 @@ llf_file_shell() {
 	llf_shell_of "$line"
 }
 
+# The path rules llf_filter and the pre-commit hook share: sets LLF_CATEGORY for $1 by extension, else bash
+# for a shell shebang, and fails for an excluded path or one no linter takes.
+llf_category_of() {
+	llf_excluded "$1" && return 1
+	llf_name_category "$1" && return 0
+	llf_file_shell "$LLF_DIR/$1" && LLF_CATEGORY=bash
+}
+
 llf_filter() {
 	local category="$1" end='\n' f found=0
 	[ "$2" = nul ] && end='\0'
 	while IFS= read -r -d '' f; do
-		llf_excluded "$f" && continue
-		if llf_name_category "$f"; then
-			[ "$LLF_CATEGORY" = "$category" ] || continue
-		elif [ "$category" != bash ] || ! llf_file_shell "$LLF_DIR/$f"; then
-			continue
-		fi
+		{ llf_category_of "$f" && [ "$LLF_CATEGORY" = "$category" ]; } || continue
 		if [ "$end" = '\n' ] && [[ $f == *$'\n'* ]]; then
 			printf 'list-lint-files: %q has a newline in its name -- list with -z\n' "$f" >&2
 			return 1

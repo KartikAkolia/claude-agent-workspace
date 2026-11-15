@@ -153,9 +153,10 @@ pick_output() {
 }
 
 pick_two() {
-	out=$(pick_output "$1" active_outputs) || return 1
-	ref=$(pick_output "$2" active_outputs) || return 1
-	[ "$out" != "$ref" ] && return 0
+	local -n _pick_out=$1 _pick_ref=$2
+	_pick_out=$(pick_output "$3" active_outputs) || return 1
+	_pick_ref=$(pick_output "$4" active_outputs) || return 1
+	[ "$_pick_out" != "$_pick_ref" ] && return 0
 	wt --msgbox "Pick two different displays." 8 50
 	return 1
 }
@@ -239,7 +240,7 @@ action_set_primary() {
 
 action_position() {
 	local out ref choice reset_args=()
-	pick_two "Move which display?" "...relative to which display?" || return 0
+	pick_two out ref "Move which display?" "...relative to which display?" || return 0
 	choice=$(wt --menu "Position $out relative to $ref" 0 0 0 \
 		"left-of" "$out is to the left of $ref" \
 		"right-of" "$out is to the right of $ref" \
@@ -252,7 +253,7 @@ action_position() {
 
 action_mirror() {
 	local out ref size xid args=()
-	pick_two "Mirror which display?" "...onto which display? (same image as)" || return 0
+	pick_two out ref "Mirror which display?" "...onto which display? (same image as)" || return 0
 	size=$(output_geom "$ref")
 	size=${size%%+*}
 	if [ -z "$size" ]; then

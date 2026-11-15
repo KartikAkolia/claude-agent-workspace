@@ -362,6 +362,7 @@ class InstallerTests(unittest.TestCase):
                 self.subTest(signal=sig.name),
                 tempfile.TemporaryDirectory() as td,
                 open(Path(td) / "terminal", "w") as out,
+                contextlib.ExitStack() as stack,
             ):
                 log, terminal = Path(td) / "log", Path(td) / "terminal"
                 log.touch()
@@ -372,7 +373,7 @@ class InstallerTests(unittest.TestCase):
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
-                self.addCleanup(kill_group, proc.pid)
+                stack.callback(kill_group, proc.pid)
                 self.assertTrue(wait_for_text(log, "READY"))
                 os.killpg(proc.pid, sig)
                 proc.wait(timeout=10)
