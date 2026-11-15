@@ -6,6 +6,17 @@ Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Session entries since 2026-10-11 are kept below, newest first. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
 
+### This session's work (2026-11-15, from the CachyOS laptop, on the Raspberry Pi): `rss-stack.sh` reviewed and fixed; FreshRSS and RSS-Bridge installed LAN-only on rootless Docker
+
+Kartik asked for a skeptic review loop, with linting against the bash-scripting skill, of `~/Downloads/rss-stack.sh`, keeping added lines to a minimum. The full record is in `docs/rss-stack-pi.md`, and the script is now `scripts/rss-stack.sh`.
+
+1. **Review and fixes:** three skeptic agents (bash semantics, tool behaviour checked against upstream source, security), then `/code-review` rounds until none had actionable findings. The high-severity fixes: the weekly cron backup ignored `--dir`; FreshRSS 1.30's SSRF guard blocked `http://rssbridge/`, now allowed through `INTERNAL_HOST_ALLOWLIST`; and Full-Text RSS was dropped at Kartik's choice, because its only image (heussd) was archived on 2026-11-07 and runs PHP 5. The script passes `lint-bash.sh` and a 104-scenario bubblewrap sandbox, which was not kept. A Watchtower opt-out label was added at Kartik's request.
+2. **On the Pi:** a dry run, then the install (Kartik, `sudo`). The first install failed because the rootless daemon couldn't enter the root-only `/opt/rss-stack`. The same run re-enabled and started the system Docker at 11:58 through the script's then-unconditional `systemctl enable --now docker`. Kartik disabled `docker.service` and `docker.socket` and stopped `containerd.service` again. **Verified:** all three are inactive and disabled. The fixed script saves `DOCKER_HOST` as `STACK_DOCKER_HOST` and leaves the system daemon alone, and the second install succeeded.
+3. **Permissions (Kartik):** the bind-mount folders had host group `root`, which rootless Docker leaves unmapped, so FreshRSS couldn't write `data/` or read `extensions/`. A one-time `sudo chown 1000:1000 /opt/rss-stack/data/freshrss /opt/rss-stack/data/extensions` plus `docker restart freshrss` fixed it, and the script now sets the group itself. **Verified:** `www-data` can write `data/` and read `extensions/`, and `cli/reconfigure.php` exits 0.
+4. **Firewall (Kartik):** `sudo ufw allow from 192.168.0.0/24 to any port 8080 proto tcp comment 'FreshRSS from LAN'`. **Verified:** the laptop gets FreshRSS's login redirect from `192.168.0.166:8080`.
+5. **Repo:** this branch, `docs/rss-stack-pi`, adds the doc, the script, the `AGENTS.md` map entry and this entry. Separately, `/fewer-permission-prompts` added 20 read-only rules to `.claude/settings.json`. Those sit uncommitted in the main working tree, beside the other session's `refactor/skeptic-line-consolidation` changes, and are not on this branch.
+6. **Left for Kartik:** items 59 (the tunnel) and 60 (the passwords shown in chat).
+
 ### This session's work (2026-11-14, night, on the CachyOS laptop): `Debian-titus` audited, fixed for Debian 13 and VM-tested; private repo created and PR #1 merged
 
 Kartik asked for a full skeptic analysis of `/home/kartik/Debian-titus`, using agents at xhigh effort and replacing package names from debian.org. That directory was a fresh clone of upstream `ChrisTitusTech/Debian-titus` (`f5533bc`, 2024-04-21). The August fork `KartikAkolia/Debian-titus` (item 11) no longer exists on GitHub. Kartik chose:
@@ -401,7 +412,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 59.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 61.
 
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
 - **13.** **Cloudflare items deliberately left open** (2026-08-26): account 2FA (dashboard-only, can't be scripted), Hotlink Protection (likely safe but held for explicit confirmation because of `personal-website`'s deliberately-embeddable `/embed/widget/` route), and HSTS preload (effectively irreversible once submitted). See `docs/cloudflare-zone-settings.md`.
@@ -442,6 +453,9 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
   8. **Dependabot PR #1** on `KartikAkolia/dwm-titus-arch`: merge or close it. Actions are off, so it has no effect either way.
 
   Once steps 3–7 pass, move this item to `docs/archival.md`.
+
+- **59.** **Raspberry Pi: put the RSS stack online through its own tunnel.** (2026-11-15) FreshRSS runs LAN-only at `http://192.168.0.166:8080`. Follow "Adding the tunnel" in `docs/rss-stack-pi.md`: create a new tunnel token (not `kartikpassbolt`'s), run `sudo /opt/rss-stack/rss-stack.sh update --domain rss.<domain> --tunnel-token '<token>'`, point the public hostname at `http://freshrss:80`, add Access (email login, Bypass `/api/*`), then `sudo ufw delete allow from 192.168.0.0/24 to any port 8080 proto tcp`. Also delete the leftover dry-run folder: `rm -r ~/rss-dry` on the Pi.
+- **60.** **Change the FreshRSS admin and API passwords shown in chat on 2026-11-15.** They were pasted from the install output. The risk is low while FreshRSS is LAN-only, but the API password will face the internet once item 59 is done. Change both under FreshRSS's profile settings, then put the same values in `/opt/rss-stack/.env` (7–72 letters and digits) so `credentials` stays accurate, since `.env` doesn't track changes made in the web UI.
 
 ## Notes
 
