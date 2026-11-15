@@ -151,8 +151,7 @@ The hook lints exactly what the commit contains, with exactly the tooling and co
 The outer run (no `LINT_HOOK_EXPORT` in the environment) does the export:
 
 - A relative `GIT_INDEX_FILE` is made absolute, since `git commit <paths>` and `git commit -a` point it at a temporary index, possibly by a relative path, and the inner run works from elsewhere.
-- Which directories are clones comes from the index's own `list-lint-files.sh` run on the index's own `reference-clones.tsv`, both exported on their own first, so a malformed staged list fails the commit with the lister's message rather than excluding the wrong paths. A commit missing either file fails.
-- Transitional: an index with tooling older than `reference-clones.tsv` (no `--reference-clones` in its lister and no list) is exported whole, for its own older hook to lint. The code marks this branch for deletion once no open branch predates `reference-clones.tsv`.
+- Which directories are clones comes from the index's own `list-lint-files.sh` run on the index's own `reference-clones.tsv`, both exported on their own first, so a malformed staged list fails the commit with the lister's message rather than excluding the wrong paths. A commit missing either file fails, including one whose tooling predates `reference-clones.tsv` (the transitional whole-index export for those was removed on 2026-11-15, once every branch had the list, so rewriting history from before 2026-11-14 needs `git commit --no-verify`).
 - An export that comes out empty fails the commit.
 - If the commit drops the hook from the index, or it isn't executable in the export, the working tree's copy lints the commit instead.
 - The inner run gets `LINT_HOOK_REPO` (the real checkout), `LINT_HOOK_EXPORT` (the export) and `GIT_DIR` (the real repository). Its output has the export's path prefix stripped, so messages show repo-relative paths, and its exit status is the hook's.

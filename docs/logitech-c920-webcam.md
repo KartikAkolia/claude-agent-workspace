@@ -21,7 +21,7 @@ journalctl -u 'c920-settings@*' -n 20
 | `EXPOSURE` | `exposure_time_absolute` | 3-2047 | 250, the C920's own default |
 | `FOCUS` | `focus_absolute` | 0-250 in steps of 5 | 0, infinity |
 
-The installer refuses values outside those ranges (the C920's `focus_absolute` only takes multiples of 5). It needs `v4l2-ctl` from `v4l-utils` and `c920-apply-settings.sh` in the same directory as itself, and it prints the unit and rule before installing them. The values are written into the unit's `ExecStart`, so to change them, rerun the installer with new ones; it replaces all three files.
+The installer refuses values outside those ranges (the C920's `focus_absolute` only takes multiples of 5). It checks the digit count before the numeric test, so a value too large for bash's arithmetic is refused rather than slipping past the range check. It needs `v4l2-ctl` from `v4l-utils` and `c920-apply-settings.sh` in the same directory as itself, and it prints the unit and rule before installing them. The values are written into the unit's `ExecStart`, so to change them, rerun the installer with new ones; it replaces all three files.
 
 | Installed path | Contents |
 | --- | --- |

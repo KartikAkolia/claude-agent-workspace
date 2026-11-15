@@ -23,6 +23,7 @@
 # If Docker is missing, install runs Docker's get.docker.com script as root.
 # Rootless Docker: install with DOCKER_HOST set; it is saved as STACK_DOCKER_HOST in .env.
 # DRY_RUN=1 install writes the config files without touching apt or Docker.
+# Docs: docs/rss-stack-pi.md
 
 set -Eeuo pipefail
 umask 077

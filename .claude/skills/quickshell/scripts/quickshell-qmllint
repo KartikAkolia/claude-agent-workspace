@@ -142,6 +142,12 @@ project_root=$(find_root)
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# qmllint is exec'd below so it gets signals itself; this watcher removes $tmp once that process is gone.
+(
+	trap '' HUP INT TERM
+	while kill -0 "$$" 2>/dev/null; do sleep 1; done
+	rm -rf "$tmp"
+) </dev/null >/dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 
 imports=$(
 	printf '%s\n' "$files" |

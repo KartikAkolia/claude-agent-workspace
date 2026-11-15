@@ -19,12 +19,7 @@ run_in_export() {
 	export_dir="$tmp/index"
 	meta="$tmp/meta"
 	excludes=()
-	index_lister=$(git cat-file blob :0:list-lint-files.sh 2>/dev/null)
-	# An index predating reference-clones.tsv is exported whole, for its own older hook to lint. Transitional: once
-	# no open branch predates reference-clones.tsv, delete this branch and fail like the missing-file case below.
-	if [[ $index_lister != *--reference-clones* ]] && ! git cat-file -e :0:reference-clones.tsv 2>/dev/null; then
-		:
-	elif ! git checkout-index --prefix="$meta/" -- list-lint-files.sh reference-clones.tsv 2>"$tmp/err"; then
+	if ! git checkout-index --prefix="$meta/" -- list-lint-files.sh reference-clones.tsv 2>"$tmp/err"; then
 		printf 'pre-commit: this commit needs list-lint-files.sh and reference-clones.tsv, which every lint gate reads:\n' >&2
 		cat "$tmp/err" >&2
 		exit 1

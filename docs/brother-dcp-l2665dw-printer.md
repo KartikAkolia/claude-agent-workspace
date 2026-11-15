@@ -40,19 +40,17 @@ The installer's prompts, in the order v2.2.6-0 asks them:
 
 Before touching anything, the script snapshots every CUPS queue that looks like this printer: any `lpstat -v` line ("device for NAME: URI", read under `LC_ALL=C` because lpstat's wording is localized) containing the model, with or without its hyphen and in any case, or the printer's IP. Because the installer exits 0 even when it fails, a queue left by an earlier run, or the driverless queue above, would otherwise make a failed install look successful. If one exists, the script shows it and asks two questions, both defaulting to no: whether to run the installer at all (answering no exits with nothing changed), and whether to remove the old queue(s) with `lpadmin -x` first, which is what makes the result checkable.
 
-Queues are removed only after the installer has downloaded and passed the hash check, so a failed download never costs a queue.
+Queues are removed only after the installer has downloaded and passed the hash check, so a failed download never costs a queue. On a hash mismatch the script keeps its temporary directory and prints the file's path with both hashes, so the download can be inspected; delete that directory afterwards.
 
 Afterwards, success is a matching `lpstat -v` line that wasn't there before: a new queue, or an old one whose device URI changed. After a removal that simply means one exists again. If the old queue was kept and nothing new appeared, it must still exist and its configuration fingerprint must have changed. The fingerprint is its `lpstat -v` line plus the `device-uri` and `printer-make-and-model` (the driver) that `lpoptions -p` reports. It deliberately leaves out `printer-state-change-time` and every other state field: those change on any job, idle or offline transition, and would report a failed reinstall as an update. A kept queue that vanished is a failure, not a change.
 
-On a host with AppArmor's `aa-complain` installed, the installer runs `aa-complain cupsd` without asking, which puts CUPS's AppArmor profile into complain mode.
+On a host with AppArmor's `aa-complain` installed, the installer runs `aa-complain cupsd` without asking, which puts CUPS's AppArmor profile into complain mode. When `aa-complain` is present the script says so before it starts the installer: `sudo grep cupsd /sys/kernel/security/apparmor/profiles` shows the mode (works on any AppArmor version), and `sudo aa-enforce cupsd` reverts it.
 
 ## Exit status
 
 - `0`: a matching queue is new, or an existing one's device URI or driver changed.
-- `1`: failed. The host isn't Debian-family with `dpkg`, `cups.service` isn't running, you declined to run the installer over an existing queue, the hash didn't match, no new or changed queue appeared, or the kept queue disappeared.
+- `1`: failed. The host isn't Debian-family with `dpkg`, `cups.service` isn't running, you declined to run the installer over an existing queue, the hash didn't match, no new or changed queue appeared, the kept queue disappeared, or any other command failed (an `ERR` trap turns, for example, a failed download or `lpadmin -x` into `1` rather than that command's own status). A signal, such as Ctrl-C at a `sudo` or installer prompt, still ends it with 128 plus the signal number.
 - `2`: unverified. The kept queue looks exactly as before (same URI and driver), and CUPS doesn't tell non-root users when a queue was last reconfigured, so the script can't tell whether the reinstall did anything. Re-run and let it remove the queue first to get a checkable result.
-
-Any other status comes from a command that failed under `set -e`, for example curl's own exit code when the download fails.
 
 ## Known gaps
 
@@ -61,5 +59,3 @@ Success means only that a matching queue exists. The script doesn't check that t
 The `(I)` route prints over LPD (port 515). The 2026-08-30 check recorded 631, 9100, 80 and 443 open and said nothing about 515. If jobs stall, the queue can be pointed at JetDirect instead with `sudo lpadmin -p <queue> -v socket://<printer-ip>:9100`.
 
 The printer's address is fixed in `PRINTER_IP`. It drives both the queue matching and the printed hints, so edit it if the printer's address changes.
-
-On a hash mismatch the error names the downloaded file in the script's temporary directory, but the `EXIT` trap deletes that directory as the script exits, so the file is already gone. Download `INSTALLER_URL` again by hand to inspect it.
