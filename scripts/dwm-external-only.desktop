@@ -1,0 +1,8 @@
+[Desktop Entry]
+# Install with the sed step in docs/dwm-external-display.md, which sets Exec to your $HOME.
+Type=Application
+Name=External display only
+Comment=Keep the external monitor at 1920x1080 max refresh as the only display while connected; auto-switch on hotplug
+Exec=/home/kartik/.local/bin/dwm-external-only watch
+OnlyShowIn=X-DWM;
+NoDisplay=true
