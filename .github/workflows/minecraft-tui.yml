@@ -1,0 +1,245 @@
+name: minecraft-tui
+
+# CI for minecraft-tui/, the only Rust crate in this repo: cargo fmt --check,
+# clippy with warnings as errors and the unit tests, plus a release build
+# whose binary is kept as a short-lived artifact, so a pull request's build
+# can be downloaded and tried. Backstop for the local pre-commit hook
+# (.githooks/pre-commit), which runs fmt and clippy but not the tests.
+# Replaces lint-rust.yml (2026-11-27). docs/repo-tooling.md has the design.
+#
+# Two jobs, run in parallel. The optimised release profile shares no build
+# output with the dev-profile clippy and test builds, only the downloaded
+# crates, so one job would buy almost no cache reuse and would run the slowest
+# stage after the others. Two keeps one runner startup and toolchain install
+# per job and gives each job its own, smaller cache. Three (lint apart from
+# test) wouldn't pay: clippy and the test build share their build scripts and
+# proc macros, and fmt takes under a second.
+#
+# The artifact uses the everyday release profile, not the fat-LTO dist one,
+# which takes about 1.7 times as long on 4 cores: it's for trying a pull
+# request, not for handing out.
+on:
+  push:
+    # Branches only: GitHub ignores `paths` for tag pushes, so a tag would
+    # otherwise run both jobs whatever it touched.
+    branches: ["**"]
+    paths:
+      - "minecraft-tui/**"
+      - ".github/workflows/minecraft-tui.yml"
+  pull_request:
+    paths:
+      - "minecraft-tui/**"
+      - ".github/workflows/minecraft-tui.yml"
+
+# A newer push to the same branch or pull request makes a running build moot.
+# Not on master, where every merged commit keeps its own result: there the
+# group is the commit, since a shared group would still drop a queued run
+# when a third push arrives, whatever cancel-in-progress says.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+# Read-only token. The cache and artifact actions authenticate with the
+# runner's own token, not this one, so they need no extra permission.
+permissions:
+  contents: read
+
+env:
+  # A pinned toolchain, so a new stable clippy lint can't fail an unrelated
+  # change. Keep it at the Rust the pre-commit hook runs locally (rustc
+  # --version), and bump both together.
+  RUSTUP_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+
+# bash -eo pipefail for every step, not the bare bash -e GitHub defaults to.
+defaults:
+  run:
+    shell: bash
+    working-directory: minecraft-tui
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_COMPONENTS: rustfmt,clippy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The same step in both jobs, through a YAML anchor. It writes the
+      # timing helper the later steps source: `timed LABEL CMD...` runs CMD
+      # and adds a row with its wall time and result to timings.md, which the
+      # Summary step prints, so build time is visible on every run's page.
+      # The image's rustup ships a newer stable too; RUSTUP_TOOLCHAIN makes
+      # rustup install and run exactly the pinned one. It comes before the
+      # cache, which keys on the rustc version.
+      - &toolchain
+        name: Toolchain
+        id: toolchain
+        run: |
+          cat >"$RUNNER_TEMP/timed.bash" <<'EOF'
+          # row LABEL START RESULT: a row timed from START, an $EPOCHREALTIME, to now.
+          row() {
+            awk -v l="$1" -v s="$2" -v e="$EPOCHREALTIME" -v r="$3" \
+              'BEGIN { printf "| %s | %.1f s | %s |\n", l, e - s, r }' >>"$RUNNER_TEMP/timings.md"
+          }
+          timed() {
+            local label=$1 start=$EPOCHREALTIME status=0
+            shift
+            "$@" || status=$?
+            if [ "$status" -eq 0 ]; then
+              row "$label" "$start" ok
+            else
+              row "$label" "$start" "failed (exit $status)"
+            fi
+            return "$status"
+          }
+          EOF
+          . "$RUNNER_TEMP/timed.bash"
+          echo "JOB_START=$EPOCHREALTIME" >>"$GITHUB_ENV"
+          timed "rustup toolchain install" \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal \
+            ${RUST_COMPONENTS:+--component "$RUST_COMPONENTS"}
+          # rust-cache hashes every installed toolchain's rustc -vV into its
+          # keys, restore keys included, so the image's own stable would wipe
+          # the cache whenever the image moves to a new release. Nothing here
+          # uses it (RUSTUP_TOOLCHAIN selects the pinned one), and the runner
+          # is thrown away afterwards.
+          rustup toolchain uninstall stable >/dev/null 2>&1 || true
+          echo "RUSTC_VERSION=$(rustc --version)" | tee -a "$GITHUB_ENV"
+          echo "CACHE_START=$EPOCHREALTIME" >>"$GITHUB_ENV"
+
+      # Rather than actions/cache: it keys on the installed toolchains,
+      # Cargo.lock, the manifest and RUST*/CARGO* variables by itself, falls
+      # back to an older lockfile's cache (pruning week-old files from such a
+      # partial restore), and drops the crate's own build output before
+      # saving, so the cache holds only dependencies. The job id is in the
+      # key, so each job keeps its own profile's build. It also sets
+      # CARGO_INCREMENTAL=0 for the steps after it, so CI builds are never
+      # incremental (release then gets 16 codegen units, not 256).
+      - &cache
+        name: Cache dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: minecraft-tui
+
+      # From here on, every step whose work doesn't depend on an earlier one
+      # runs once the toolchain is in, even after a failed check or cache
+      # step, so a formatting nit doesn't hide a clippy or test failure.
+      - &cache-time
+        name: Time the cache restore
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          . "$RUNNER_TEMP/timed.bash"
+          row "cache restore" "$CACHE_START" "done"
+
+      - name: cargo fmt
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          . "$RUNNER_TEMP/timed.bash"
+          timed "cargo fmt --check" cargo fmt --check
+
+      - name: cargo clippy
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          . "$RUNNER_TEMP/timed.bash"
+          timed "cargo clippy (dev)" cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          . "$RUNNER_TEMP/timed.bash"
+          timed "cargo test (dev build and run)" cargo test --locked
+
+      # always(), not !cancelled(): a job that hits timeout-minutes counts as
+      # cancelled, and that's when the timings matter most. RUSTC_VERSION
+      # comes from the toolchain step, since running rustc here could make
+      # rustup try to install a toolchain that failed to install.
+      # From the workspace root, not the crate: if checkout failed, the crate
+      # directory doesn't exist and the step couldn't start. It only uses
+      # absolute paths.
+      - &summary
+        name: Summary
+        if: always()
+        working-directory: ${{ github.workspace }}
+        env:
+          CACHE_OUTCOME: ${{ steps.cache.outcome }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          rust=${RUSTC_VERSION:-"Rust $RUSTUP_TOOLCHAIN (not installed)"}
+          case $CACHE_OUTCOME/$CACHE_HIT in
+          success/true) cache="exact hit" ;;
+          success/*) cache="miss, or a partial restore from an older key" ;;
+          *) cache="${CACHE_OUTCOME:-not run}" ;;
+          esac
+          . "$RUNNER_TEMP/timed.bash" || true
+          [ -z "${JOB_START:-}" ] || row "job so far, from the toolchain step" "$JOB_START" "$JOB_STATUS"
+          {
+            echo "### $GITHUB_JOB"
+            echo
+            echo "$rust on $(nproc) CPUs; dependency cache: $cache. Only the timed steps have rows, and one that didn't run has none."
+            echo
+            echo "| Step | Wall time | Result |"
+            echo "| --- | ---: | --- |"
+            cat "$RUNNER_TEMP/timings.md" 2>/dev/null || true
+            cat "$RUNNER_TEMP/notes.md" 2>/dev/null || true
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_COMPONENTS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - *toolchain
+      - *cache
+      - *cache-time
+
+      - name: cargo build --release
+        id: release
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          . "$RUNNER_TEMP/timed.bash"
+          timed "cargo build --release" cargo build --release --locked
+
+      # tar keeps the executable bit, which upload-artifact's zip drops, and
+      # archive: false uploads the tarball as it is rather than zipped again.
+      # GITHUB_SHA is the commit built: on a pull request, the merge commit.
+      - name: Package the binary
+        id: package
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        run: |
+          name="minecraft-tui-${GITHUB_SHA::12}-$(uname -m)-linux.tar.gz"
+          tar -czf "$RUNNER_TEMP/$name" -C target/release minecraft-tui
+          echo "ARTIFACT=$RUNNER_TEMP/$name" >>"$GITHUB_ENV"
+
+      # overwrite: a re-run of this job uploads the same name in the same run.
+      - name: Upload the binary
+        id: upload
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.ARTIFACT }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+
+      # Only once the upload worked, so the summary never names a missing artifact.
+      - name: Note the artifact
+        if: ${{ !cancelled() && steps.upload.outcome == 'success' }}
+        run: |
+          bin_size=$(stat -c %s target/release/minecraft-tui)
+          tar_sha=$(sha256sum "$ARTIFACT" | cut -d ' ' -f 1)
+          {
+            echo
+            echo "Artifact \`${ARTIFACT##*/}\`, kept 7 days: tarball sha256 \`$tar_sha\`, holding the $bin_size-byte binary."
+            echo "Built on Ubuntu, so it needs that glibc or newer, and its default \`--script\`"
+            echo "path is the runner's checkout: pass \`--script\` or set \`MC_TUI_SCRIPT\`."
+          } >>"$RUNNER_TEMP/notes.md"
+
+      - *summary

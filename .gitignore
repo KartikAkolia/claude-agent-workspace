@@ -12,3 +12,4 @@ estuary/
 titus-ai-main/.serena/project.yml
 /notes
 /wireshark-output.log
+.claude/worktrees/

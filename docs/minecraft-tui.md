@@ -11,6 +11,7 @@ cd minecraft-tui
 cargo build --release
 target/release/minecraft-tui                 # stack in /opt/minecraft-server
 target/release/minecraft-tui --dir /srv/mc   # another stack folder
+cargo build --profile dist                   # smallest binary, in target/dist/, for handing out
 ```
 
 `--script PATH` (or `MC_TUI_SCRIPT`) names the `minecraft-twingate.sh` to run for install and update. By default it's this repository's copy, found from the path the binary was built in, so a binary copied elsewhere, or a moved checkout, needs `--script`. The terminal has to be at least 64×18. Below that the screen says so and only `q` or Ctrl-C (quit) work, except while a command runs: it then gets the whole screen and its keys, since it may be asking for a password.
@@ -62,9 +63,40 @@ Container control uses `docker` directly. The names `minecraft-server`, `twingat
 
 Source layout: `config.rs` (options, shared names, the root command), `probe.rs` (the state snapshot), `slp.rs` (Server List Ping, with one deadline for the whole reply), `logs.rs` (log follower), `pane.rs` (the pseudo-terminal pane, with portable-pty, vt100 and tui-term), `actions.rs`, `form.rs`, `app.rs` (event loop) and `ui.rs` (drawing).
 
+## Build time
+
+The crate is tuned to build quickly ([details below](#build-time-measurements)):
+
+- **Dependencies.** ratatui is built without its default features: only the crossterm backend, the layout cache and underline colour. That drops the calendar widget (with the `time` crates) and `ratatui-macros`, which nothing here uses: seven crates, taking the dependencies from 89 to 82. The rest can't be trimmed further without rewriting working code: crossterm's `derive-more` and the two `syn` versions are forced by ratatui's and portable-pty's own dependencies, and portable-pty has no default features to turn off. A hand-written JSON parser in place of `serde_json` was tried and rejected: it saved CPU time but not wall time, for 230 lines of parser to maintain.
+- **`release` profile.** Cargo's defaults (crate-local LTO, and 256 codegen units when incremental) plus `incremental = true` and `strip`. The binary is 1.29 MB instead of 1.11 MB. CI never builds incrementally, because rust-cache sets `CARGO_INCREMENTAL=0`, so its release build gets Cargo's non-incremental 16 codegen units. `panic` stays `unwind`, because the background threads and the Drop impls that kill child processes rely on it.
+- **`dist` profile.** The old release settings (fat LTO, one codegen unit, not incremental) for the smallest binary, 1,105,928 bytes as before, at the old build time.
+- **`dev` profile.** Line tables only for this crate, so backtraces keep file and line, and no debug info for dependencies.
+- **Linker.** Unchanged: since Rust 1.90, rustup's toolchains link with the bundled rust-lld on x86_64 Linux, and Arch's packaged rustc links with the system LLD. Forcing GNU ld made a debug relink 0.56 s instead of 0.23 s.
+- **Tests.** The `cmd.rs` deadline test uses a 300 ms limit instead of the real 5 seconds, so `cargo test` runs in under a second. Its message is formatted with integers only, since float formatting would add about 20 KB to the binary.
+
+### Build-time measurements
+
+Measured on 2026-11-27 on this laptop (Ryzen 9 7940HS, 8 cores and 16 threads, Rust 1.100.0), each build in a fresh target directory, on an idle machine. The CI rows use 4 cores (`taskset -c 0-3`) with `CARGO_INCREMENTAL=0`, as rust-cache sets it; each was run twice and agreed to within 0.3 s. The `release`, `dist` and previous binaries were also driven against the live stack, and every screen and colour dump was identical.
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| Clean debug build | 6.0 s | 5.5 s |
+| Debug rebuild after touching `src/ui.rs` | 0.2 s | 0.2 s |
+| Clean release build | 15.5–16.5 s | 7.0–7.5 s |
+| Release rebuild after touching `src/ui.rs` | 10.3 s | 0.2 s |
+| Clean `cargo clippy --all-targets` | 5.2 s | 4.9–5.3 s |
+| `cargo test --no-run` after clippy | 3.8 s | 3.1–3.2 s |
+| `cargo test` run time | 5.0 s | 0.8 s |
+| Clean `dist` build | (was `release`) | 16.0 s |
+| CI `check` job (fmt, clippy, tests), 4 cores | 17 s | 11.3 s |
+| CI `build` job (release build), 4 cores | 18.8 s | 10.9 s |
+| `dist` build, 4 cores | (was the `build` job) | 18.3 s |
+
+The release binary is 1,286,448 bytes and the `dist` binary 1,105,928, the same as the old release build. On GitHub's runners the dependency cache shortens repeat runs further; each run's summary shows the real times.
+
 ## Linting
 
-`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` run in `.githooks/pre-commit` whenever a commit adds, changes or deletes anything in `minecraft-tui/`. The `lint-rust.yml` workflow runs both plus `cargo test` on Rust 1.100.0, pinned so a new stable clippy lint can't fail an unrelated change; bump it with the local Rust ([repo-tooling.md](repo-tooling.md)).
+`cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` run in `.githooks/pre-commit` whenever a commit adds, changes or deletes anything in `minecraft-tui/`. The `minecraft-tui.yml` workflow runs both plus `cargo test --locked` on Rust 1.100.0, pinned so a new stable clippy lint can't fail an unrelated change; bump it with the local Rust. In parallel it builds the release binary and keeps it for 7 days as an artifact on the run's page, so a pull request's build can be downloaded: a `.tar.gz` holding the binary for x86_64 Linux with Ubuntu's glibc or newer. Its default `--script` points into the runner's checkout, so pass `--script` or set `MC_TUI_SCRIPT` when running it. Download it from the run's page in a browser, or with `gh api repos/KartikAkolia/claude-agent-workspace/actions/artifacts/<id>/zip > minecraft-tui.tar.gz` (the id is in `gh api .../actions/runs/<run>/artifacts`): `gh run download` expects every artifact to be a zip and fails on this one with "not a valid zip file". Each run's summary lists how long each build step took. The workflow's design is in [repo-tooling.md](repo-tooling.md#ci-workflows).
 
 ## Validation
 

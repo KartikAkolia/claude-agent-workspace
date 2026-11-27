@@ -45,9 +45,10 @@ gem install --user-install --no-document mdl --bindir ~/.local/bin
 
 ## CI
 
-Five GitHub Actions workflows under `.github/workflows/`, none of them a blocking merge gate (no branch protection or rulesets are configured on this public repo — see `SPEC.md`'s Testing & CI section):
+Six GitHub Actions workflows under `.github/workflows/`, none of them a blocking merge gate (no branch protection or rulesets are configured on this public repo — see `SPEC.md`'s Testing & CI section):
 
 - `lint-markdown.yml`, `lint-config.yml`, `lint-bash.yml` and `lint-python.yml` — re-run the matching local lint on push/PR, a backstop for a `--no-verify` bypass or a commit made on a machine without the hook wired up. `lint-bash.yml` and `lint-python.yml` also run the scripts' `unittest` suites.
+- `minecraft-tui.yml` — fmt, clippy and the tests for the `minecraft-tui/` Rust crate, plus a release build kept as a 7-day artifact.
 - `gitleaks.yml` — secret scanning on every push/PR.
 
 `fjord-ci.yml` and `dependabot.yml`, which built and updated the `fjord/` Astro site, were removed with it on 2026-10-21.
