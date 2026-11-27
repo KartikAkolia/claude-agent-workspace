@@ -9,6 +9,9 @@ executes selected commands inside a pseudo-terminal.
 
 Read `SPEC.md` before making architectural or behavior changes.
 
+`CLAUDE.md`, `GEMINI.md`, and `.github/copilot-instructions.md` only point to
+this file. Put new instructions here, not in them.
+
 ## Repository layout
 
 - `core/`: Backend library, menu data model, TOML parsing, platform
@@ -147,6 +150,32 @@ documentation.
 - Keep tab data consistently ordered. Use `sort-tomlfiles.sh` when the change
   requires catalog sorting.
 
+## Documentation
+
+`docs/` is a Hugo site. `docs/content/userguide/walkthrough.md` is generated
+from the catalog by `cargo xtask docgen` and must not be edited by hand. Commit
+the regenerated file with the catalog change.
+
+The other pages are hand-written. They describe categories and behavior and
+link to the walkthrough rather than listing every script, so adding a script
+only needs docgen. Do not add per-script tables to them.
+
+Update the matching pages in the same change when you change:
+
+- CLI flags in `tui/src/cli.rs`: the options table in
+  `docs/content/userguide/getting-started/_index.md` and `man/linutil.1`.
+- Keyboard shortcuts: the shortcut table in the same getting-started page.
+- Config fields in `core/src/config.rs`:
+  `docs/content/userguide/automation/_index.md`.
+- Task flags, preconditions, or the TOML schema: `SPEC.md`,
+  `docs/content/dev/architecture.md`, and `docs/content/dev/scripts.md`.
+- Shared helpers or shell conventions: `docs/content/dev/scripts.md`.
+- Package managers detected by `common-script.sh`: the distro table in
+  `docs/content/faq.md`.
+
+Only document behavior confirmed in the code. Do not describe flags, commands,
+or options that do not exist.
+
 ## Validation
 
 Run the smallest relevant checks, then broaden them for cross-cutting changes.
@@ -177,6 +206,13 @@ cargo xtask docgen
 git diff --check
 ```
 
+For changes under `docs/`, also build the site to an output directory outside
+the repository:
+
+```bash
+hugo build --source docs --destination /tmp/linutil-docs
+```
+
 For TUI behavior, also run:
 
 ```bash
@@ -185,6 +221,25 @@ cargo run --package linutil_tui
 
 Interactive validation must not execute destructive utilities merely to test
 navigation. Use preview, descriptions, harmless entries, or focused tests.
+
+## Docs site
+
+`docs/` is a Hugo site with its own layouts. `docs/README.md` explains how it
+is put together.
+
+- The live site shows the catalog of the latest release, not `main`. The deploy
+  in `.github/workflows/docs.yaml` checks out `core/tabs` from that release and
+  runs `cargo xtask docgen` before building, so the homepage menu and the
+  walkthrough list what the installer downloads. Keep it that way.
+- Publishing a release, or promoting a pre-release, redeploys the site and
+  opens a `docs-update` PR with the regenerated walkthrough, which
+  `.github/workflows/auto-merge-docs.yaml` merges. A new pre-release on its own
+  does not change the site.
+- Hand-written pages are not generated. They go live from `main` as soon as
+  they merge, so update them in the same change as the behavior they describe.
+- The homepage Flags panel is copied from `tui/src/dashboard.rs` into the front
+  matter of `docs/content/_index.md`. Update it when the TUI's flags change.
+  Quick Help lists the keys the menu preview answers to, not the TUI's.
 
 ## Completion criteria
 
