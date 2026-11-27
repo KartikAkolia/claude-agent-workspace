@@ -41,15 +41,18 @@ pub fn open(app: &gtk::Application, file: gio::File) {
 pub fn quit(app: &gtk::Application) {
     let app = app.clone();
     glib::spawn_future_local(async move {
-        let windows = WINDOWS.with_borrow(Clone::clone);
-        for win in &windows {
+        // Asked again until none is left: a prompt only blocks its own window, so another can
+        // be edited, or opened, while one is waiting.
+        loop {
+            let next = WINDOWS.with_borrow(|ws| ws.iter().find(|w| w.unsaved()).cloned());
+            let Some(win) = next else {
+                break;
+            };
             if !win.confirm_discard().await {
                 return;
             }
         }
-        for win in &windows {
-            win.closing.set(true);
-        }
+        WINDOWS.with_borrow(|ws| ws.iter().for_each(|w| w.closing.set(true)));
         app.quit();
     });
 }
@@ -98,6 +101,8 @@ struct Win {
     saving: Cell<bool>,
     /// Set once closing has been agreed to, so the close request lets it through.
     closing: Cell<bool>,
+    /// `edits` when the user last chose Discard, so quit doesn't ask twice about the same text.
+    discarded: Cell<Option<u64>>,
     layout: RefCell<Layout>,
 }
 
@@ -215,6 +220,7 @@ impl Win {
             blocks: RefCell::new(Vec::new()),
             saving: Cell::new(false),
             closing: Cell::new(false),
+            discarded: Cell::new(None),
             layout: RefCell::new(Layout::default()),
         });
         win.connect_actions();
@@ -224,6 +230,13 @@ impl Win {
         win.update_actions();
         WINDOWS.with_borrow_mut(|ws| ws.push(win.clone()));
         win
+    }
+
+    /// Unsaved work the user hasn't already agreed to discard.
+    fn unsaved(&self) -> bool {
+        self.has_doc.get()
+            && self.source.is_modified()
+            && self.discarded.get() != Some(self.edits.get())
     }
 
     fn is_empty(&self) -> bool {
@@ -480,7 +493,7 @@ impl Win {
                     find::go_to_line(&win.editor, line);
                     win.close_bar();
                 }
-                Err(_) => win.bar.set_status("Not a line number", true),
+                Err(_) => win.bar.line_error(true),
             }
         });
 
@@ -591,6 +604,7 @@ impl Win {
     /// costs the current one. Without `ask` it is a reload of the same file, which the user has
     /// asked for (or which has nothing unsaved), and keeps the place in the document.
     fn load(self: &Rc<Self>, file: gio::File, ask: bool) {
+        let edits = self.edits.get();
         let this_load = self.loads.get() + 1;
         self.loads.set(this_load);
         self.pending.replace(Some(file.clone()));
@@ -617,7 +631,10 @@ impl Win {
                         return; // Superseded while the prompt was open.
                     }
                     win.pending.replace(None);
-                    if go {
+                    // A reload never replaces text typed while it was reading the file.
+                    if !ask && win.edits.get() != edits {
+                        win.show_changed(&file);
+                    } else if go {
                         win.show(&file, loaded, !ask);
                     }
                 }
@@ -738,7 +755,10 @@ impl Win {
             .default_button(2)
             .build();
         match dialog.choose_future(Some(&self.window)).await {
-            Ok(1) => true,
+            Ok(1) => {
+                self.discarded.set(Some(self.edits.get()));
+                true
+            }
             Ok(2) => self.save().await,
             _ => false,
         }
@@ -746,31 +766,56 @@ impl Win {
 
     /// Saves to the document's file, or asks for one. True once it is on disk.
     async fn save(self: &Rc<Self>) -> bool {
+        // One save at a time: a second would check the file against the guard the first is
+        // about to replace, and report mdview's own save as an outside change.
+        let Some(_busy) = Busy::start(&self.saving) else {
+            return false;
+        };
         if !self.has_doc.get() {
             return false;
         }
         let file = self.file.borrow().clone();
         let Some(file) = file else {
-            return self.save_as().await;
+            return self.choose_and_save().await;
         };
         let text = self.source_text();
         let edits = self.edits.get();
-        let guard = self.guard.borrow().clone();
-        self.saving.set(true);
-        let mut result = file::save(&file, &text, guard.as_ref()).await;
-        if matches!(result, Err(SaveError::Conflict)) {
-            if !self.ask_overwrite(&file).await {
-                self.saving.set(false);
-                return false;
+        let mut guard = self.guard.borrow().clone();
+        loop {
+            match file::save(&file, &text, guard.as_ref()).await {
+                Err(SaveError::Conflict) => {
+                    if !self.ask_overwrite(&file).await {
+                        return false;
+                    }
+                    // Overwrite what is there now, and still notice a change made while the
+                    // prompt was open: that asks again.
+                    guard = match file::read_checked(&file).await {
+                        Ok(Some(disk)) => Some(Guard::of(&disk.bytes)),
+                        Ok(None) => None,
+                        Err(message) => {
+                            let failed = SaveError::Failed {
+                                message,
+                                in_place: false,
+                            };
+                            return self.finish_save(&file, Err(failed), edits);
+                        }
+                    };
+                }
+                result => return self.finish_save(&file, result, edits),
             }
-            result = file::save(&file, &text, None).await;
         }
-        self.saving.set(false);
-        self.finish_save(&file, result, edits)
     }
 
     /// Saves to a file the user picks, which then becomes the document's file.
     async fn save_as(self: &Rc<Self>) -> bool {
+        let Some(_busy) = Busy::start(&self.saving) else {
+            return false;
+        };
+        self.choose_and_save().await
+    }
+
+    /// Save As itself, for a caller that already holds the save in progress.
+    async fn choose_and_save(self: &Rc<Self>) -> bool {
         if !self.has_doc.get() {
             return false;
         }
@@ -819,9 +864,7 @@ impl Win {
         }
         let text = self.source_text();
         let edits = self.edits.get();
-        self.saving.set(true);
         let result = file::save(&target, &text, None).await;
-        self.saving.set(false);
         let saved = self.finish_save(&target, result, edits);
         if saved {
             self.file.replace(Some(target.clone()));
@@ -843,7 +886,7 @@ impl Win {
                 self.update_title();
                 true
             }
-            // It changed again between the overwrite prompt and the write; saving again asks.
+            // save() answers conflicts itself, and Save As writes without a guard.
             Err(SaveError::Conflict) => false,
             Err(SaveError::Failed { message, in_place }) => {
                 let mut detail = sentence(&message);
@@ -929,8 +972,9 @@ impl Win {
         };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            // Gone or unreadable: a save will recreate it or say why it can't.
-            let Ok(bytes) = file::read_capped(&file).await else {
+            // Gone, unreadable or no longer a regular file: a save will recreate it or say why
+            // it can't.
+            let Ok(Some(disk)) = file::read_checked(&file).await else {
                 return;
             };
             let Some(win) = weak.upgrade() else {
@@ -941,21 +985,25 @@ impl Win {
                 .guard
                 .borrow()
                 .as_ref()
-                .is_some_and(|g| g.matches(&bytes));
+                .is_some_and(|g| g.matches(&disk.bytes));
             if win.saving.get() || !still_ours || unchanged {
                 return;
             }
             if win.source.is_modified() {
-                win.changed.label.set_text(&format!(
-                    "“{}” changed on disk. Reload it and lose your changes, or keep yours \
-                     (saving will ask before overwriting).",
-                    display_name(&file)
-                ));
-                win.changed.revealer.set_reveal_child(true);
+                win.show_changed(&file);
             } else {
                 win.load(file, false);
             }
         });
+    }
+
+    fn show_changed(&self, file: &gio::File) {
+        self.changed.label.set_text(&format!(
+            "“{}” changed on disk. Reload it and lose your changes, or keep yours (saving will \
+             ask before overwriting).",
+            display_name(file)
+        ));
+        self.changed.revealer.set_reveal_child(true);
     }
 
     /// Switches between the rendered view and the source, keeping the place in the document.
@@ -1162,6 +1210,21 @@ impl Win {
             table.set_min_content_width(fit);
             table.set_min_content_height(height);
         }
+    }
+}
+
+/// Marks a save as running for as long as it lives, so a second can't start meanwhile.
+struct Busy<'a>(&'a Cell<bool>);
+
+impl<'a> Busy<'a> {
+    fn start(flag: &'a Cell<bool>) -> Option<Self> {
+        (!flag.replace(true)).then_some(Self(flag))
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 

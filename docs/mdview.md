@@ -53,7 +53,7 @@ The window opens on the rendered document; Ctrl+E shows the source, the exact te
 
 Unsaved work is never lost silently. Closing a window, quitting, opening another file over it, or dropping one on it asks Save, Discard or Cancel; quit asks each window in turn and stops at the first Cancel. A file being opened is read and checked before that prompt, so one that fails to open costs nothing.
 
-Saving writes the text byte for byte, line endings included. Before writing, mdview re-reads the file and compares it with what it last read or wrote (a hash of the bytes, because the etag is only the modification time), and writes with that etag. If anything else changed the file, it asks: Overwrite, or Cancel and use Save As. Save As adds `.md` to a name without an extension, refuses any other extension, and asks before replacing an existing file the file dialog didn't ask about. A save that fails says why; where gio rewrites a file in place (a symlink, a hard link, a file in a read-only folder), it also warns the file may be incomplete.
+Saving writes the text byte for byte, line endings included. Before writing, mdview re-reads the file and compares it with what it last read or wrote (a hash of the bytes, because the etag is only the modification time), and writes with the etag taken just before that read; a `touch` alone isn't a conflict, and a file that has become something other than a regular file isn't written. One save runs at a time. If anything else changed the file, it asks: Overwrite, or Cancel and use Save As. Save As adds `.md` to a name without an extension, refuses any other extension, and asks before replacing an existing file the file dialog didn't ask about. A save that fails says why; where gio rewrites a file in place (a symlink, a hard link, a file in a read-only folder, or one owned by another user or group), it also warns the file may be incomplete.
 
 While a document is open, mdview watches its file. A change from outside reloads a document with nothing unsaved, keeping its place; a document with unsaved work gets a bar instead, offering Reload or Keep Mine. mdview's own saves are recognised by their hash and ignored.
 
@@ -117,6 +117,7 @@ Phase 2 check on `asus-vivobook`, 2026-11-27, all passed. Synthesised keystrokes
 - Quit with two modified windows asks twice; Discard both quits and writes nothing. Quit answered Save saves, then quits. Cancel keeps the app running.
 - Replace All rewrites every match, and one undo reverts all of it.
 - Switching views deep in `docs/archival.md` lands on source line 514 both ways, on the same paragraph.
+- Two overlapping saves: the second is refused while the first runs, with no false conflict. A `touch` before saving isn't a conflict. A file swapped for a FIFO is refused at save time ("it isn't a regular file") with no hang.
 - The find bar, the changed-on-disk bar and the match highlight are drawn in the theme, in both views.
 
 Not yet checked by hand, since each needs a person at the keyboard: the key bindings themselves, the Save, Discard and Cancel prompt's look and its Alt shortcuts, the Open and Save As dialogs through the KDE portal, New then Save As, dropping a file from Dolphin, Tab, go to line and word wrap.

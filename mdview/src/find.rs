@@ -145,11 +145,21 @@ impl Bar {
         self.replace_row.set_visible(mode == Mode::Replace);
         self.goto_row.set_visible(mode == Mode::GoTo);
         self.set_status("", false);
+        self.line_error(false);
         self.revealer.set_reveal_child(true);
         if mode == Mode::GoTo {
             self.line.grab_focus();
         } else {
             self.find.grab_focus();
+        }
+    }
+
+    /// Marks the line field with the theme's error style, for a line number that isn't one.
+    pub fn line_error(&self, error: bool) {
+        if error {
+            self.line.add_css_class("error");
+        } else {
+            self.line.remove_css_class("error");
         }
     }
 

@@ -100,15 +100,31 @@ pub struct Rendered {
 pub fn render(source: &str) -> Rendered {
     // pulldown-cmark doesn't skip a byte-order mark, which would turn a first `# Title` into text.
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
+    let line_starts = line_starts(source);
     let mut b = Builder::default();
     for (event, range) in Parser::new_ext(source, OPTIONS).into_offset_iter() {
         b.line = line_starts.partition_point(|&start| start <= range.start) - 1;
         b.event(event);
     }
     b.out
+}
+
+/// Where each line starts, by the line breaks `TextBuffer` counts (`\n`, `\r\n`, a lone `\r`
+/// and U+2029), so a block's line is the editor's line number for it.
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut chars = source.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\r' if chars.peek().is_some_and(|&(_, next)| next == '\n') => {
+                chars.next();
+                starts.push(at + 2);
+            }
+            '\r' | '\n' | '\u{2029}' => starts.push(at + c.len_utf8()),
+            _ => {}
+        }
+    }
+    starts
 }
 
 /// Escapes text for Pango markup, and drops the control characters markup can't hold.
@@ -754,8 +770,11 @@ mod tests {
         let r = render("# A\n\npara\nmore\n\n- x\n- y\n\n```\ncode\n```\n");
         assert_eq!(r.text, "A\n\npara more\n\n• x\n• y\n\ncode");
         assert_eq!(r.blocks, [(0, 0), (3, 2), (14, 5), (18, 6), (23, 8)]);
-        // A byte-order mark adds no line.
+        // A byte-order mark adds no line; every line break TextBuffer counts does.
         assert_eq!(render("\u{feff}a\n\nb\n").blocks, [(0, 0), (3, 2)]);
+        assert_eq!(render("a\r\rb\r").blocks, [(0, 0), (3, 2)]);
+        assert_eq!(render("a\r\n\r\nb").blocks, [(0, 0), (3, 2)]);
+        assert_eq!(line_starts("a\u{2029}b\u{2028}c"), [0, 4]);
     }
 
     #[test]
