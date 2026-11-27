@@ -2,7 +2,7 @@
 
 mdview is a small GTK4 Markdown viewer and editor, written in Rust, that takes on the system GTK theme (Nordic, Papirus-Dark and Noto Sans on `asus-vivobook`). It lives in `mdview/`. The design, the decisions behind it and the pitfalls the skeptic reviews found are in [mdview-plan.md](mdview-plan.md); read that before changing it.
 
-Status, 2026-11-27: Phases 1 to 4 (the viewer, the editor; links, zoom, the status line and the desktop entry; autosave and crash recovery) are built and checked on `asus-vivobook`. The copy installed there for Kartik's user is a Phase 3 build until it is reinstalled.
+Status, 2026-11-27: Phases 1 to 4 (the viewer, the editor; links, zoom, the status line and the desktop entry; autosave and crash recovery) are built and checked on `asus-vivobook`, and installed there for Kartik's user (the release build of commit `58d065f`, reinstalled on 2026-11-27).
 
 ## Install
 

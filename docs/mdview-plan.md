@@ -1,6 +1,6 @@
 # mdview plan
 
-Status, 2026-11-27: Phases 1 to 4 are built and checked; the copy installed for Kartik's user on `asus-vivobook` is a Phase 3 build. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
+Status, 2026-11-27: Phases 1 to 4 are built and checked, and installed for Kartik's user on `asus-vivobook`. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
 
 mdview is a small native Markdown viewer and editor for Kartik's CachyOS laptop (`asus-vivobook`, KDE Plasma on Wayland). It opens on the rendered document, Ctrl+E flips the same window to the source, and it does the basic jobs of an ordinary text editor for Markdown files and nothing else. It draws with plain GTK4, so it takes on the system GTK theme (Nordic, Papirus-Dark, Noto Sans) and carries no colours of its own.
 
