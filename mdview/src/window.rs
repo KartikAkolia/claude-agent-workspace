@@ -1,4 +1,5 @@
-//! One window per document: the header bar, the rendered view, opening files and refusals.
+//! One window per document: the rendered view and the source editor, opening and saving, the
+//! unsaved-work prompts, and watching the file for outside changes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -7,7 +8,8 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 
-use crate::file;
+use crate::file::{self, Guard, Loaded, SaveError};
+use crate::find::{self, Bar, Mode};
 use crate::render::{self, ANCHOR, BULLETS, Marker, Rendered, Style, TASK_BOXES};
 
 thread_local! {
@@ -28,14 +30,31 @@ pub fn open(app: &gtk::Application, file: gio::File) {
         win.window.present();
         return;
     }
-    let empty = WINDOWS.with_borrow(|ws| {
-        ws.iter()
-            .find(|w| w.file.borrow().is_none() && w.pending.borrow().is_none())
-            .cloned()
-    });
+    let empty = WINDOWS.with_borrow(|ws| ws.iter().find(|w| w.is_empty()).cloned());
     let win = empty.unwrap_or_else(|| Win::new(app));
     win.window.present();
-    win.load(file);
+    win.load(file, true);
+}
+
+/// Quits after asking about each window's unsaved work in turn; a Cancel anywhere stops it.
+/// GTK's own quit skips the windows' close requests, so it is only called once all agree.
+pub fn quit(app: &gtk::Application) {
+    let app = app.clone();
+    glib::spawn_future_local(async move {
+        // Asked again until none is left: a prompt only blocks its own window, so another can
+        // be edited, or opened, while one is waiting.
+        loop {
+            let next = WINDOWS.with_borrow(|ws| ws.iter().find(|w| w.unsaved()).cloned());
+            let Some(win) = next else {
+                break;
+            };
+            if !win.confirm_discard().await {
+                return;
+            }
+        }
+        WINDOWS.with_borrow(|ws| ws.iter().for_each(|w| w.closing.set(true)));
+        app.quit();
+    });
 }
 
 /// The window showing `file`, or loading it, so a file opened twice quickly gets one window.
@@ -52,14 +71,47 @@ struct Win {
     window: gtk::ApplicationWindow,
     stack: gtk::Stack,
     scroller: gtk::ScrolledWindow,
+    /// The rendered document, rebuilt from `source` when it is shown after an edit.
     view: gtk::TextView,
+    editor: gtk::TextView,
+    /// The document's text, exactly as it is (or will be) on disk.
+    source: gtk::TextBuffer,
+    bar: Bar,
+    changed: Changed,
+    edit_action: gio::SimpleAction,
     probes: Probes,
+    /// The file, or `None` for a new document not yet saved.
     file: RefCell<Option<gio::File>>,
+    /// Whether there is a document at all; an empty window has none.
+    has_doc: Cell<bool>,
+    /// What the file was when last read or written, for the conflict check.
+    guard: RefCell<Option<Guard>>,
+    monitor: RefCell<Option<gio::FileMonitor>>,
     /// The file being loaded, and a count of loads started: only the latest load's result is
     /// shown, so a slow load can't replace a newer one.
     pending: RefCell<Option<gio::File>>,
     loads: Cell<u64>,
+    /// Edits to `source`: a save clears the modified flag only if none came in meanwhile.
+    edits: Cell<u64>,
+    /// Whether `view` is behind `source`.
+    stale: Cell<bool>,
+    /// Where each rendered block starts, and its source line (render::Rendered::blocks).
+    blocks: RefCell<Vec<(usize, usize)>>,
+    /// While a save runs, the file monitor's events are mdview's own.
+    saving: Cell<bool>,
+    /// Set once closing has been agreed to, so the close request lets it through.
+    closing: Cell<bool>,
+    /// `edits` when the user last chose Discard, so quit doesn't ask twice about the same text.
+    discarded: Cell<Option<u64>>,
     layout: RefCell<Layout>,
+}
+
+/// The bar shown when the file changes on disk while there is unsaved work.
+struct Changed {
+    revealer: gtk::Revealer,
+    label: gtk::Label,
+    reload: gtk::Button,
+    keep: gtk::Button,
 }
 
 /// Hidden widgets whose computed colours become the tag colours: tags take colour values, not
@@ -69,6 +121,8 @@ struct Probes {
     link: gtk::LinkButton,
     dim: gtk::Label,
     tint: gtk::Label,
+    match_bg: gtk::Label,
+    match_fg: gtk::Label,
 }
 
 /// What a resize has to adjust: the reading column is centred, so every margin moves with it.
@@ -98,43 +152,49 @@ impl Win {
             .wrap_mode(gtk::WrapMode::WordChar)
             .build();
         view.add_css_class("md-view");
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&view)
+        let scroller = scrolled(&view);
+
+        let editor = gtk::TextView::builder()
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
             .build();
+        editor.add_css_class("md-editor");
+        let source = editor.buffer();
 
         let stack = gtk::Stack::new();
         stack.add_named(&empty_page(), Some("empty"));
         stack.add_named(&scroller, Some("view"));
+        stack.add_named(&scrolled(&editor), Some("edit"));
 
         let probes = Probes {
             link: gtk::LinkButton::new("about:blank"),
             dim: probe_label("md-probe-dim"),
             tint: probe_label("md-probe-tint"),
+            match_bg: probe_label("md-probe-match-bg"),
+            match_fg: probe_label("md-probe-match-fg"),
         };
         let probe_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         probe_box.append(&probes.link);
         probe_box.append(&probes.dim);
         probe_box.append(&probes.tint);
+        probe_box.append(&probes.match_bg);
+        probe_box.append(&probes.match_fg);
         probe_box.set_visible(false);
 
+        let bar = Bar::new();
+        let changed = Changed::new();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&bar.revealer);
+        content.append(&changed.revealer);
         content.append(&stack);
         content.append(&probe_box);
-
-        let open_button = gtk::Button::from_icon_name("document-open-symbolic");
-        open_button.set_tooltip_text(Some("Open a Markdown file (Ctrl+O)"));
-        open_button.set_action_name(Some("win.open"));
-        let header = gtk::HeaderBar::new();
-        header.pack_start(&open_button);
 
         let window = gtk::ApplicationWindow::builder()
             .application(app)
             .title("mdview")
             .default_width(900)
             .default_height(1000)
-            .titlebar(&header)
+            .titlebar(&header_bar())
             .child(&content)
             .build();
 
@@ -143,37 +203,321 @@ impl Win {
             stack,
             scroller,
             view,
+            editor,
+            source,
+            bar,
+            changed,
+            edit_action: gio::SimpleAction::new_stateful("edit", None, &false.to_variant()),
             probes,
             file: RefCell::new(None),
+            has_doc: Cell::new(false),
+            guard: RefCell::new(None),
+            monitor: RefCell::new(None),
             pending: RefCell::new(None),
             loads: Cell::new(0),
+            edits: Cell::new(0),
+            stale: Cell::new(true),
+            blocks: RefCell::new(Vec::new()),
+            saving: Cell::new(false),
+            closing: Cell::new(false),
+            discarded: Cell::new(None),
             layout: RefCell::new(Layout::default()),
         });
-        win.connect();
+        win.connect_actions();
+        win.connect_editor();
+        win.connect_bars();
+        win.connect_window();
+        win.update_actions();
         WINDOWS.with_borrow_mut(|ws| ws.push(win.clone()));
         win
     }
 
-    /// Actions, the file drop and the resize hook. Closures hold the window weakly: it owns them.
-    fn connect(self: &Rc<Self>) {
-        let open_action = gio::SimpleAction::new("open", None);
+    /// Unsaved work the user hasn't already agreed to discard.
+    fn unsaved(&self) -> bool {
+        self.has_doc.get()
+            && self.source.is_modified()
+            && self.discarded.get() != Some(self.edits.get())
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.has_doc.get() && self.pending.borrow().is_none()
+    }
+
+    fn editing(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some("edit")
+    }
+
+    /// The view on screen: find works on this one.
+    fn active(&self) -> &gtk::TextView {
+        if self.editing() {
+            &self.editor
+        } else {
+            &self.view
+        }
+    }
+
+    fn source_text(&self) -> String {
+        let (start, end) = self.source.bounds();
+        self.source.text(&start, &end, true).into()
+    }
+
+    /// The window's actions. Each closure holds the window weakly: the window owns them.
+    fn connect_actions(self: &Rc<Self>) {
+        self.action("open", |win| win.choose_file());
+        self.action("close", |win| win.window.close());
+        self.action("new", |win| win.new_document());
+        self.action("save", |win| {
+            glib::spawn_future_local(async move {
+                win.save().await;
+            });
+        });
+        self.action("save-as", |win| {
+            glib::spawn_future_local(async move {
+                win.save_as().await;
+            });
+        });
+        self.action("find", |win| win.open_bar(Mode::Find));
+        self.action("replace", |win| {
+            win.set_editing(true);
+            win.open_bar(Mode::Replace);
+        });
+        self.action("goto", |win| {
+            win.set_editing(true);
+            win.open_bar(Mode::GoTo);
+        });
+        self.action("find-next", |win| win.find_again(true));
+        self.action("find-previous", |win| win.find_again(false));
+
         let weak = Rc::downgrade(self);
-        open_action.connect_activate(move |_, _| {
+        self.edit_action.connect_activate(move |action, _| {
+            let on = action
+                .state()
+                .and_then(|s| s.get::<bool>())
+                .unwrap_or(false);
             if let Some(win) = weak.upgrade() {
-                win.choose_file();
+                win.set_editing(!on);
             }
         });
-        self.window.add_action(&open_action);
+        self.window.add_action(&self.edit_action);
 
-        let close = gio::SimpleAction::new("close", None);
-        let window = self.window.downgrade();
-        close.connect_activate(move |_, _| {
-            if let Some(window) = window.upgrade() {
-                window.close();
+        let wrap = gio::SimpleAction::new_stateful("wrap", None, &true.to_variant());
+        let editor = self.editor.downgrade();
+        wrap.connect_activate(move |action, _| {
+            let on = !action.state().and_then(|s| s.get::<bool>()).unwrap_or(true);
+            action.set_state(&on.to_variant());
+            if let Some(editor) = editor.upgrade() {
+                let mode = if on {
+                    gtk::WrapMode::WordChar
+                } else {
+                    gtk::WrapMode::None
+                };
+                editor.set_wrap_mode(mode);
             }
         });
-        self.window.add_action(&close);
+        self.window.add_action(&wrap);
+    }
 
+    fn action(self: &Rc<Self>, name: &str, run: impl Fn(Rc<Self>) + 'static) {
+        let action = gio::SimpleAction::new(name, None);
+        let weak = Rc::downgrade(self);
+        action.connect_activate(move |_, _| {
+            if let Some(win) = weak.upgrade() {
+                run(win);
+            }
+        });
+        self.window.add_action(&action);
+    }
+
+    /// Actions that need a document are off in an empty window.
+    fn update_actions(&self) {
+        let has_doc = self.has_doc.get();
+        let names = [
+            "save",
+            "save-as",
+            "find",
+            "replace",
+            "goto",
+            "find-next",
+            "find-previous",
+        ];
+        for name in names {
+            let action = self
+                .window
+                .lookup_action(name)
+                .and_then(|a| a.downcast::<gio::SimpleAction>().ok());
+            if let Some(action) = action {
+                action.set_enabled(has_doc);
+            }
+        }
+        self.edit_action.set_enabled(has_doc);
+    }
+
+    fn connect_editor(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.source.connect_changed(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.edits.set(win.edits.get() + 1);
+                win.stale.set(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.source.connect_modified_changed(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.update_title();
+            }
+        });
+
+        // Tab inserts four spaces: CommonMark reads a tab as up to four columns anyway, and
+        // spaces show the same everywhere.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let source = self.source.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let modifiers = gdk::ModifierType::SHIFT_MASK
+                | gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::ALT_MASK
+                | gdk::ModifierType::SUPER_MASK;
+            if key != gdk::Key::Tab || state.intersects(modifiers) {
+                return glib::Propagation::Proceed;
+            }
+            source.begin_user_action();
+            source.delete_selection(true, true);
+            source.insert_interactive_at_cursor("    ", true);
+            source.end_user_action();
+            glib::Propagation::Stop
+        });
+        self.editor.add_controller(keys);
+    }
+
+    fn connect_bars(self: &Rc<Self>) {
+        let bar = &self.bar;
+        let weak = Rc::downgrade(self);
+        bar.find.connect_search_changed(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.run_find(true, true);
+            }
+        });
+        for (forward, button) in [(true, &bar.next), (false, &bar.previous)] {
+            let weak = Rc::downgrade(self);
+            button.connect_clicked(move |_| {
+                if let Some(win) = weak.upgrade() {
+                    win.run_find(forward, false);
+                }
+            });
+        }
+        let weak = Rc::downgrade(self);
+        bar.find.connect_activate(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.run_find(true, false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.find.connect_next_match(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.run_find(true, false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.find.connect_previous_match(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.run_find(false, false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.case.connect_toggled(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.run_find(true, true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.find.connect_stop_search(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.close_bar();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.close.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.close_bar();
+            }
+        });
+
+        // Shift+Enter finds backwards, and Escape closes the bar from any of its fields.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(win) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if key == gdk::Key::Escape {
+                win.close_bar();
+                return glib::Propagation::Stop;
+            }
+            let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            if enter && shift && win.bar.find.has_focus() {
+                win.run_find(false, false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        bar.revealer.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        bar.replace.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.replace(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.replace_all.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.replace(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.replacement.connect_activate(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.replace(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        bar.line.connect_activate(move |entry| {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            match entry.text().trim().parse::<i32>() {
+                Ok(line) => {
+                    win.set_editing(true);
+                    find::go_to_line(&win.editor, line);
+                    win.close_bar();
+                }
+                Err(_) => win.bar.line_error(true),
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.changed.reload.connect_clicked(move |_| {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            win.changed.revealer.set_reveal_child(false);
+            let file = win.file.borrow().clone();
+            if let Some(file) = file {
+                win.load(file, false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.changed.keep.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.changed.revealer.set_reveal_child(false);
+            }
+        });
+    }
+
+    /// The file drop, the resize hook and the close request.
+    fn connect_window(self: &Rc<Self>) {
         // Capture phase, so a file dropped on the text opens rather than being read as text.
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         drop.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -206,26 +550,32 @@ impl Win {
                 }
             });
 
-        self.window.connect_close_request(|window| {
-            WINDOWS.with_borrow_mut(|ws| ws.retain(|w| &w.window != window));
-            glib::Propagation::Proceed
+        // Unsaved work holds the close until the prompt is answered.
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |window| {
+            let Some(win) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if win.closing.get() || !win.has_doc.get() || !win.source.is_modified() {
+                WINDOWS.with_borrow_mut(|ws| ws.retain(|w| &w.window != window));
+                return glib::Propagation::Proceed;
+            }
+            glib::spawn_future_local(async move {
+                if win.confirm_discard().await {
+                    win.closing.set(true);
+                    win.window.close();
+                }
+            });
+            glib::Propagation::Stop
         });
     }
 
     fn choose_file(self: &Rc<Self>) {
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Markdown"));
-        // Suffixes match without regard to case.
-        filter.add_suffix("md");
-        filter.add_suffix("markdown");
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
         let dialog = gtk::FileDialog::builder()
             .title("Open Markdown file")
             .modal(true)
-            .filters(&filters)
-            .default_filter(&filter)
             .build();
+        markdown_filter(&dialog);
         if let Some(folder) = self.file.borrow().as_ref().and_then(|f| f.parent()) {
             dialog.set_initial_folder(Some(&folder));
         }
@@ -246,12 +596,15 @@ impl Win {
     fn open_here(self: &Rc<Self>, file: gio::File) {
         match showing(&file) {
             Some(other) if !Rc::ptr_eq(&other, self) => other.window.present(),
-            _ => self.load(file),
+            _ => self.load(file, true),
         }
     }
 
-    /// Loads, validates, then swaps: a file that fails to load never replaces the current one.
-    fn load(self: &Rc<Self>, file: gio::File) {
+    /// Loads, validates, asks about unsaved work, then swaps: a file that fails to load never
+    /// costs the current one. Without `ask` it is a reload of the same file, which the user has
+    /// asked for (or which has nothing unsaved), and keeps the place in the document.
+    fn load(self: &Rc<Self>, file: gio::File, ask: bool) {
+        let edits = self.edits.get();
         let this_load = self.loads.get() + 1;
         self.loads.set(this_load);
         self.pending.replace(Some(file.clone()));
@@ -264,32 +617,550 @@ impl Win {
             if win.loads.get() != this_load {
                 return; // A newer load superseded this one.
             }
-            win.pending.replace(None);
             match result {
-                Ok(text) => win.show(&file, &text),
-                Err(reason) => win.refuse(&file, &reason),
+                Err(reason) => {
+                    win.pending.replace(None);
+                    win.alert(
+                        &format!("Couldn't open “{}”", display_name(&file)),
+                        &sentence(&reason),
+                    );
+                }
+                Ok(loaded) => {
+                    let go = !ask || win.confirm_discard().await;
+                    if win.loads.get() != this_load {
+                        return; // Superseded while the prompt was open.
+                    }
+                    win.pending.replace(None);
+                    // A reload never replaces text typed while it was reading the file.
+                    if !ask && win.edits.get() != edits {
+                        win.show_changed(&file);
+                    } else if go {
+                        win.show(&file, loaded, !ask);
+                    }
+                }
             }
         });
     }
 
-    fn show(&self, file: &gio::File, text: &str) {
-        let rendered = render::render(text);
-        let layout = fill(&self.view, &rendered, &Theme::from(&self.probes));
-        self.layout.replace(layout);
-        self.relayout();
-        self.window.set_title(Some(&display_name(file)));
+    fn show(self: &Rc<Self>, file: &gio::File, loaded: Loaded, keep_place: bool) {
+        let place = keep_place.then(|| (self.editing(), self.top_line()));
+        // Not undoable: undo never reaches back into the previous document.
+        self.source.begin_irreversible_action();
+        self.source.set_text(&loaded.text);
+        self.source.end_irreversible_action();
+        // file::check_text keeps out what TextBuffer refuses, but a text the buffer didn't take
+        // whole must never be saved back over the file.
+        let held = usize::try_from(self.source.char_count()).unwrap_or(0);
+        if held != loaded.text.chars().count() {
+            self.source.set_text("");
+            self.source.set_modified(false);
+            self.close_document();
+            self.alert(
+                &format!("Couldn't open “{}”", display_name(file)),
+                "The text view couldn't hold its text exactly, so it isn't safe to edit.",
+            );
+            return;
+        }
+        self.source.place_cursor(&self.source.start_iter());
+        self.source.set_modified(false);
+        self.guard.replace(Some(loaded.guard));
         self.file.replace(Some(file.clone()));
-        self.stack.set_visible_child_name("view");
-        self.scroller.vadjustment().set_value(0.0);
+        self.has_doc.set(true);
+        self.watch(file);
+        self.changed.revealer.set_reveal_child(false);
+        self.update_title();
+        self.update_actions();
+        match place {
+            Some((true, line)) => self.scroll_editor_to(line),
+            Some((false, line)) => {
+                self.show_view();
+                self.scroll_view_to(line);
+            }
+            None => {
+                self.show_view();
+                self.scroller.vadjustment().set_value(0.0);
+            }
+        }
     }
 
-    fn refuse(&self, file: &gio::File, reason: &str) {
+    /// Back to an empty window, after a document that couldn't be held.
+    fn close_document(&self) {
+        self.file.replace(None);
+        self.guard.replace(None);
+        self.monitor.replace(None);
+        self.has_doc.set(false);
+        self.stack.set_visible_child_name("empty");
+        self.edit_action.set_state(&false.to_variant());
+        self.update_title();
+        self.update_actions();
+    }
+
+    /// A new, unsaved document: in this window if it is empty, else in a new one.
+    fn new_document(self: &Rc<Self>) {
+        let win = if self.is_empty() {
+            self.clone()
+        } else {
+            let Some(app) = self.window.application() else {
+                return;
+            };
+            let win = Win::new(&app);
+            win.window.present();
+            win
+        };
+        win.source.begin_irreversible_action();
+        win.source.set_text("");
+        win.source.end_irreversible_action();
+        win.source.set_modified(false);
+        win.file.replace(None);
+        win.guard.replace(None);
+        win.monitor.replace(None);
+        win.has_doc.set(true);
+        win.update_title();
+        win.update_actions();
+        win.fit_editor_margins();
+        win.stack.set_visible_child_name("edit");
+        win.edit_action.set_state(&true.to_variant());
+        win.editor.grab_focus();
+    }
+
+    fn update_title(&self) {
+        let title = match (self.has_doc.get(), self.source.is_modified()) {
+            (false, _) => "mdview".to_owned(),
+            (true, true) => format!("• {}", self.name()),
+            (true, false) => self.name(),
+        };
+        self.window.set_title(Some(&title));
+    }
+
+    fn name(&self) -> String {
+        self.file
+            .borrow()
+            .as_ref()
+            .map_or_else(|| "Untitled".to_owned(), display_name)
+    }
+
+    /// Asks before unsaved work is lost: Save, Discard or Cancel. True to go ahead (saved or
+    /// discarded), false to stay.
+    async fn confirm_discard(self: &Rc<Self>) -> bool {
+        if !self.has_doc.get() || !self.source.is_modified() {
+            return true;
+        }
+        self.window.present();
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
-            .message(format!("Couldn't open “{}”", display_name(file)))
-            .detail(sentence(reason))
+            .message(format!("Save changes to “{}”?", self.name()))
+            .detail("Unsaved changes will be lost if you don't save them.")
+            .buttons(["_Cancel", "_Discard", "_Save"])
+            .cancel_button(0)
+            .default_button(2)
+            .build();
+        match dialog.choose_future(Some(&self.window)).await {
+            Ok(1) => {
+                self.discarded.set(Some(self.edits.get()));
+                true
+            }
+            Ok(2) => self.save().await,
+            _ => false,
+        }
+    }
+
+    /// Saves to the document's file, or asks for one. True once it is on disk.
+    async fn save(self: &Rc<Self>) -> bool {
+        // One save at a time: a second would check the file against the guard the first is
+        // about to replace, and report mdview's own save as an outside change.
+        let Some(_busy) = Busy::start(&self.saving) else {
+            return false;
+        };
+        if !self.has_doc.get() {
+            return false;
+        }
+        let file = self.file.borrow().clone();
+        let Some(file) = file else {
+            return self.choose_and_save().await;
+        };
+        let text = self.source_text();
+        let edits = self.edits.get();
+        let mut guard = self.guard.borrow().clone();
+        loop {
+            match file::save(&file, &text, guard.as_ref()).await {
+                Err(SaveError::Conflict) => {
+                    if !self.ask_overwrite(&file).await {
+                        return false;
+                    }
+                    // Overwrite what is there now, and still notice a change made while the
+                    // prompt was open: that asks again.
+                    guard = match file::read_checked(&file).await {
+                        Ok(Some(disk)) => Some(Guard::of(&disk.bytes)),
+                        Ok(None) => None,
+                        Err(message) => {
+                            let failed = SaveError::Failed {
+                                message,
+                                in_place: false,
+                            };
+                            return self.finish_save(&file, Err(failed), edits);
+                        }
+                    };
+                }
+                result => return self.finish_save(&file, result, edits),
+            }
+        }
+    }
+
+    /// Saves to a file the user picks, which then becomes the document's file.
+    async fn save_as(self: &Rc<Self>) -> bool {
+        let Some(_busy) = Busy::start(&self.saving) else {
+            return false;
+        };
+        self.choose_and_save().await
+    }
+
+    /// Save As itself, for a caller that already holds the save in progress.
+    async fn choose_and_save(self: &Rc<Self>) -> bool {
+        if !self.has_doc.get() {
+            return false;
+        }
+        let current = self.file.borrow().clone();
+        let initial = current
+            .as_ref()
+            .map_or_else(|| "Untitled.md".to_owned(), display_name);
+        let dialog = gtk::FileDialog::builder()
+            .title("Save As")
+            .modal(true)
+            .initial_name(initial)
+            .build();
+        markdown_filter(&dialog);
+        if let Some(folder) = current.as_ref().and_then(|f| f.parent()) {
+            dialog.set_initial_folder(Some(&folder));
+        }
+        let Ok(chosen) = dialog.save_future(Some(&self.window)).await else {
+            return false;
+        };
+        let Some(name) = chosen.basename() else {
+            return false;
+        };
+        let target = match file::save_name(&name) {
+            Err(reason) => {
+                let heading = format!("Couldn't save as “{}”", name.display());
+                self.alert(&heading, &sentence(&reason));
+                return false;
+            }
+            Ok(fixed) if fixed == name => chosen,
+            Ok(fixed) => {
+                let Some(folder) = chosen.parent() else {
+                    return false;
+                };
+                let target = folder.child(&fixed);
+                // The dialog asked about overwriting the name as typed, not this one.
+                if exists(&target).await && !self.ask_replace(&target).await {
+                    return false;
+                }
+                target
+            }
+        };
+        if showing(&target).is_some_and(|other| !Rc::ptr_eq(&other, self)) {
+            let heading = format!("Couldn't save as “{}”", display_name(&target));
+            self.alert(&heading, "It is open in another window.");
+            return false;
+        }
+        let text = self.source_text();
+        let edits = self.edits.get();
+        let result = file::save(&target, &text, None).await;
+        let saved = self.finish_save(&target, result, edits);
+        if saved {
+            self.file.replace(Some(target.clone()));
+            self.watch(&target);
+            self.update_title();
+        }
+        saved
+    }
+
+    fn finish_save(&self, file: &gio::File, result: Result<Guard, SaveError>, edits: u64) -> bool {
+        match result {
+            Ok(guard) => {
+                self.guard.replace(Some(guard));
+                // Typing during the save leaves the document modified: that text isn't saved.
+                if self.edits.get() == edits {
+                    self.source.set_modified(false);
+                }
+                self.changed.revealer.set_reveal_child(false);
+                self.update_title();
+                true
+            }
+            // save() answers conflicts itself, and Save As writes without a guard.
+            Err(SaveError::Conflict) => false,
+            Err(SaveError::Failed { message, in_place }) => {
+                let mut detail = sentence(&message);
+                if in_place {
+                    detail.push_str(
+                        " It was being rewritten in place, so it may now be incomplete: use \
+                         Save As to keep a safe copy.",
+                    );
+                }
+                self.alert(&format!("Couldn't save “{}”", display_name(file)), &detail);
+                false
+            }
+        }
+    }
+
+    async fn ask_overwrite(&self, file: &gio::File) -> bool {
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(format!("“{}” changed on disk", display_name(file)))
+            .detail(
+                "Another program changed it since mdview last read or saved it. Overwrite it \
+                 with your version, or cancel and use Save As to keep both.",
+            )
+            .buttons(["_Cancel", "_Overwrite"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        matches!(dialog.choose_future(Some(&self.window)).await, Ok(1))
+    }
+
+    async fn ask_replace(&self, file: &gio::File) -> bool {
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(format!("“{}” already exists", display_name(file)))
+            .detail("Replace it with this document?")
+            .buttons(["_Cancel", "_Replace"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        matches!(dialog.choose_future(Some(&self.window)).await, Ok(1))
+    }
+
+    fn alert(&self, message: &str, detail: &str) {
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(message)
+            .detail(detail)
             .build();
         dialog.show(Some(&self.window));
+    }
+
+    /// Watches the file for outside changes, replacing any earlier watch.
+    fn watch(self: &Rc<Self>, file: &gio::File) {
+        let monitor = file
+            .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            .ok();
+        if let Some(monitor) = &monitor {
+            let weak = Rc::downgrade(self);
+            monitor.connect_changed(move |_, _, _, event| {
+                // A write ends with ChangesDoneHint; a save that renames a new copy into place
+                // (as gio's and most editors' do) shows as Created.
+                let done = matches!(
+                    event,
+                    gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::Created
+                );
+                if let (true, Some(win)) = (done, weak.upgrade()) {
+                    win.check_disk();
+                }
+            });
+        }
+        self.monitor.replace(monitor);
+    }
+
+    /// After an outside change: an unmodified document reloads, keeping its place; one with
+    /// unsaved work gets the changed-on-disk bar. mdview's own saves, and changes that leave the
+    /// bytes as they were, are recognised by the guard's hash and ignored.
+    fn check_disk(self: &Rc<Self>) {
+        if self.saving.get() {
+            return;
+        }
+        let Some(file) = self.file.borrow().clone() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // Gone, unreadable or no longer a regular file: a save will recreate it or say why
+            // it can't.
+            let Ok(Some(disk)) = file::read_checked(&file).await else {
+                return;
+            };
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            let still_ours = win.file.borrow().as_ref().is_some_and(|f| f.equal(&file));
+            let unchanged = win
+                .guard
+                .borrow()
+                .as_ref()
+                .is_some_and(|g| g.matches(&disk.bytes));
+            if win.saving.get() || !still_ours || unchanged {
+                return;
+            }
+            if win.source.is_modified() {
+                win.show_changed(&file);
+            } else {
+                win.load(file, false);
+            }
+        });
+    }
+
+    fn show_changed(&self, file: &gio::File) {
+        self.changed.label.set_text(&format!(
+            "“{}” changed on disk. Reload it and lose your changes, or keep yours (saving will \
+             ask before overwriting).",
+            display_name(file)
+        ));
+        self.changed.revealer.set_reveal_child(true);
+    }
+
+    /// Switches between the rendered view and the source, keeping the place in the document.
+    fn set_editing(self: &Rc<Self>, edit: bool) {
+        if !self.has_doc.get() || edit == self.editing() {
+            self.edit_action.set_state(&self.editing().to_variant());
+            return;
+        }
+        let line = self.top_line();
+        if edit {
+            self.fit_editor_margins();
+            self.stack.set_visible_child_name("edit");
+            self.scroll_editor_to(line);
+            self.editor.grab_focus();
+        } else {
+            self.show_view();
+            self.scroll_view_to(line);
+        }
+        self.edit_action.set_state(&edit.to_variant());
+        if self.bar.is_open() {
+            self.run_find(true, true);
+        }
+    }
+
+    /// Shows the rendered view, rebuilding it first if the source has changed.
+    fn show_view(&self) {
+        if self.stale.get() {
+            let rendered = render::render(&self.source_text());
+            let layout = fill(&self.view, &rendered, &Theme::from(&self.probes));
+            self.blocks.replace(rendered.blocks);
+            self.layout.replace(layout);
+            self.relayout();
+            self.stale.set(false);
+        }
+        self.stack.set_visible_child_name("view");
+        self.edit_action.set_state(&false.to_variant());
+    }
+
+    /// The source line at the top of whichever view is showing.
+    fn top_line(&self) -> usize {
+        // By height alone: the top-left corner is in the margin, where there is no text.
+        let view = self.active();
+        let (at, _) = view.line_at_y(view.visible_rect().y());
+        if self.editing() {
+            return usize::try_from(at.line()).unwrap_or(0);
+        }
+        let offset = usize::try_from(at.offset()).unwrap_or(0);
+        let blocks = self.blocks.borrow();
+        let index = blocks.partition_point(|&(start, _)| start <= offset);
+        index.checked_sub(1).map_or(0, |i| blocks[i].1)
+    }
+
+    fn scroll_editor_to(&self, line: usize) {
+        let at = self
+            .source
+            .iter_at_line(offset(line))
+            .unwrap_or_else(|| self.source.end_iter());
+        self.source.place_cursor(&at);
+        scroll_to_top(&self.editor, &at);
+    }
+
+    /// Scrolls the rendered view to the last block starting at or before `line`.
+    fn scroll_view_to(&self, line: usize) {
+        let start = self
+            .blocks
+            .borrow()
+            .iter()
+            .rev()
+            .find(|&&(_, l)| l <= line)
+            .map_or(0, |&(start, _)| start);
+        let at = self.view.buffer().iter_at_offset(offset(start));
+        scroll_to_top(&self.view, &at);
+    }
+
+    /// Sizes the editor's margins from its own font, once it is in the window.
+    fn fit_editor_margins(&self) {
+        let em = text_width(&self.editor, "M");
+        self.editor.set_left_margin(2 * em);
+        self.editor.set_right_margin(2 * em);
+        self.editor.set_top_margin(em);
+        self.editor.set_bottom_margin(4 * em);
+    }
+
+    fn open_bar(&self, mode: Mode) {
+        // A short, single-line selection becomes the search.
+        if mode != Mode::GoTo
+            && let Some((start, end)) = self.active().buffer().selection_bounds()
+        {
+            let text = start.text(&end);
+            if !text.contains('\n') && text.chars().count() <= 100 {
+                self.bar.find.set_text(&text);
+            }
+        }
+        self.bar.show(mode);
+    }
+
+    fn highlight(&self) -> find::Highlight {
+        find::Highlight {
+            background: self.probes.match_bg.color(),
+            foreground: self.probes.match_fg.color(),
+        }
+    }
+
+    fn close_bar(&self) {
+        self.bar.hide();
+        find::clear(&self.view);
+        find::clear(&self.editor);
+        self.active().grab_focus();
+    }
+
+    fn find_again(&self, forward: bool) {
+        if self.bar.is_open() && !self.bar.find.text().is_empty() {
+            self.run_find(forward, false);
+        } else {
+            self.open_bar(Mode::Find);
+        }
+    }
+
+    fn run_find(&self, forward: bool, from_start: bool) {
+        let needle = self.bar.find.text();
+        if needle.is_empty() {
+            self.bar.set_status("", false);
+            return;
+        }
+        let case = self.bar.case.is_active();
+        let found = find::find(
+            self.active(),
+            &needle,
+            case,
+            forward,
+            from_start,
+            &self.highlight(),
+        );
+        self.bar
+            .set_status(if found { "" } else { "No match" }, !found);
+    }
+
+    /// Replace works on the source only, so it switches to editing first.
+    fn replace(self: &Rc<Self>, all: bool) {
+        self.set_editing(true);
+        let needle = self.bar.find.text();
+        let replacement = self.bar.replacement.text();
+        let case = self.bar.case.is_active();
+        if all {
+            let count = find::replace_all(&self.editor, &needle, &replacement, case);
+            let note = match count {
+                0 => "No match".to_owned(),
+                1 => "1 replaced".to_owned(),
+                n => format!("{n} replaced"),
+            };
+            self.bar.set_status(&note, count == 0);
+        } else {
+            let colours = self.highlight();
+            let more = find::replace(&self.editor, &needle, &replacement, case, &colours);
+            self.bar
+                .set_status(if more { "" } else { "No match" }, !more);
+        }
     }
 
     /// Centres the reading column in the current width and moves every margin with it.
@@ -340,6 +1211,147 @@ impl Win {
             table.set_min_content_height(height);
         }
     }
+}
+
+/// Marks a save as running for as long as it lives, so a second can't start meanwhile.
+struct Busy<'a>(&'a Cell<bool>);
+
+impl<'a> Busy<'a> {
+    fn start(flag: &'a Cell<bool>) -> Option<Self> {
+        (!flag.replace(true)).then_some(Self(flag))
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl Changed {
+    fn new() -> Self {
+        let label = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let reload = gtk::Button::with_label("Reload");
+        let keep = gtk::Button::with_label("Keep Mine");
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.add_css_class("md-bar");
+        row.append(&label);
+        row.append(&reload);
+        row.append(&keep);
+        let revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .child(&row)
+            .build();
+        Self {
+            revealer,
+            label,
+            reload,
+            keep,
+        }
+    }
+}
+
+fn header_bar() -> gtk::HeaderBar {
+    let open = gtk::Button::from_icon_name("document-open-symbolic");
+    open.set_tooltip_text(Some("Open a Markdown file (Ctrl+O)"));
+    open.set_action_name(Some("win.open"));
+    let save = gtk::Button::from_icon_name("document-save-symbolic");
+    save.set_tooltip_text(Some("Save (Ctrl+S)"));
+    save.set_action_name(Some("win.save"));
+    let edit = gtk::ToggleButton::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Edit the source (Ctrl+E)")
+        .action_name("win.edit")
+        .build();
+    let menu = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Menu")
+        .menu_model(&main_menu())
+        .build();
+    let header = gtk::HeaderBar::new();
+    header.pack_start(&open);
+    header.pack_end(&menu);
+    header.pack_end(&edit);
+    header.pack_end(&save);
+    header
+}
+
+fn main_menu() -> gio::Menu {
+    let section = |items: &[(&str, &str)]| {
+        let section = gio::Menu::new();
+        for (label, action) in items {
+            section.append(Some(label), Some(action));
+        }
+        section
+    };
+    let menu = gio::Menu::new();
+    menu.append_section(
+        None,
+        &section(&[
+            ("New", "win.new"),
+            ("Open…", "win.open"),
+            ("Save As…", "win.save-as"),
+        ]),
+    );
+    menu.append_section(
+        None,
+        &section(&[
+            ("Find…", "win.find"),
+            ("Replace…", "win.replace"),
+            ("Go to Line…", "win.goto"),
+            ("Word Wrap", "win.wrap"),
+        ]),
+    );
+    menu.append_section(None, &section(&[("Quit", "app.quit")]));
+    menu
+}
+
+fn markdown_filter(dialog: &gtk::FileDialog) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Markdown"));
+    // Suffixes match without regard to case.
+    filter.add_suffix("md");
+    filter.add_suffix("markdown");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    dialog.set_filters(Some(&filters));
+    dialog.set_default_filter(Some(&filter));
+}
+
+async fn exists(file: &gio::File) -> bool {
+    file.query_info_future(
+        "standard::type",
+        gio::FileQueryInfoFlags::NONE,
+        glib::Priority::DEFAULT,
+    )
+    .await
+    .is_ok()
+}
+
+fn scrolled(view: &gtk::TextView) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(view)
+        .build()
+}
+
+/// Scrolls `view` so `at` is at the top, through a mark: unlike an iterator, a mark is still
+/// right after the view's next layout, which a switch between views needs.
+fn scroll_to_top(view: &gtk::TextView, at: &gtk::TextIter) {
+    let buffer = view.buffer();
+    let mark = match buffer.mark("mdview-top") {
+        Some(mark) => {
+            buffer.move_mark(&mark, at);
+            mark
+        }
+        None => buffer.create_mark(Some("mdview-top"), at, true),
+    };
+    view.scroll_to_mark(&mark, 0.0, true, 0.0, 0.0);
 }
 
 /// The tag colours, read from the probes when a document is shown.
@@ -535,7 +1547,9 @@ fn table_widget(table: &render::Table) -> gtk::ScrolledWindow {
 fn empty_page() -> gtk::Box {
     let title = gtk::Label::new(Some("No document open"));
     title.add_css_class("md-empty-title");
-    let hint = gtk::Label::new(Some("Open a Markdown file with Ctrl+O, or drop one here."));
+    let hint = gtk::Label::new(Some(
+        "Open a Markdown file with Ctrl+O, start one with Ctrl+N, or drop one here.",
+    ));
     hint.add_css_class("md-empty-hint");
     let page = gtk::Box::new(gtk::Orientation::Vertical, 6);
     page.set_valign(gtk::Align::Center);
@@ -556,7 +1570,7 @@ fn text_width(view: &gtk::TextView, s: &str) -> i32 {
     view.create_pango_layout(Some(s)).pixel_size().0
 }
 
-/// A refusal reason ("it isn't a regular file") as a sentence: capitalised, with a full stop.
+/// A reason ("it isn't a regular file") as a sentence: capitalised, with a full stop.
 fn sentence(reason: &str) -> String {
     let mut chars = reason.chars();
     let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
@@ -577,7 +1591,7 @@ fn display_name(file: &gio::File) -> String {
         .unwrap_or_else(|| file.uri().into())
 }
 
-/// A character offset or grid index as GTK's `i32`. Files are capped at 8 MiB, so it fits.
+/// A character offset, line or grid index as GTK's `i32`. Files are capped at 8 MiB, so it fits.
 fn offset(n: usize) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }

@@ -1,6 +1,7 @@
 /* mdview's only stylesheet. No colour literals: only these named colours, all defined by
    Nordic's gtk-4.0 sheet. A misspelt name fails silently, so keep to this list:
-     theme_fg_color, insensitive_fg_color, borders
+     theme_fg_color, theme_bg_color, theme_selected_bg_color, theme_selected_fg_color,
+     insensitive_fg_color, borders
    Loaded at USER + 1 priority, because KDE's ~/.config/gtk-4.0/gtk.css imports Nordic at
    USER priority and would otherwise win. Every class starts md-: Nordic styles .h1 to .h4. */
 
@@ -11,6 +12,15 @@ label.md-probe-dim {
 
 label.md-probe-tint {
   color: alpha(@theme_fg_color, 0.07);
+}
+
+/* The current search match: the theme's own selection colours. */
+label.md-probe-match-bg {
+  color: @theme_selected_bg_color;
+}
+
+label.md-probe-match-fg {
+  color: @theme_selected_fg_color;
 }
 
 /* The empty window. */
@@ -38,4 +48,15 @@ label.md-cell {
 label.md-th {
   font-weight: bold;
   background-color: alpha(@theme_fg_color, 0.07);
+}
+
+/* The find bar and the changed-on-disk bar, under the header bar. */
+box.md-bar {
+  padding: 0.4em 0.6em;
+  border-bottom: 1px solid @borders;
+  background-color: @theme_bg_color;
+}
+
+label.md-bar-status {
+  color: @insensitive_fg_color;
 }
