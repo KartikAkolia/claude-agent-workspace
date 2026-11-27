@@ -1,0 +1,21 @@
+[package]
+name = "minecraft-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal UI for the Minecraft + Twingate stack that scripts/minecraft-twingate.sh manages"
+publish = false
+
+[dependencies]
+libc = "0.2.191"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+# tui-term 0.3.4 renders vt100 0.16 screens, so the two versions move together.
+tui-term = "0.3.4"
+vt100 = "0.16.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
