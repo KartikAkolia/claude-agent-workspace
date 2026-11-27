@@ -28,7 +28,7 @@ Both are hardcoded to a config literally named **`root`** (`ConditionPathExists=
 ## Setup
 
 ```bash
-bash scripts/setup-snapper.sh
+bash scripts/snapper/setup-snapper.sh
 ```
 
 The script is Debian/apt-only. It exits before changing anything unless `/` is Btrfs and `apt` is on `PATH`, so on the current ext4 CachyOS install it refuses. It also works out the user for the final check up front. That's the caller, or whoever ran `sudo` (`SUDO_USER`) or `pkexec` (`PKEXEC_UID`), and it refuses plain root.

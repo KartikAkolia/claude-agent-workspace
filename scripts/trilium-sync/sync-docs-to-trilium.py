@@ -33,7 +33,7 @@ from pathlib import Path
 import markdown
 from markdown.treeprocessors import Treeprocessor
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_URL = "https://trilium.kartikpassbolt.org"
 TOKEN_FILE = Path.home() / ".config" / "trilium-etapi-token"
 ROOT_LABEL = "workspaceDocsRoot"

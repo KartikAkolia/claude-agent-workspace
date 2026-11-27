@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-c920-udev-rule.sh: install c920-apply-settings, c920-settings@.service and a udev rule
 # that re-applies the Logitech C920 (046d:08e5) "stable" fix on every plug-in, then apply it now.
-# Usage: scripts/install-c920-udev-rule.sh [EXPOSURE 3-2047, default 250] [FOCUS 0-250 step 5, default 0]
+# Usage: scripts/c920-webcam/install-c920-udev-rule.sh [EXPOSURE 3-2047, default 250] [FOCUS 0-250 step 5, default 0]
 # Docs: docs/logitech-c920-webcam.md
 
 set -euo pipefail
@@ -28,7 +28,7 @@ fi
 command -v v4l2-ctl >/dev/null || die "v4l2-ctl not found (install v4l-utils)"
 [ -f "$HELPER_SRC" ] || die "missing $HELPER_SRC"
 
-unit="# Installed by scripts/install-c920-udev-rule.sh — started by
+unit="# Installed by scripts/c920-webcam/install-c920-udev-rule.sh — started by
 # $RULE_FILE when a Logitech C920 appears.
 [Unit]
 Description=Logitech C920 stable settings on /dev/%I
@@ -37,7 +37,7 @@ Description=Logitech C920 stable settings on /dev/%I
 Type=oneshot
 ExecStart=$HELPER /dev/%I $EXPOSURE $FOCUS"
 
-rule="# Installed by scripts/install-c920-udev-rule.sh — Logitech C920: manual
+rule="# Installed by scripts/c920-webcam/install-c920-udev-rule.sh — Logitech C920: manual
 # exposure + autofocus off on every plug-in/boot, via $UNIT_FILE.
 ACTION==\"add\", SUBSYSTEM==\"video4linux\", ATTRS{idVendor}==\"046d\", ATTRS{idProduct}==\"08e5\", ATTR{index}==\"0\", TAG+=\"systemd\", ENV{SYSTEMD_WANTS}+=\"c920-settings@%k.service\""
 

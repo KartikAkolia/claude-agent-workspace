@@ -5,7 +5,7 @@
 # ///
 """Offline regression tests for sync-docs-to-trilium.py (markdown pinned above).
 
-Run: uv run --script scripts/test_sync_docs_to_trilium.py -v
+Run: uv run --script scripts/trilium-sync/test_sync_docs_to_trilium.py -v
 """
 
 import contextlib

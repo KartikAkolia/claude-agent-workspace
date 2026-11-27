@@ -3,7 +3,7 @@ name = "minecraft-tui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Terminal UI for the Minecraft + Twingate stack that scripts/minecraft-twingate.sh manages"
+description = "Terminal UI for the Minecraft + Twingate stack that scripts/minecraft-twingate/minecraft-twingate.sh manages"
 publish = false
 
 [dependencies]

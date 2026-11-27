@@ -9,8 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LIB = HERE / "lib" / "tui.sh"
+SCRIPTS = Path(__file__).resolve().parent.parent
+LIB = SCRIPTS / "lib" / "tui.sh"
+TUI_DIR = SCRIPTS / "desktop-tuis"
 TUIS = {
     "audio-tui.sh": "whiptail pactl jq",
     "display-tui.sh": "whiptail xrandr awk mktemp rm",
@@ -21,7 +22,7 @@ SHARED = ("wt", "die", "require_tools")
 INTERFACE = (*SHARED, "pick_menu", "run_or_report", "normalize_int", "int_le")
 LIB_FUNCS = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_]*)\(\) \{$", LIB.read_text())
 BASH = shutil.which("bash")
-SYNC = HERE / "sync-root-gtk-theme.sh"
+SYNC = SCRIPTS / "gtk-root-theme" / "sync-root-gtk-theme.sh"
 SYNC_TOOLS = ("dirname", "readlink", "realpath", "sort", "basename", "sed", "head")
 MARKER_LIB = """readonly PROG="${0##*/}"
 : >"$TUI_LIB_SOURCED"
@@ -62,7 +63,7 @@ class TuiLibTests(unittest.TestCase):
         self.assertRegex(LIB.read_text(), r"(?m)^readonly PROG=", "lib sets no PROG")
         own_func = rf"(?m)^({'|'.join(LIB_FUNCS)})\(\)"
         for tui in TUIS:
-            text = (HERE / tui).read_text()
+            text = (TUI_DIR / tui).read_text()
             with self.subTest(tui=tui):
                 self.assertNotRegex(text, own_func, f"{tui} defines a lib function")
                 self.assertNotRegex(text, r"(?m)^readonly PROG=", f"{tui} sets PROG")
@@ -73,8 +74,8 @@ class TuiLibTests(unittest.TestCase):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         cases = []
         for tui, tools in TUIS.items():
-            (tmp / f"link-{tui}").symlink_to(HERE / tui)
-            cases += [(HERE / tui, tools), (tmp / f"link-{tui}", tools)]
+            (tmp / f"link-{tui}").symlink_to(TUI_DIR / tui)
+            cases += [(TUI_DIR / tui, tools), (tmp / f"link-{tui}", tools)]
         for script, tools in cases:
             with self.subTest(script=str(script)):
                 result = run_script(script, tmp, TUI_TOOLS)
@@ -87,8 +88,9 @@ class TuiLibTests(unittest.TestCase):
         tmp = self.enterContext(tempfile.TemporaryDirectory())
         lib = os.path.join(os.path.realpath(tmp), "lib", "tui.sh")
         for tui in TUIS:
-            copy = Path(tmp) / tui
-            shutil.copy(HERE / tui, copy)
+            copy = Path(tmp) / TUI_DIR.name / tui
+            copy.parent.mkdir(exist_ok=True)
+            shutil.copy(TUI_DIR / tui, copy)
             with self.subTest(tui=tui):
                 result = run_script(copy, tmp, TUI_TOOLS)
                 self.assertEqual(result.returncode, 1, result.stderr)
@@ -167,7 +169,8 @@ run_or_report "quiet failed" false; printf 'rc=%s\n' "$?"
 class SyncRootGtkThemeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.copy = self.tmp / SYNC.name
+        self.copy = self.tmp / SYNC.parent.name / SYNC.name
+        self.copy.parent.mkdir()
         shutil.copy(SYNC, self.copy)
 
     def test_no_own_copy_of_the_shared_helpers(self):

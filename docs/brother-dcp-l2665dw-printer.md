@@ -1,6 +1,6 @@
 # Brother DCP-L2665DW printer driver
 
-`scripts/install-brother-dcp-l2665dw.sh` installs Brother's own Linux CUPS driver for the DCP-L2665DW network printer. It downloads a pinned copy of Brother's `linux-brprinter-installer`, runs it, then checks that a CUPS queue for the printer really exists afterwards, because the installer's own exit status says nothing. It is for Debian and Ubuntu only and refuses every other host. Run it as yourself in a real terminal: its own questions are read from `/dev/tty`, the installer is interactive, and both the installer and any `lpadmin -x` run through `sudo`. No run against the real printer is recorded in this repo, and the 2026-11-14 audit verified its logic with stubs only ([script-audit-2026-11-14.md](script-audit-2026-11-14.md), SYS-2). On the current `asus-vivobook` install it refuses: as checked on 2026-11-15 that host is Arch, with `/usr/bin/rpm` from `rpm-tools`, no `dpkg`, and no `cups` package (only `libcups`), so even the driverless route below needs `cups` installed and started first.
+`scripts/brother-printer/install-brother-dcp-l2665dw.sh` installs Brother's own Linux CUPS driver for the DCP-L2665DW network printer. It downloads a pinned copy of Brother's `linux-brprinter-installer`, runs it, then checks that a CUPS queue for the printer really exists afterwards, because the installer's own exit status says nothing. It is for Debian and Ubuntu only and refuses every other host. Run it as yourself in a real terminal: its own questions are read from `/dev/tty`, the installer is interactive, and both the installer and any `lpadmin -x` run through `sudo`. No run against the real printer is recorded in this repo, and the 2026-11-14 audit verified its logic with stubs only ([script-audit-2026-11-14.md](script-audit-2026-11-14.md), SYS-2). On the current `asus-vivobook` install it refuses: as checked on 2026-11-15 that host is Arch, with `/usr/bin/rpm` from `rpm-tools`, no `dpkg`, and no `cups` package (only `libcups`), so even the driverless route below needs `cups` installed and started first.
 
 ## Why Debian and Ubuntu only
 
@@ -25,7 +25,7 @@ The installer downloads the driver packages itself with `wget`. If `wget` is mis
 ## Usage
 
 ```bash
-bash scripts/install-brother-dcp-l2665dw.sh
+bash scripts/brother-printer/install-brother-dcp-l2665dw.sh
 ```
 
 The installer's prompts, in the order v2.2.6-0 asks them:

@@ -21,11 +21,11 @@ on:
       - ".claude/skills/quickshell/scripts/quickshell-qmllint"
       - "scripts/xppen-tablet/xppentablet"
       - "scripts/xppen-tablet/xppen-tablet.install"
-      - "scripts/test_install_fedora.py"
+      - "scripts/fedora-install/test_install_fedora.py"
       - "scripts/minecraft-fabric/**"
-      - "scripts/test_tui_lib.py"
-      - "scripts/test_device_power_saving.py"
-      - "scripts/device-power-saving-config.py"
+      - "scripts/lib/test_tui_lib.py"
+      - "scripts/device-power-saving/test_device_power_saving.py"
+      - "scripts/device-power-saving/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
       - "reference-clones.tsv"
@@ -36,11 +36,11 @@ on:
       - ".claude/skills/quickshell/scripts/quickshell-qmllint"
       - "scripts/xppen-tablet/xppentablet"
       - "scripts/xppen-tablet/xppen-tablet.install"
-      - "scripts/test_install_fedora.py"
+      - "scripts/fedora-install/test_install_fedora.py"
       - "scripts/minecraft-fabric/**"
-      - "scripts/test_tui_lib.py"
-      - "scripts/test_device_power_saving.py"
-      - "scripts/device-power-saving-config.py"
+      - "scripts/lib/test_tui_lib.py"
+      - "scripts/device-power-saving/test_device_power_saving.py"
+      - "scripts/device-power-saving/device-power-saving-config.py"
       - ".github/workflows/lint-bash.yml"
       - ".lint-versions"
       - "reference-clones.tsv"
@@ -134,7 +134,7 @@ jobs:
           ./lint-bash.sh "${files[@]}"
 
       - name: Installer regression and mandatory no-nested-if checks
-        run: python3 scripts/test_install_fedora.py
+        run: python3 scripts/fedora-install/test_install_fedora.py
 
       - name: Minecraft Fabric installer tests
         # Stubs java, curl, sudo and systemctl itself; the system-unit tests
@@ -145,11 +145,11 @@ jobs:
       - name: TUI shared-library wiring tests
         # Needs only bash, dirname, readlink and python3: each TUI stops at
         # require_tools before any whiptail, xrandr, pactl or v4l2-ctl call.
-        run: python3 scripts/test_tui_lib.py -v
+        run: python3 scripts/lib/test_tui_lib.py -v
 
       - name: Device power-saving policy tests
         # Stubs nmcli, modprobe, mkinitcpio, grub-mkconfig, udevadm, iw,
         # setpci, systemctl and sleep, and works in a temp dir, never the
         # runner's own config. Beyond those it needs only bash, python3, GNU
         # coreutils, flock (util-linux) and cmp (diffutils), all stock.
-        run: cd scripts && python3 -m unittest test_device_power_saving -v
+        run: cd scripts/device-power-saving && python3 -m unittest test_device_power_saving -v

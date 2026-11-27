@@ -1,6 +1,6 @@
 # Fedora and EL10 post-install setup
 
-`scripts/install-fedora.sh` sets up a fresh DNF-based Fedora or Rocky,
+`scripts/fedora-install/install-fedora.sh` sets up a fresh DNF-based Fedora or Rocky,
 AlmaLinux, CentOS Stream or RHEL 10 machine, VM or bare metal. It replicates
 the `rocky10` VM setup from 2026-11-06. Atomic/rpm-ostree systems are
 rejected. It changes the host, so read `--help` and a dry run first.
@@ -8,9 +8,9 @@ rejected. It changes the host, so read `--help` and a dry run first.
 ## Usage
 
 ```bash
-bash scripts/install-fedora.sh --help
-sudo bash scripts/install-fedora.sh --dry-run --user "$USER"
-sudo bash scripts/install-fedora.sh --user "$USER"
+bash scripts/fedora-install/install-fedora.sh --help
+sudo bash scripts/fedora-install/install-fedora.sh --dry-run --user "$USER"
+sudo bash scripts/fedora-install/install-fedora.sh --user "$USER"
 ```
 
 By default it installs the CachyOS kernel, disables SELinux, stops and masks
@@ -36,7 +36,7 @@ signal to the whole process group still leaves the summary in the log.
 
 Never nest `if` statements in this script, the Bash block it writes into
 `~/.bashrc`, or its embedded Python editors. Use guard clauses and small named
-helpers instead. `python3 scripts/test_install_fedora.py` enforces this: it
+helpers instead. `python3 scripts/fedora-install/test_install_fedora.py` enforces this: it
 parses the shell with `shfmt -tojson` and the embedded Python with `ast`, and
 the Bash CI workflow runs it, so a nested `if` fails CI. Keep the gate enabled
 when changing the installer.
@@ -153,9 +153,9 @@ Run these from the repository root with the linter versions in
 `.lint-versions`:
 
 ```bash
-./lint-bash.sh scripts/install-fedora.sh
-./lint-python.sh scripts/test_install_fedora.py
-python3 scripts/test_install_fedora.py
+./lint-bash.sh scripts/fedora-install/install-fedora.sh
+./lint-python.sh scripts/fedora-install/test_install_fedora.py
+python3 scripts/fedora-install/test_install_fedora.py
 ./validate-config.sh .github/workflows/lint-bash.yml
 ```
 

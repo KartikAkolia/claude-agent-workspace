@@ -4,9 +4,9 @@
 # Docs: docs/desktop-tuis.md
 set -uo pipefail
 
-tui_lib="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/tui.sh"
+tui_lib="$(dirname -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")")/lib/tui.sh"
 if [ ! -r "$tui_lib" ]; then
-	printf 'error: %s is missing; run %s from the repo checkout, or keep scripts/lib/ beside it\n' "$tui_lib" "${0##*/}" >&2
+	printf 'error: %s is missing; run %s from the repo checkout, or keep lib/ as a sibling of its folder\n' "$tui_lib" "${0##*/}" >&2
 	exit 1
 fi
 # shellcheck source=/dev/null

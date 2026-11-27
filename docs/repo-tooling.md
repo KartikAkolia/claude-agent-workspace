@@ -1,6 +1,6 @@
 # Repo tooling
 
-The scripts at the repo root, plus `scripts/sync-docs-to-trilium.py`, are this repo's own lint, version-tracking and mirror tooling, and `.github/workflows/` runs the lint parts in CI. Most of it runs without anyone asking: `.githooks/pre-commit` on every `git commit` in a clone with `git config core.hooksPath .githooks`, and the workflows on every push and pull request. `lint-markdown.sh`, `refresh-reference-clone.sh` and the Trilium sync are run by hand. [../README.md](../README.md) has the overview; this doc holds the contracts the scripts' short header comments don't carry: modes, exit codes, environment variables, invariants and known limitations. The fixes behind most of these rules are in [script-audit-2026-11-14.md](script-audit-2026-11-14.md), cited here by row ID (TOOL-1 and so on).
+The scripts at the repo root, plus `scripts/trilium-sync/sync-docs-to-trilium.py`, are this repo's own lint, version-tracking and mirror tooling, and `.github/workflows/` runs the lint parts in CI. Most of it runs without anyone asking: `.githooks/pre-commit` on every `git commit` in a clone with `git config core.hooksPath .githooks`, and the workflows on every push and pull request. `lint-markdown.sh`, `refresh-reference-clone.sh` and the Trilium sync are run by hand. [../README.md](../README.md) has the overview; this doc holds the contracts the scripts' short header comments don't carry: modes, exit codes, environment variables, invariants and known limitations. The fixes behind most of these rules are in [script-audit-2026-11-14.md](script-audit-2026-11-14.md), cited here by row ID (TOOL-1 and so on).
 
 | Tool | Run by |
 | --- | --- |
@@ -10,7 +10,7 @@ The scripts at the repo root, plus `scripts/sync-docs-to-trilium.py`, are this r
 | `list-lint-files.sh` | sourced by the hook, `lint-bash.sh`, `lint-markdown.sh` and `refresh-reference-clone.sh`; run by CI and the Trilium sync |
 | `lint-versions.sh` | sourced by `lint-bash.sh`, `lint-python.sh` and `lint-markdown.yml`; run by the hook and CI |
 | `refresh-reference-clone.sh` | by hand, only for a resync Kartik asked for (AGENTS.md non-negotiable #1) |
-| `scripts/sync-docs-to-trilium.py` | by hand, after docs change |
+| `scripts/trilium-sync/sync-docs-to-trilium.py` | by hand, after docs change |
 
 ## Shared conventions
 
@@ -178,8 +178,8 @@ All six workflows run on `ubuntu-latest` and pin every action by commit SHA, wit
 | --- | --- | --- |
 | `lint-markdown.yml` | every push and pull request | a scope step, then `mdl` and/or `check-markdown-links.py` over every tracked markdown file |
 | `lint-config.yml` | `**.json`, `**.yml`, `**.yaml`, `validate-config.sh`, `list-lint-files.sh`, `reference-clones.tsv`, itself | `validate-config.sh` over every config file |
-| `lint-bash.yml` | `**.sh`, the extensionless shell scripts by name, the test files it runs plus `scripts/device-power-saving-config.py`, `.lint-versions`, `reference-clones.tsv`, itself | `LINT_VERSIONS_MODE=strict ./lint-bash.sh` over every shell script, then the `unittest` suites `scripts/test_install_fedora.py`, `scripts/minecraft-fabric/test_install.py`, `scripts/test_tui_lib.py` and `scripts/test_device_power_saving.py` |
-| `lint-python.yml` | `**.py`, `lint-python.sh`, `list-lint-files.sh`, `reference-clones.tsv`, `lint-versions.sh`, `.lint-versions`, itself | `./lint-python.sh` over every `.py` file (unset mode, so the checkout's ruff line), then `uv run -q --script scripts/test_sync_docs_to_trilium.py -v` |
+| `lint-bash.yml` | `**.sh`, the extensionless shell scripts by name, the test files it runs plus `scripts/device-power-saving/device-power-saving-config.py`, `.lint-versions`, `reference-clones.tsv`, itself | `LINT_VERSIONS_MODE=strict ./lint-bash.sh` over every shell script, then the `unittest` suites `scripts/fedora-install/test_install_fedora.py`, `scripts/minecraft-fabric/test_install.py`, `scripts/lib/test_tui_lib.py` and `scripts/device-power-saving/test_device_power_saving.py` |
+| `lint-python.yml` | `**.py`, `lint-python.sh`, `list-lint-files.sh`, `reference-clones.tsv`, `lint-versions.sh`, `.lint-versions`, itself | `./lint-python.sh` over every `.py` file (unset mode, so the checkout's ruff line), then `uv run -q --script scripts/trilium-sync/test_sync_docs_to_trilium.py -v` |
 | `minecraft-tui.yml` | `minecraft-tui/**`, itself | in `minecraft-tui/`, on Rust 1.100.0 (`RUSTUP_TOOLCHAIN`, installed with rustup), pinned so a new clippy lint can't fail an unrelated change; bump it with the local Rust. Job `check`: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`. Job `build`, in parallel: `cargo build --release --locked`, uploaded as a 7-day artifact |
 | `gitleaks.yml` | every push and pull request | `gitleaks/gitleaks-action` secret scanning, with the full history checked out (`fetch-depth: 0`); no `GITLEAKS_LICENSE`, which only organisation-owned repos need |
 
@@ -220,7 +220,7 @@ If the sync would delete or overwrite more than half the files git tracks in the
 
 Every rsync's exit status is checked (TOOL-3). A failed dry run exits 1 before anything is written. A failed sync exits 1 saying the mirror may be partly updated and to check `git status -- <mirror>`. After a sync the same dry run must find nothing; if it can't run, or still reports differences (the sync can't converge, so every later run would report changes), it prints them and exits 1.
 
-## `scripts/sync-docs-to-trilium.py`
+## `scripts/trilium-sync/sync-docs-to-trilium.py`
 
 It mirrors this repo's markdown into Trilium (`https://trilium.kartikpassbolt.org` unless `--url` or `TRILIUM_URL` says otherwise) as read-only text notes under one parent note, "claude-agent-workspace docs". It runs through `uv run --script` (its shebang; the inline metadata declares its `markdown` dependency), by hand after docs change. Its module docstring is its `--help` text, which gives the usage: `--dry-run` shows what would change without writing, `--prune` deletes notes for docs that are gone, and each path is a file or folder inside the repo, relative to the current directory, with `docs/` the default. The ETAPI token comes from `TRILIUM_ETAPI_TOKEN` or `~/.config/trilium-etapi-token` (Trilium, Options, ETAPI, Create new token). What `--help` doesn't spell out:
 
@@ -232,7 +232,7 @@ It mirrors this repo's markdown into Trilium (`https://trilium.kartikpassbolt.or
 - It stops rather than guess when more than one note carries the `workspaceDocsRoot` label, when two notes carry the same `workspaceDocPath` (Trilium's Duplicate copies labels; the message names the likely original), or when doc notes exist but no root does.
 - It won't send the token over anything but HTTPS, localhost aside, and refuses HTTP redirects, which would replay the token to another host.
 
-Its offline test suite is `scripts/test_sync_docs_to_trilium.py`, run with `uv run -q --script scripts/test_sync_docs_to_trilium.py -v`, as `lint-python.yml` also does. It stubs the network but runs the real `list-lint-files.sh` parser.
+Its offline test suite is `scripts/trilium-sync/test_sync_docs_to_trilium.py`, run with `uv run -q --script scripts/trilium-sync/test_sync_docs_to_trilium.py -v`, as `lint-python.yml` also does. It stubs the network but runs the real `list-lint-files.sh` parser.
 
 ## `quickshell-qmllint`
 

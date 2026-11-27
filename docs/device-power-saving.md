@@ -1,14 +1,14 @@
 # Device power saving on asus-vivobook
 
-`scripts/disable-device-power-saving.sh` turns off device-level power saving on `asus-vivobook`: USB and PCI runtime power management, PCIe ASPM, NVMe autonomous power-state transitions, HDA audio power saving, the NVIDIA dGPU's dynamic power management and Wi-Fi power saving. System suspend, hibernate and lid handling are untouched. It targets that laptop's CachyOS install (Arch, GRUB, mkinitcpio, NetworkManager) and runs as root, re-running itself under `sudo` when started as an ordinary user. Every install and every undo is a recorded run with a private, recoverable backup, and both need a reboot to take full effect. Its helper `scripts/device-power-saving-config.py` does the GRUB editing and the effective-config checks, and `scripts/test_device_power_saving.py` tests both against a fake root. Status: installed on `asus-vivobook` as three stacked runs and reboot-verified on 2026-11-12 per [handoff.md](handoff.md) (open item 53). The late pass's after-resume run had not been verified by then (item 51). The dated session entries in handoff.md (2026-10-24, 2026-11-10 and 2026-11-12) hold the history.
+`scripts/device-power-saving/disable-device-power-saving.sh` turns off device-level power saving on `asus-vivobook`: USB and PCI runtime power management, PCIe ASPM, NVMe autonomous power-state transitions, HDA audio power saving, the NVIDIA dGPU's dynamic power management and Wi-Fi power saving. System suspend, hibernate and lid handling are untouched. It targets that laptop's CachyOS install (Arch, GRUB, mkinitcpio, NetworkManager) and runs as root, re-running itself under `sudo` when started as an ordinary user. Every install and every undo is a recorded run with a private, recoverable backup, and both need a reboot to take full effect. Its helper `scripts/device-power-saving/device-power-saving-config.py` does the GRUB editing and the effective-config checks, and `scripts/device-power-saving/test_device_power_saving.py` tests both against a fake root. Status: installed on `asus-vivobook` as three stacked runs and reboot-verified on 2026-11-12 per [handoff.md](handoff.md) (open item 53). The late pass's after-resume run had not been verified by then (item 51). The dated session entries in handoff.md (2026-10-24, 2026-11-10 and 2026-11-12) hold the history.
 
 ## Usage
 
 ```bash
-python3 -m unittest discover -s scripts -p test_device_power_saving.py -v   # first; fake root, no privileges
-pkexec "$PWD/scripts/disable-device-power-saving.sh"                        # install
-pkexec "$PWD/scripts/disable-device-power-saving.sh" --undo BACKUP_DIRECTORY
-pkexec "$PWD/scripts/disable-device-power-saving.sh" --recover BACKUP_DIRECTORY
+python3 -m unittest discover -s scripts/device-power-saving -p test_device_power_saving.py -v   # first; fake root, no privileges
+pkexec "$PWD/scripts/device-power-saving/disable-device-power-saving.sh"                        # install
+pkexec "$PWD/scripts/device-power-saving/disable-device-power-saving.sh" --undo BACKUP_DIRECTORY
+pkexec "$PWD/scripts/device-power-saving/disable-device-power-saving.sh" --recover BACKUP_DIRECTORY
 ```
 
 Run these from the repository root. The 2026-11-10 and 2026-11-12 runs recorded in handoff.md used `pkexec`. A successful install ends by printing its exact undo command. The script resolves the path it's given, so `--undo /var/lib/device-power-saving/current` also names the most recent run, the only one undo accepts. Running the install again, for example after changing the script, stacks a new run on top of the last one. Reboot after an install, an undo or a recovery.
@@ -96,7 +96,7 @@ The rollback runs from the `EXIT` trap, so none of this is power-loss atomic. A 
 
 ## The config helper
 
-`scripts/device-power-saving-config.py` reads its input and prints to stdout. It never writes files. On any refusal it exits non-zero with `error: …`.
+`scripts/device-power-saving/device-power-saving-config.py` reads its input and prints to stdout. It never writes files. On any refusal it exits non-zero with `error: …`.
 
 | Operation | Input | Does |
 | --- | --- | --- |
@@ -141,10 +141,10 @@ pkexec lspci -vv | grep -c 'ASPM L[01s ]*Enabled'               # 0
 ## Testing
 
 ```bash
-python3 -m unittest discover -s scripts -p test_device_power_saving.py -v
+python3 -m unittest discover -s scripts/device-power-saving -p test_device_power_saving.py -v
 ```
 
-Run it from the repository root. It needs no privileges, and on 2026-11-15 all 33 tests passed in about 17 s. CI runs the same suite (`cd scripts && python3 -m unittest test_device_power_saving -v`) in `.github/workflows/lint-bash.yml` on any push or pull request that touches a shell script, the suite or the helper.
+Run it from the repository root. It needs no privileges, and on 2026-11-15 all 33 tests passed in about 17 s. CI runs the same suite (`cd scripts/device-power-saving && python3 -m unittest test_device_power_saving -v`) in `.github/workflows/lint-bash.yml` on any push or pull request that touches a shell script, the suite or the helper.
 
 `GrubTests` call the helper directly. Each `InstallTests` case builds a throwaway root in a temp directory and runs a rewritten copy of the script against it. The root check `((EUID == 0)) ||` becomes `true ||`. Every `/etc/`, `/sys/`, `/var/lib/` and `/usr/local/` prefix points into the temp root, and so does `BOOT_DIR=/boot`. A Python stub stands in for `nmcli`, `modprobe`, `mkinitcpio`, `grub-mkconfig`, `udevadm`, `iw`, `setpci` and `systemctl`, and `sleep` is a no-op. The stub logs every call to `calls` and keeps its state in the fake root. Wi-Fi profiles live in `wifi.json` and PCI Link Control values in `lnkctl.json`. Its `grub.cfg` is built by sourcing the fake GRUB defaults. Marker files inject failures:
 

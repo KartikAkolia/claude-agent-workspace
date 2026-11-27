@@ -1,12 +1,12 @@
 # Desktop TUIs: audio, display and webcam
 
-`scripts/audio-tui.sh`, `scripts/display-tui.sh` and `scripts/webcam-tui.sh` are whiptail front ends for PipeWire/PulseAudio (through `pactl`), X11 displays (through `xrandr`) and V4L2 webcams (through `v4l2-ctl`). They were written for the keyboard-driven dwm desktop, to do from one menu tree what pavucontrol, arandr and guvcview would otherwise need a mouse for, and they share their helpers from `scripts/lib/tui.sh`. Run them from a terminal inside the graphical session as the desktop user. None of them needs or asks for root, and the display TUI needs an X11 session. Status: the audio and display TUIs were added on 2026-08-30 and the webcam TUI on 2026-09-11. All three were reworked in the [2026-11-14 script audit](script-audit-2026-11-14.md), but its fixes were verified only against stubs, never against real PipeWire, X or cameras (item 4 of its "Still needs Kartik" list). `scripts/test_tui_lib.py` covers the shared library, not the menus.
+`scripts/desktop-tuis/audio-tui.sh`, `scripts/desktop-tuis/display-tui.sh` and `scripts/desktop-tuis/webcam-tui.sh` are whiptail front ends for PipeWire/PulseAudio (through `pactl`), X11 displays (through `xrandr`) and V4L2 webcams (through `v4l2-ctl`). They were written for the keyboard-driven dwm desktop, to do from one menu tree what pavucontrol, arandr and guvcview would otherwise need a mouse for, and they share their helpers from `scripts/lib/tui.sh`. Run them from a terminal inside the graphical session as the desktop user. None of them needs or asks for root, and the display TUI needs an X11 session. Status: the audio and display TUIs were added on 2026-08-30 and the webcam TUI on 2026-09-11. All three were reworked in the [2026-11-14 script audit](script-audit-2026-11-14.md), but its fixes were verified only against stubs, never against real PipeWire, X or cameras (item 4 of its "Still needs Kartik" list). `scripts/lib/test_tui_lib.py` covers the shared library, not the menus.
 
 ```bash
-scripts/audio-tui.sh
-scripts/display-tui.sh
-scripts/webcam-tui.sh
-python3 scripts/test_tui_lib.py -v
+scripts/desktop-tuis/audio-tui.sh
+scripts/desktop-tuis/display-tui.sh
+scripts/desktop-tuis/webcam-tui.sh
+python3 scripts/lib/test_tui_lib.py -v
 ```
 
 None of the three takes command-line arguments, so `--help` just starts the TUI.
@@ -38,7 +38,7 @@ Every dialog goes through `wt`, which adds `--backtitle "$PROG"` and sends each 
 
 ### sync-root-gtk-theme.sh
 
-`scripts/sync-root-gtk-theme.sh` uses the library for `--pick` only. Its `--check` and `--apply` run as root, and the library is a file the desktop user can write, so it's sourced only inside the `pick)` case arm. `--pick` itself refuses to run as root, and the root paths execute nothing but the script file. The sync script mustn't define its own `wt`, `die` or `require_tools`. Both rules are tested; [gparted-root-theme-fix.md](gparted-root-theme-fix.md) explains the trust model.
+`scripts/gtk-root-theme/sync-root-gtk-theme.sh` uses the library for `--pick` only. Its `--check` and `--apply` run as root, and the library is a file the desktop user can write, so it's sourced only inside the `pick)` case arm. `--pick` itself refuses to run as root, and the root paths execute nothing but the script file. The sync script mustn't define its own `wt`, `die` or `require_tools`. Both rules are tested; [gparted-root-theme-fix.md](gparted-root-theme-fix.md) explains the trust model.
 
 ## audio-tui.sh
 
@@ -74,7 +74,7 @@ It needs `whiptail`, `v4l2-ctl`, `awk` and `grep`, and stops if `v4l2-ctl --list
 
 Only capture nodes are offered. `v4l2-ctl --list-devices` lists every `/dev/videoN` of a camera, including metadata-only nodes such as the UVC metadata stream. So each node's own `Device Caps` block has to include Video Capture; the aggregate `Capabilities` line doesn't count, because it lists a sibling node's caps too. That block is tab-indented in `v4l2-ctl -D` output, so the parser doesn't anchor it at column 0.
 
-**Control names differ by driver.** The quick setup resolves each logical control from a short candidate list, and the first name the camera reports wins. The candidates are `exposure_auto` or `auto_exposure`, `exposure_absolute` or `exposure_time_absolute`, `focus_auto` or `focus_automatic_continuous`, and `focus_absolute`. The C920 reports `auto_exposure`, `exposure_time_absolute` and `focus_automatic_continuous`, the names `scripts/c920-apply-settings.sh` sets, while the christitus.com C920 article uses `exposure_auto` and `focus_auto` (commit `1990ae8`). A camera with none of these names is pointed at the browse menu, which works from whatever names the driver reports.
+**Control names differ by driver.** The quick setup resolves each logical control from a short candidate list, and the first name the camera reports wins. The candidates are `exposure_auto` or `auto_exposure`, `exposure_absolute` or `exposure_time_absolute`, `focus_auto` or `focus_automatic_continuous`, and `focus_absolute`. The C920 reports `auto_exposure`, `exposure_time_absolute` and `focus_automatic_continuous`, the names `scripts/c920-webcam/c920-apply-settings.sh` sets, while the christitus.com C920 article uses `exposure_auto` and `focus_auto` (commit `1990ae8`). A camera with none of these names is pointed at the browse menu, which works from whatever names the driver reports.
 
 **Editing.** Bools are toggled after a yes/no, and menu controls are picked from their options. `int` and `int64` values are typed, normalised with `normalize_int` and range-checked with `int_le`, so values up to a control's real int64 range are accepted and longer ones rejected, never overflowed. They're also checked against the step, since drivers may round or reject an off-step value; the C920's `focus_absolute` only takes multiples of 5. The step test reduces each side modulo the step first, because `value - min` can itself exceed int64. `check_int_value` takes the caller's variable by nameref, which resolves by name, so its locals are prefixed `civ_`; a plain local `val` would shadow the caller's. Other types (bitmask, string and so on) aren't editable here, and the TUI prints the `v4l2-ctl --set-ctrl` command to use instead. Controls flagged inactive, because their auto mode is on, are marked, since the camera ignores a value written to one then. The browse list reopens on the control just edited, not the first one, so a repeated Enter can't toggle the first bool by accident.
 
@@ -92,7 +92,7 @@ Not built: a preview action that runs `ffplay` or `mpv av://v4l2:<device>` in a 
 
 ## Tests
 
-`scripts/test_tui_lib.py` checks the library's wiring and helpers without running any device tool. Run it as your normal user with `python3 scripts/test_tui_lib.py -v`. It needs Python 3.11 or later for `unittest`'s `enterContext`. Don't run it as root, because the sync-script tests rely on `--check` and `--apply` stopping at the root check. CI runs the same command in the "TUI shared-library wiring tests" step of `.github/workflows/lint-bash.yml`. All 8 tests passed on 2026-11-15.
+`scripts/lib/test_tui_lib.py` checks the library's wiring and helpers without running any device tool. Run it as your normal user with `python3 scripts/lib/test_tui_lib.py -v`. It needs Python 3.11 or later for `unittest`'s `enterContext`. Don't run it as root, because the sync-script tests rely on `--check` and `--apply` stopping at the root check. CI runs the same command in the "TUI shared-library wiring tests" step of `.github/workflows/lint-bash.yml`. All 8 tests passed on 2026-11-15.
 
 The library tests check that `lib/tui.sh` defines `wt`, `die`, `require_tools`, `pick_menu`, `run_or_report`, `normalize_int` and `int_le` and sets `PROG`. They check that no TUI defines any function the library defines, or sets its own `PROG`; the function list is read from the library, so a helper added later is covered. They also check that each TUI computes `tui_lib` and sources it. Each TUI is then started, directly and through a symlink in a temp directory, with a `PATH` holding only `dirname` and `readlink`. The test expects exit 1 and exactly `error: missing required tool(s): ...`. That proves the library was found, and it stops the run before any whiptail, pactl, xrandr or v4l2-ctl call. The expected tool list per TUI is pinned in the test's `TUIS` table, so changing a `require_tools` line means updating it. A copy of a TUI outside `scripts/` has to fail naming the missing `lib/tui.sh`. Finally, a bash snippet sources the library with a stub `wt` and checks four helpers. For `pick_menu` it tries an empty list, a pick, an empty choice and Cancel. For `normalize_int` it tries `08`, `-007`, `-0`, `0250`, `0x10` and non-numbers. `int_le` is tested across the int64 boundary and with a 20-digit number, and `run_or_report` on success, on a failure with stderr and on a bare exit status.
 

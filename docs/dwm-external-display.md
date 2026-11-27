@@ -1,6 +1,6 @@
 # External-only display with hotplug under dwm
 
-`scripts/dwm-external-only.sh` makes the external HDMI monitor the only display while it is connected: 1920x1080 at the highest refresh rate it lists for that mode (180 Hz on the current monitor), primary, at `0x0`, with the internal panel off. When the monitor is unplugged it turns the internal panel back on (`--auto`, which picks 1920x1080 at 144 Hz) and the external output off. In `watch` mode it keeps doing this for the whole dwm session, so plugging or unplugging the cable switches displays within about 2–4 seconds. `scripts/dwm-external-only.desktop` starts the watcher at dwm login.
+`scripts/dwm-external-display/dwm-external-only.sh` makes the external HDMI monitor the only display while it is connected: 1920x1080 at the highest refresh rate it lists for that mode (180 Hz on the current monitor), primary, at `0x0`, with the internal panel off. When the monitor is unplugged it turns the internal panel back on (`--auto`, which picks 1920x1080 at 144 Hz) and the external output off. In `watch` mode it keeps doing this for the whole dwm session, so plugging or unplugging the cable switches displays within about 2–4 seconds. `scripts/dwm-external-display/dwm-external-only.desktop` starts the watcher at dwm login.
 
 Status: installed on `asus-vivobook` (ASUS Vivobook M6500XV, CachyOS, dwm-titus under SDDM) on 2026-11-17. A real unplug and replug were verified that day from the journal: `HDMI-1-0 disconnected, eDP-1 back on` at 18:51:58, then `HDMI-1-0 at 1920x1080 180.00 Hz, eDP-1 off` at 18:52:08. Start at login is configured and the generated unit's condition matches the session, but a fresh login running it has not been watched yet.
 
@@ -17,9 +17,9 @@ The watcher owns the layout only when the cable state changes. A layout set by h
 ## Install
 
 ```bash
-install -Dm755 scripts/dwm-external-only.sh ~/.local/bin/dwm-external-only
+install -Dm755 scripts/dwm-external-display/dwm-external-only.sh ~/.local/bin/dwm-external-only
 mkdir -p ~/.config/autostart
-sed "s|/home/kartik|$HOME|" scripts/dwm-external-only.desktop >~/.config/autostart/dwm-external-only.desktop
+sed "s|/home/kartik|$HOME|" scripts/dwm-external-display/dwm-external-only.desktop >~/.config/autostart/dwm-external-only.desktop
 systemctl --user daemon-reload
 systemctl --user restart 'app-dwm\x2dexternal\x2donly@autostart.service'
 ```

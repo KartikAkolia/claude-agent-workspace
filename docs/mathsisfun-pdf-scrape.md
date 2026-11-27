@@ -33,7 +33,7 @@ The scripts run fine on either Windows (native, no WSL needed) or Linux — whic
 ## Usage
 
 ```bash
-cd /path/to/Github/scripts
+cd /path/to/Github/scripts/mathsisfun-pdf
 VENV=~/.venvs/mathsisfun-pdf   # adjust bin/ vs Scripts/ for your OS
 
 # 1. Discover every page under a section (breadth-first, same-domain, 1s delay).
@@ -87,6 +87,6 @@ All four scripts (three Python-driven pipeline steps plus the shell merge step) 
 
 ## Files
 
-- `scripts/mathsisfun-algebra-discover.py` — crawler, outputs one URL per line. Takes an optional start-URL argument to crawl a different section.
-- `scripts/mathsisfun-algebra-render.py` — renders each URL to a PDF (needs the venv above). Takes an optional profile-dir argument; use a distinct one per section.
-- `scripts/mathsisfun-algebra-merge.sh` — `pdfunite`s the per-page PDFs into one book, in crawl order. Refuses if any are missing unless given `--allow-missing`.
+- `scripts/mathsisfun-pdf/mathsisfun-algebra-discover.py` — crawler, outputs one URL per line. Takes an optional start-URL argument to crawl a different section.
+- `scripts/mathsisfun-pdf/mathsisfun-algebra-render.py` — renders each URL to a PDF (needs the venv above). Takes an optional profile-dir argument; use a distinct one per section.
+- `scripts/mathsisfun-pdf/mathsisfun-algebra-merge.sh` — `pdfunite`s the per-page PDFs into one book, in crawl order. Refuses if any are missing unless given `--allow-missing`.

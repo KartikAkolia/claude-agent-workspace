@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-fedora.sh: post-install setup for EL10 (Rocky/Alma/CentOS Stream/RHEL 10) and Fedora.
 # Flags only, no prompts (see --help; --dry-run changes nothing).
-# Never nest if statements here or in the embedded code; scripts/test_install_fedora.py enforces it.
+# Never nest if statements here or in the embedded code; scripts/fedora-install/test_install_fedora.py enforces it.
 # Docs: docs/install-fedora.md
 
 set -Eeuo pipefail

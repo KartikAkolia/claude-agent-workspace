@@ -1,4 +1,4 @@
-//! Command-line options, and the names this front end shares with scripts/minecraft-twingate.sh.
+//! Command-line options, and the names this front end shares with scripts/minecraft-twingate/minecraft-twingate.sh.
 
 use std::{
     env, fs,
@@ -20,7 +20,7 @@ pub const DEFAULT_DIR: &str = "/opt/minecraft-server";
 pub const USAGE: &str = "\
 Usage: minecraft-tui [--dir /opt/minecraft-server] [--script PATH]
 
-A terminal front end for the stack scripts/minecraft-twingate.sh installs.
+A terminal front end for the stack scripts/minecraft-twingate/minecraft-twingate.sh installs.
   --dir     the stack folder (the script's --dir), default /opt/minecraft-server
   --script  minecraft-twingate.sh to run for install and update; default
             $MC_TUI_SCRIPT, else the copy in this repository
@@ -40,7 +40,8 @@ impl Config {
         let mut script = env::var_os("MC_TUI_SCRIPT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/minecraft-twingate.sh")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/minecraft-twingate/minecraft-twingate.sh")
             });
         while let Some(arg) = args.next() {
             match arg.as_str() {

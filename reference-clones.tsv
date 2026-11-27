@@ -3,7 +3,7 @@
 # spaces; # starts a comment. The one list every tool reads:
 #   list-lint-files.sh               skips these dirs (so every lint gate does)
 #   refresh-reference-clone.sh       only ever writes <owner/repo> into <dir>
-#   scripts/sync-docs-to-trilium.py  never publishes them
+#   scripts/trilium-sync/sync-docs-to-trilium.py  never publishes them
 # Each refuses to run if this file is missing, malformed or empty. So that
 # a mistaken line can't point the refresh's rsync --delete at docs/ or
 # another project directory, a dir must be named <repo>-<branch> (GitHub's

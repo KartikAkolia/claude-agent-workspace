@@ -1,18 +1,18 @@
 # Logitech C920 webcam settings on plug-in
 
-`scripts/install-c920-udev-rule.sh` makes a Logitech C920 (USB `046d:08e5`) come up with the "stable" settings, manual exposure and autofocus off, every time it appears, not just until the next replug or reboot. It installs `scripts/c920-apply-settings.sh` as a helper, a templated systemd service that runs the helper, and a udev rule that starts the service, then applies the settings to any C920 already plugged in. Run the installer as yourself in a real terminal: every install step goes through `sudo`, and the service runs the helper as root. Status: not installed on the current `asus-vivobook` install. As checked on 2026-11-15, none of the three installed files exists and no C920 is attached (`video0` and `video1` are the laptop's built-in camera). The 2026-11-14 audit lists the C920 udev helper among the things verified only with stubs, not on a real camera ([script-audit-2026-11-14.md](script-audit-2026-11-14.md), SYS-5 and "Still needs Kartik" item 4).
+`scripts/c920-webcam/install-c920-udev-rule.sh` makes a Logitech C920 (USB `046d:08e5`) come up with the "stable" settings, manual exposure and autofocus off, every time it appears, not just until the next replug or reboot. It installs `scripts/c920-webcam/c920-apply-settings.sh` as a helper, a templated systemd service that runs the helper, and a udev rule that starts the service, then applies the settings to any C920 already plugged in. Run the installer as yourself in a real terminal: every install step goes through `sudo`, and the service runs the helper as root. Status: not installed on the current `asus-vivobook` install. As checked on 2026-11-15, none of the three installed files exists and no C920 is attached (`video0` and `video1` are the laptop's built-in camera). The 2026-11-14 audit lists the C920 udev helper among the things verified only with stubs, not on a real camera ([script-audit-2026-11-14.md](script-audit-2026-11-14.md), SYS-5 and "Still needs Kartik" item 4).
 
 ## Why
 
-The settings are the fix from [Chris Titus's article on C920 lag under Linux](https://christitus.com/logitech-c920-linux-driver/). `scripts/webcam-tui.sh`'s "stable" preset applies the same fix ([desktop-tuis.md](desktop-tuis.md)), but only for the session: v4l2 controls reset when the camera is replugged or the machine reboots, and that is the gap the rule covers.
+The settings are the fix from [Chris Titus's article on C920 lag under Linux](https://christitus.com/logitech-c920-linux-driver/). `scripts/desktop-tuis/webcam-tui.sh`'s "stable" preset applies the same fix ([desktop-tuis.md](desktop-tuis.md)), but only for the session: v4l2 controls reset when the camera is replugged or the machine reboots, and that is the gap the rule covers.
 
 The article's control names, `exposure_auto` and `focus_auto`, don't work here: `v4l2-ctl` rejected them as "unknown control" (checked 2026-10-18 on `/dev/video2`). Both scripts use the names the kernel reports, `auto_exposure`, `exposure_time_absolute`, `focus_automatic_continuous` and `focus_absolute`.
 
 ## Usage
 
 ```bash
-scripts/install-c920-udev-rule.sh            # exposure 250, focus 0
-scripts/install-c920-udev-rule.sh 300 40     # EXPOSURE FOCUS
+scripts/c920-webcam/install-c920-udev-rule.sh            # exposure 250, focus 0
+scripts/c920-webcam/install-c920-udev-rule.sh 300 40     # EXPOSURE FOCUS
 journalctl -u 'c920-settings@*' -n 20
 ```
 
@@ -25,7 +25,7 @@ The installer refuses values outside those ranges (the C920's `focus_absolute` o
 
 | Installed path | Contents |
 | --- | --- |
-| `/usr/local/bin/c920-apply-settings` | a copy of `scripts/c920-apply-settings.sh`, mode 755 |
+| `/usr/local/bin/c920-apply-settings` | a copy of `scripts/c920-webcam/c920-apply-settings.sh`, mode 755 |
 | `/etc/systemd/system/c920-settings@.service` | a `Type=oneshot` template whose `ExecStart` runs the helper on `/dev/%I` with the chosen values |
 | `/etc/udev/rules.d/99-logitech-c920.rules` | on `add`, pulls in `c920-settings@<videoN>.service` |
 

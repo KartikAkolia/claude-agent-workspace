@@ -1,6 +1,6 @@
 # Private Minecraft server behind Twingate (Docker Compose)
 
-`scripts/minecraft-twingate.sh` automates the guide Kartik saved as `~/Downloads/minecraft-docker-twingate.md`, which follows Twingate's [Minecraft Server with Twingate](https://www.twingate.com/docs/minecraft-server). It runs `itzg/minecraft-server` and `twingate/connector:1` together on a private Docker bridge network. The Connector only makes outbound connections, so no port is published, nothing is forwarded on the router, and port 25565 never faces the internet or the LAN. Players reach the server through the Twingate Client at a fixed private address (`172.30.0.10` by default).
+`scripts/minecraft-twingate/minecraft-twingate.sh` automates the guide Kartik saved as `~/Downloads/minecraft-docker-twingate.md`, which follows Twingate's [Minecraft Server with Twingate](https://www.twingate.com/docs/minecraft-server). It runs `itzg/minecraft-server` and `twingate/connector:1` together on a private Docker bridge network. The Connector only makes outbound connections, so no port is published, nothing is forwarded on the router, and port 25565 never faces the internet or the LAN. Players reach the server through the Twingate Client at a fixed private address (`172.30.0.10` by default).
 
 The script is POSIX `sh`, so it runs under `dash`, `bash`, BusyBox `ash` or any other POSIX shell. It installs Docker Engine and the Compose plugin when they're missing, on the Arch, Fedora/EL and Debian/Ubuntu families and their derivatives. This is a separate setup from the port-forwarded Paper server (`docs/minecraft-server-setup.md`) and the Fabric server on the laptop (`docs/minecraft-fabric-server.md`).
 
@@ -16,10 +16,10 @@ Run as root (`sudo`, or `pkexec` on Kartik's machines). Pass the tokens through 
 
 ```sh
 sudo TG_ACCESS_TOKEN=... TG_REFRESH_TOKEN=... \
-  scripts/minecraft-twingate.sh install --network mytenant --accept-eula
-sudo scripts/minecraft-twingate.sh status     # containers, readiness, the Resource address
-sudo scripts/minecraft-twingate.sh update     # re-apply .env and flags, pull newer images, recreate
-scripts/minecraft-twingate.sh install --dry-run --accept-eula   # preview to a temp folder, no root
+  scripts/minecraft-twingate/minecraft-twingate.sh install --network mytenant --accept-eula
+sudo scripts/minecraft-twingate/minecraft-twingate.sh status     # containers, readiness, the Resource address
+sudo scripts/minecraft-twingate/minecraft-twingate.sh update     # re-apply .env and flags, pull newer images, recreate
+scripts/minecraft-twingate/minecraft-twingate.sh install --dry-run --accept-eula   # preview to a temp folder, no root
 ```
 
 `install` identifies the distribution, installs Docker unless a real Engine (`dockerd`) and a working `docker compose` are already there, enables and starts the daemon, and writes `/opt/minecraft-server/.env` (mode 600) and `compose.yaml`. It then pulls the images, starts both containers and waits up to `MC_WAIT` seconds (default 600) for the server log's `Done (` line. The first start downloads the server JAR, so it's slow. If Minecraft's restart count rises during the wait, for example because of a bad `--version`, the script stops at once instead of waiting it out. It then gives the Connector 60 seconds to log `State: Online`. A Connector with bad tokens doesn't crash: it keeps running and logs `State: Error`, so the script reads the Connector's own state lines rather than Docker's status. Finally the script checks that neither container is restarting, then prints the Admin Console steps that remain. It exits 1 if Minecraft didn't become ready within `MC_WAIT`, so automation can tell. `status` is read-only and lenient: it doesn't prompt or validate `.env`, so a bad hand edit can't hide the containers' state.
@@ -42,7 +42,7 @@ The server gets `stop_grace_period: 75s`. The image waits up to 60 seconds for i
 
 The container names `minecraft-server` and `twingate-connector` are fixed, so there is one stack per host. `install` or `update` from a second `--dir` stops before writing anything when those containers already belong to another folder or to no Compose project. Otherwise Compose would repoint the running server at the new folder's empty world.
 
-Settings resolve the same way `scripts/rss-stack.sh` does: a flag or environment variable wins, then the value saved in `.env`, then the default. Re-running `install` is safe. To change a setting, edit `.env` or pass the flag to `update`. Repeat `--dir` on every command if you don't use the default.
+Settings resolve the same way `scripts/rss-stack/rss-stack.sh` does: a flag or environment variable wins, then the value saved in `.env`, then the default. Re-running `install` is safe. To change a setting, edit `.env` or pass the flag to `update`. Repeat `--dir` on every command if you don't use the default.
 
 | Flag | Variable | Default | Notes |
 | --- | --- | --- | --- |

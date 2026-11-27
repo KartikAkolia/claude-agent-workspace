@@ -1,6 +1,6 @@
 # Canon EOS 4000D as a USB Webcam on Linux
 
-Status: **Working and verified on `asus-vivobook` 2026-08-28, on its earlier Debian install.** `gphoto2 → ffmpeg → /dev/video9` bridge streaming 1056×704 @ 25 fps. Wrapper script `scripts/start-canon-webcam.sh` with `-q` quality-settings and `-r` lossless-record modes. **Not set up on the current install** (Arch Linux on the CachyOS kernel since the 2026-11-09 reinstall): as of 2026-11-14 `gphoto2` isn't installed and the script isn't in `~/.local/bin/`, so none of this has been tested there. Boot-time loopback persistence not yet enabled (optional, see end).
+Status: **Working and verified on `asus-vivobook` 2026-08-28, on its earlier Debian install.** `gphoto2 → ffmpeg → /dev/video9` bridge streaming 1056×704 @ 25 fps. Wrapper script `scripts/canon-webcam/start-canon-webcam.sh` with `-q` quality-settings and `-r` lossless-record modes. **Not set up on the current install** (Arch Linux on the CachyOS kernel since the 2026-11-09 reinstall): as of 2026-11-14 `gphoto2` isn't installed and the script isn't in `~/.local/bin/`, so none of this has been tested there. Boot-time loopback persistence not yet enabled (optional, see end).
 
 Kartik wanted the easiest way to get video off a **Canon EOS 4000D** (EF-S 18‑55 mm III kit lens) over **USB** on his laptop (then running Debian), for **video calls** and occasionally **archiving clips**. Three options were weighed (see *Options considered*); the zero‑cost, zero‑hardware one — the standard `gphoto2` + `v4l2loopback` recipe — was chosen and set up.
 
@@ -52,13 +52,13 @@ sudo modinfo v4l2loopback | head
 
 ## Everyday use — the wrapper script
 
-`scripts/start-canon-webcam.sh` does the whole dance: checks the camera is seen, releases it from the GNOME/GVFS auto‑mount, loads `v4l2loopback` if needed, then runs the gphoto2 → ffmpeg bridge and stops both on Ctrl‑C.
+`scripts/canon-webcam/start-canon-webcam.sh` does the whole dance: checks the camera is seen, releases it from the GNOME/GVFS auto‑mount, loads `v4l2loopback` if needed, then runs the gphoto2 → ffmpeg bridge and stops both on Ctrl‑C.
 
 Install it on the laptop once:
 
 ```bash
 mkdir -p ~/.local/bin
-cp /path/to/claude-agent-workspace/scripts/start-canon-webcam.sh ~/.local/bin/
+cp /path/to/claude-agent-workspace/scripts/canon-webcam/start-canon-webcam.sh ~/.local/bin/
 chmod +x ~/.local/bin/start-canon-webcam.sh
 # ~/.local/bin is on PATH by default on Debian if it exists at login;
 # otherwise: echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc

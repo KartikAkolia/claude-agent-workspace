@@ -55,4 +55,4 @@ jobs:
         # checking list-lint-files.sh parses it to the same table. --script
         # installs the test file's own inline dependencies, where markdown
         # is pinned.
-        run: uv run -q --script scripts/test_sync_docs_to_trilium.py -v
+        run: uv run -q --script scripts/trilium-sync/test_sync_docs_to_trilium.py -v

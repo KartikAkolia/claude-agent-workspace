@@ -1,6 +1,6 @@
 # minecraft-tui: a terminal UI for the Minecraft + Twingate stack
 
-`minecraft-tui/` is a Rust [ratatui](https://ratatui.rs) program that controls the stack `scripts/minecraft-twingate.sh` installs ([minecraft-twingate.md](minecraft-twingate.md)). It shows the server's and the Connector's state live, follows the server log, and runs actions in an embedded terminal pane, the way [linutil](https://github.com/ChrisTitusTech/linutil) runs its scripts. It is only a front end. Anything that changes configuration still goes through the script as root, so the script's validation and safety checks stay the only ones.
+`minecraft-tui/` is a Rust [ratatui](https://ratatui.rs) program that controls the stack `scripts/minecraft-twingate/minecraft-twingate.sh` installs ([minecraft-twingate.md](minecraft-twingate.md)). It shows the server's and the Connector's state live, follows the server log, and runs actions in an embedded terminal pane, the way [linutil](https://github.com/ChrisTitusTech/linutil) runs its scripts. It is only a front end. Anything that changes configuration still goes through the script as root, so the script's validation and safety checks stay the only ones.
 
 ## Build and run
 

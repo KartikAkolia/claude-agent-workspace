@@ -2,7 +2,7 @@
 
 Status: **Fixed on `asus-vivobook` 2026-09-03** with symlinks from root's GTK config to `kartik`'s.
 A script audit on **2026-11-14** (finding SYS-1) found those symlinks let any code running as
-`kartik` choose a GTK module for root to load. `scripts/sync-root-gtk-theme.sh` was redesigned the
+`kartik` choose a GTK module for root to load. `scripts/gtk-root-theme/sync-root-gtk-theme.sh` was redesigned the
 same day and then simplified: it writes **root-owned, filtered copies of the appearance settings**
 (reading them with `kartik`'s own privileges) and **copies nothing else** — themes, icon themes and
 cursor themes are not copied, only noted for system-wide install (see "Current fix" below). It was run once as root on `asus-vivobook` on 2026-11-14 (see "Re-applying after the
@@ -86,7 +86,7 @@ newline, and more. So **root no longer copies anything from `kartik`'s home.** T
 writes is a filtered copy of the appearance *settings*; themes, icon themes and cursor themes stay
 where they are, and GTK uses them only if they're installed system-wide.
 
-`scripts/sync-root-gtk-theme.sh --apply` runs as root and:
+`scripts/gtk-root-theme/sync-root-gtk-theme.sh --apply` runs as root and:
 
 - **Reads every settings file as `kartik`, never as root.** The user is the one who invoked
   `pkexec` or `sudo` (`PKEXEC_UID`, then `SUDO_UID`), looked up in the passwd database, and their
@@ -161,8 +161,8 @@ when pasted.
 `--list`, `--set` and `--pick` work on `KARTIK_HOME` (default `/home/kartik`), not on `$HOME` or a passwd lookup, so another user has to set it, and `--set` refuses a file there that the caller doesn't own anyway. `--set` accepts only a name `--list` finds: a directory under `~/.themes`, `~/.local/share/themes`, `/usr/local/share/themes` or `/usr/share/themes` with a `gtk-2.0`, `gtk-3.0` or `gtk-4.0` subdirectory. That leaves out window-manager-only directories (Metacity or xfwm4), such as the `-hdpi`/`-xhdpi` siblings some theme packages ship. The file, or a symlinked dotfile's target, must also sit in a directory the user can write. Each file is rewritten through a temp file in its own directory, which gets the original's mode and owner before `mv` replaces the original, so a failure can't leave a half-written config and a `0644` file doesn't turn `0600` (SYS-4 in the [script audit](script-audit-2026-11-14.md)).
 
 ```bash
-pkexec /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --check
-pkexec /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --apply
+pkexec /home/kartik/claude-agent-workspace/scripts/gtk-root-theme/sync-root-gtk-theme.sh --check
+pkexec /home/kartik/claude-agent-workspace/scripts/gtk-root-theme/sync-root-gtk-theme.sh --apply
 ```
 
 `pkexec` needs the absolute path. Started as `kartik` without `pkexec`, the script re-runs itself
@@ -179,7 +179,7 @@ and run that instead (re-install after changing the repo copy):
 
 ```bash
 pkexec install -m 0755 -o root -g root \
-  /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh \
+  /home/kartik/claude-agent-workspace/scripts/gtk-root-theme/sync-root-gtk-theme.sh \
   /usr/local/sbin/sync-root-gtk-theme
 pkexec /usr/local/sbin/sync-root-gtk-theme --apply
 ```
@@ -235,7 +235,7 @@ hands only the disk work to a root helper.
   theme/icon/cursor prints no root command in any case (symlinked tree, in-tree absolute link,
   escaping link, clean tree). The Brother script exits `0`/`1`/`2` (verified/failed/
   unverified). `scripts/lib/tui.sh` is sourced only by `--pick` (guarded by
-  `scripts/test_tui_lib.py`), and the root-path `WARNING` fires only for a non-root-writable script.
+  `scripts/lib/test_tui_lib.py`), and the root-path `WARNING` fires only for a non-root-writable script.
 - **Not verified:** GParted's look after the new `--apply`, and `dell-optiplex`'s `/root`. On `asus-vivobook`, `/root` was checked and applied as root on 2026-11-14 (see the status at the top).
 
 ## Re-applying after the 2026-11-14 change
@@ -244,8 +244,8 @@ Run `--apply` once as root to replace whatever the old version left. Then check 
 reports no `UNSAFE` line, and relaunch GParted:
 
 ```bash
-pkexec /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --apply
-pkexec /home/kartik/claude-agent-workspace/scripts/sync-root-gtk-theme.sh --check
+pkexec /home/kartik/claude-agent-workspace/scripts/gtk-root-theme/sync-root-gtk-theme.sh --apply
+pkexec /home/kartik/claude-agent-workspace/scripts/gtk-root-theme/sync-root-gtk-theme.sh --check
 ```
 
 Both print the repo-copy trust `WARNING` described under "Trust" above. To avoid it, install the
@@ -268,7 +268,7 @@ distro has one, or as a reviewed copy into `/usr/local/share/themes` — for roo
 themes through XSETTINGS rather than `settings.ini`, which a `pkexec`-launched GParted still reads
 over X, so the two `settings.ini` sources don't exist on this host. `--check` reports those as
 `skip` rather than `DRIFT`. `sudo` has no TTY from a Claude Code shell, so the script was run
-whole as root in one call: `pkexec bash -c 'scripts/sync-root-gtk-theme.sh'` (absolute path).
+whole as root in one call: `pkexec bash -c 'scripts/gtk-root-theme/sync-root-gtk-theme.sh'` (absolute path).
 GParted confirmed themed by Kartik the same day (with the old symlink version; the new one needs
 re-running once, which also removes that `/root/.themes` link).
 

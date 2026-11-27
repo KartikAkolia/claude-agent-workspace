@@ -1,6 +1,6 @@
 # RSS stack on the Raspberry Pi 5
 
-`scripts/rss-stack.sh` installs and runs a self-hosted RSS reader with Docker Compose: FreshRSS as the reader, RSS-Bridge for sites without a feed, and an optional `cloudflared` container for a Cloudflare Tunnel. It targets Debian, Ubuntu and Raspberry Pi OS on amd64 or arm64. This doc records how it is installed on the Pi 5 (`ssh pi`, `192.168.0.166`, Debian forky/sid, arm64), how the script fits that host, and what is still open. The Pi itself is described in `docs/raspberry-pi-host-setup.md` and `docs/vaultwarden-pi-setup.md`.
+`scripts/rss-stack/rss-stack.sh` installs and runs a self-hosted RSS reader with Docker Compose: FreshRSS as the reader, RSS-Bridge for sites without a feed, and an optional `cloudflared` container for a Cloudflare Tunnel. It targets Debian, Ubuntu and Raspberry Pi OS on amd64 or arm64. This doc records how it is installed on the Pi 5 (`ssh pi`, `192.168.0.166`, Debian forky/sid, arm64), how the script fits that host, and what is still open. The Pi itself is described in `docs/raspberry-pi-host-setup.md` and `docs/vaultwarden-pi-setup.md`.
 
 ## Current state (verified 2026-11-15)
 
@@ -47,7 +47,7 @@ After the first install, change settings with `update` rather than `install`: bo
 
 **No Full-Text RSS.** The original plan included FiveFilters Full-Text RSS. Its only free image, `heussd/fivefilters-full-text-rss`, was archived on 2026-11-07; it runs end-of-life PHP 5, and its README warns of actively exploited remote-code-execution bugs and says to migrate away. FiveFilters publishes no official image. Kartik chose to drop it. For summary-only feeds, use FreshRSS's per-feed setting under **Advanced**: "Article CSS selector on original website".
 
-**`INTERNAL_HOST_ALLOWLIST`.** FreshRSS 1.30.0 added an SSRF guard that refuses feeds on private networks, which includes the Docker network RSS-Bridge sits on. The compose file sets `INTERNAL_HOST_ALLOWLIST: "rssbridge:80"`. When that variable is set it replaces the allowlist under *System configuration* entirely, so another internal source (RSSHub, say) has to be added to the compose heredoc in `scripts/rss-stack.sh`, not in the web UI.
+**`INTERNAL_HOST_ALLOWLIST`.** FreshRSS 1.30.0 added an SSRF guard that refuses feeds on private networks, which includes the Docker network RSS-Bridge sits on. The compose file sets `INTERNAL_HOST_ALLOWLIST: "rssbridge:80"`. When that variable is set it replaces the allowlist under *System configuration* entirely, so another internal source (RSSHub, say) has to be added to the compose heredoc in `scripts/rss-stack/rss-stack.sh`, not in the web UI.
 
 **`TRUSTED_PROXY` left unset.** The image's Apache config already trusts `X-Forwarded-For` from the private ranges, which covers `cloudflared` on the Docker network. Setting the variable would only widen which IPs FreshRSS trusts for `Remote-User` headers.
 

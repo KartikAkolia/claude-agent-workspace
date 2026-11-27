@@ -1,5 +1,5 @@
 //! minecraft-tui: a terminal front end for the Minecraft + Twingate stack. It shows the stack's
-//! state and runs actions; scripts/minecraft-twingate.sh stays the only thing that configures it.
+//! state and runs actions; scripts/minecraft-twingate/minecraft-twingate.sh stays the only thing that configures it.
 //! Docs: docs/minecraft-tui.md
 
 mod actions;
