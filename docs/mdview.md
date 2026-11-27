@@ -143,10 +143,13 @@ Measured on `asus-vivobook` (16 threads, Rust 1.100.0) on 2026-11-27, from `carg
 | --- | --- |
 | Cold dev build | 30.6 s |
 | Dev rebuild after an edit | 0.24 s |
-| Cold release build | 37.6 s (38.8 s with Phase 4) |
-| Release rebuild after an edit | 0.16 s (0.22 s with Phase 4) |
+| Cold release build | 34.2 s |
+| Release rebuild after an edit | 0.25 s |
+| Cold `dist` build (LTO, one codegen unit) | 44.2 s |
 
-The release binary is 967,856 bytes, 1,305,104 with Phase 4, which added no crate. Nearly all the cold time is gtk-rs's serial chain (glib, gio, pango, gdk4, gsk4, gtk4); none of it can be trimmed from this side, as the plan's Non-functional section records.
+The release profile optimises for size (`opt-level = "s"`) and aborts on panic. Measured on 2026-11-27 with Phase 4 in, that took the release binary from 1,309,176 bytes to 1,073,336, and the `dist` binary from 1,129,352 to 938,560, with no cost to the cold build and a rebuild 0.03 s slower. Rendering all of `docs/archival.md` (160,663 characters) went from 0.54 ms to 0.79 ms, still far inside a frame; GTK's own drawing is in its C libraries and unaffected. A panic inside a GTK callback aborts anyway; the setting only changes the thread-pool jobs (the autosave write, the recovered-file check and a folder sync), whose panic now ends the app (the last written copy, if any, reopens at the next start). Before, an autosave write's panic showed "Autosave failed" and the other two were ignored. Phase 3's release binary, with the default profile, was 967,856 bytes.
+
+Nearly all the cold time is gtk-rs's serial chain (glib, gio, pango, gdk4, gsk4, gtk4); none of it can be trimmed from this side, as the plan's Non-functional section records.
 
 ## Checks
 

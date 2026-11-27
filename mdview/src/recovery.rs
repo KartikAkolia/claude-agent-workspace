@@ -425,17 +425,10 @@ fn scan(dir: &Path) -> Startup {
         }
     }
     // Moves first; any failure leaves every copy not yet moved for a later start.
-    let failed_dir = dir.join("failed");
     let mut moved = 0;
     let unmoved = |moved: usize| keep.len() + fail.len() - moved;
     for uuid in &fail {
-        let name = format!("{uuid}.md");
-        let result = DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&failed_dir)
-            .and_then(|()| fs::rename(dir.join(&name), failed_dir.join(&name)));
-        if let Err(e) = result {
+        if let Err(e) = move_to_failed(dir, uuid) {
             return left(
                 format!("a copy can't be moved aside: {e}"),
                 unmoved(moved),
@@ -550,7 +543,8 @@ pub fn new_slot(attempts: u8) -> SlotRef {
     }))
 }
 
-/// A panicked writer must not take the app down with it.
+/// A writer that panicked must not poison the slot for the window: in a debug build, where a
+/// panic unwinds; a release build aborts on panic (Cargo.toml).
 fn guard(slot: &SlotRef) -> MutexGuard<'_, Slot> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -584,8 +578,9 @@ pub fn begin(slot: &SlotRef, dir: &Path, uuid: &str, bytes: Vec<u8>) -> Option<J
 
 /// Runs a write on the pool: its own `.tmp`, `0600`, synced; then, under the slot mutex, the
 /// current attempts digit stamped in and the rename, unless a delete or close came meanwhile;
-/// then the folder synced with the mutex released.
-pub fn run(job: Job) -> Result<(), String> {
+/// then the folder synced with the mutex released. True if the copy landed, false if a delete
+/// or close dropped it.
+pub fn run(job: Job) -> Result<bool, String> {
     let tmp = job.dir.join(format!("{}.{}.tmp", job.uuid, job.n));
     let target = job.dir.join(format!("{}.md", job.uuid));
     let written = (|| -> io::Result<()> {
@@ -615,12 +610,16 @@ pub fn run(job: Job) -> Result<(), String> {
         }
     };
     match landed {
-        Some(Ok(())) => sync_folder(&job.dir).map_err(|e| e.to_string()),
+        Some(Ok(())) => sync_folder(&job.dir)
+            .map(|()| true)
+            .map_err(|e| e.to_string()),
         Some(Err(e)) => {
             let _ = fs::remove_file(&tmp);
             Err(e.to_string())
         }
-        None => remove_if_present(&tmp).map_err(|e| e.to_string()),
+        None => remove_if_present(&tmp)
+            .map(|()| false)
+            .map_err(|e| e.to_string()),
     }
 }
 
@@ -642,9 +641,9 @@ pub fn delete(slot: &SlotRef, dir: &Path, uuid: &str, final_: bool) -> Result<()
     result.map_err(|e| e.to_string())
 }
 
-/// Moves a copy to `failed/`, for a recovered text a text buffer couldn't hold exactly; no
-/// window exists for it yet. If the move fails the copy stays, for a later start.
-pub fn set_aside(dir: &Path, uuid: &str) -> io::Result<()> {
+/// Moves a copy to `failed/`, making that folder (`0700`) if need be. If the move fails the
+/// copy stays where it is, for a later start.
+pub fn move_to_failed(dir: &Path, uuid: &str) -> io::Result<()> {
     let failed = dir.join("failed");
     let name = format!("{uuid}.md");
     DirBuilder::new()

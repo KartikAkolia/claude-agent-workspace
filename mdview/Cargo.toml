@@ -24,9 +24,16 @@ debug = "line-tables-only"
 debug = false
 
 # Everyday release builds: Cargo's default codegen units and crate-local LTO, kept incremental.
+# Optimised for size and aborting on panic: 18% smaller (1.31 MB to 1.07 MB) with no cold-build
+# cost, and rendering stays well under a frame (docs/mdview.md "Build time"). A panic inside a
+# GTK callback aborts anyway; abort only changes the thread-pool jobs (the autosave write, the
+# recovered-file check and a folder sync), whose panic now ends the app instead of being caught
+# (an autosave write's showed "Autosave failed"; the last written copy reopens next start).
 [profile.release]
 incremental = true
 strip = true
+opt-level = "s"
+panic = "abort"
 
 # The smallest binary, for handing out: cargo build --profile dist (lands in target/dist/).
 [profile.dist]
