@@ -55,7 +55,7 @@ The one list of ChrisTitusTech's read-only mirrors. `list-lint-files.sh` is its 
 - a dir, or an `owner/repo` compared case-insensitively, is listed twice;
 - a mirror's owner isn't on an `@owners` line.
 
-The naming and owner rules exist because `refresh-reference-clone.sh` runs `rsync --delete` into the dir: a mistaken line naming `docs` or another project directory can't pass them, and trusting a new owner takes a separate, deliberate edit to `@owners`. Check the file with `./list-lint-files.sh --reference-clones`. Adding or renaming a mirror is an edit here, and all four lint workflows re-run on a change to it.
+The naming and owner rules exist because `refresh-reference-clone.sh` runs `rsync --delete` into the dir: a mistaken line naming `docs` or another project directory can't pass them, and trusting a new owner takes a separate, deliberate edit to `@owners`. Check the file with `./list-lint-files.sh --reference-clones`. Adding or renaming a mirror is an edit here, and the four list-based lint workflows (all but `lint-rust.yml`) re-run on a change to it.
 
 ## `.lint-versions`
 
@@ -166,12 +166,13 @@ The inner run works in the export, with `GIT_WORK_TREE` set to it and `GIT_OPTIO
 6. `validate-config.sh` checks the config files.
 7. The shell step runs the sync step first. That's the one step that works on the working tree, and the only thing the hook ever writes: the index's `lint-versions.sh` with `LINT_VERSIONS_DIR` set to the real checkout, `LINT_VERSIONS_MODE=sync`, and `GIT_WORK_TREE` unset so git sees the real checkout as the work tree. Then `LINT_VERSIONS_MODE=index ./lint-bash.sh` lints the staged shell scripts with the versions this commit gives CI.
 8. `LINT_VERSIONS_MODE=index ./lint-python.sh` lints the staged `.py` files, and runs with no files too when ruff changed.
+9. When the commit adds, changes, deletes or renames anything under `minecraft-tui/` (found with `git diff --cached --quiet -- minecraft-tui`, whose pathspec also catches a file renamed out), unless it removes the crate entirely, `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` run in the export's copy of the crate, with `CARGO_TARGET_DIR` set to the real checkout's `minecraft-tui/target` so the dependencies don't rebuild every time. A missing `cargo` fails the commit.
 
-Every step runs even after an earlier one fails, and any failure fails the commit. A setup failure (a git error, a file list that can't be built) fails it too, and skips the remaining version checks so a git error isn't repeated for every tool. The hook doesn't run the `unittest` suites; only CI does.
+Every step runs even after an earlier one fails, and any failure fails the commit. A setup failure (a git error, a file list that can't be built) fails it too, and skips the remaining version checks so a git error isn't repeated for every tool. The hook doesn't run the `unittest` suites or `cargo test`; only CI does.
 
 ## CI workflows
 
-All five workflows run on `ubuntu-latest` and pin every action by commit SHA, with its tag in a trailing comment (TOOL-13). The four lint workflows set `defaults.run.shell: bash`, so each step runs under `bash -eo pipefail` rather than GitHub's default `bash -e`, and each reads its file list NUL-separated from `./list-lint-files.sh -z <category>` through a file, so a lister failure or an empty list fails the step (TOOL-4). None of them is a required check; see `SPEC.md`'s Testing & CI section.
+All six workflows run on `ubuntu-latest` and pin every action by commit SHA, with its tag in a trailing comment (TOOL-13). The five lint workflows set `defaults.run.shell: bash`, so each step runs under `bash -eo pipefail` rather than GitHub's default `bash -e`. The four list-based ones (all but `lint-rust.yml`, which lints its one crate) each read their file list NUL-separated from `./list-lint-files.sh -z <category>` through a file, so a lister failure or an empty list fails the step (TOOL-4). None of them is a required check; see `SPEC.md`'s Testing & CI section.
 
 | Workflow | Triggered by | Runs |
 | --- | --- | --- |
@@ -179,6 +180,7 @@ All five workflows run on `ubuntu-latest` and pin every action by commit SHA, wi
 | `lint-config.yml` | `**.json`, `**.yml`, `**.yaml`, `validate-config.sh`, `list-lint-files.sh`, `reference-clones.tsv`, itself | `validate-config.sh` over every config file |
 | `lint-bash.yml` | `**.sh`, the extensionless shell scripts by name, the test files it runs plus `scripts/device-power-saving-config.py`, `.lint-versions`, `reference-clones.tsv`, itself | `LINT_VERSIONS_MODE=strict ./lint-bash.sh` over every shell script, then the `unittest` suites `scripts/test_install_fedora.py`, `scripts/minecraft-fabric/test_install.py`, `scripts/test_tui_lib.py` and `scripts/test_device_power_saving.py` |
 | `lint-python.yml` | `**.py`, `lint-python.sh`, `list-lint-files.sh`, `reference-clones.tsv`, `lint-versions.sh`, `.lint-versions`, itself | `./lint-python.sh` over every `.py` file (unset mode, so the checkout's ruff line), then `uv run -q --script scripts/test_sync_docs_to_trilium.py -v` |
+| `lint-rust.yml` | `minecraft-tui/**`, itself | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` in `minecraft-tui/`, on Rust 1.100.0 (`RUSTUP_TOOLCHAIN`, installed with rustup), pinned so a new clippy lint can't fail an unrelated change; bump it with the local Rust |
 | `gitleaks.yml` | every push and pull request | `gitleaks/gitleaks-action` secret scanning, with the full history checked out (`fetch-depth: 0`); no `GITLEAKS_LICENSE`, which only organisation-owned repos need |
 
 A path filter sees paths, not file contents, so `lint-bash.yml` names the shell scripts that have no `.sh` extension one by one: `.githooks/pre-commit`, `.claude/skills/quickshell/scripts/quickshell-qmllint`, `scripts/xppen-tablet/xppentablet` and `scripts/xppen-tablet/xppen-tablet.install`. A new one needs adding there, and to `.gitattributes` to pin it to LF (TOOL-7).
