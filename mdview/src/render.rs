@@ -263,7 +263,9 @@ impl Builder {
                     ..
                 } => {
                     let url = link_url(link_type, &dest_url);
-                    let open = format!("<a href=\"{}\">", escape(&url));
+                    // The title is the label's tooltip for the link, as the text's links have.
+                    let url = escape(&url);
+                    let open = format!("<a href=\"{url}\" title=\"{url}\">");
                     t.cell.push_str(&open);
                     t.closers.push("</a>");
                 }
@@ -733,7 +735,10 @@ mod tests {
         assert_eq!(table.rows[0], ["a &lt; b", "<b>c</b>"]);
         assert_eq!(
             table.rows[1],
-            ["<tt>x&amp;y</tt>", "<a href=\"u?a=&quot;1&quot;\">l</a>"]
+            [
+                "<tt>x&amp;y</tt>",
+                "<a href=\"u?a=&quot;1&quot;\" title=\"u?a=&quot;1&quot;\">l</a>"
+            ]
         );
     }
 
@@ -840,7 +845,7 @@ mod tests {
         let r = render("| <a@b.org> |\n|---|\n");
         assert_eq!(
             r.tables[0].table.rows[0],
-            ["<a href=\"mailto:a@b.org\">a@b.org</a>"]
+            ["<a href=\"mailto:a@b.org\" title=\"mailto:a@b.org\">a@b.org</a>"]
         );
     }
 

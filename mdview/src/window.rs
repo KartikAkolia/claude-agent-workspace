@@ -95,10 +95,16 @@ pub fn zoom(step: i32) {
         })
         .clone()
     });
-    provider.load_from_string(&format!(
-        "textview.md-view, textview.md-editor {{ font-size: {}%; }}",
-        ZOOM_STEPS[index]
-    ));
+    // At the default there is no rule at all, so a theme's own text size applies again.
+    let css = if index == ZOOM_DEFAULT {
+        String::new()
+    } else {
+        format!(
+            "textview.md-view, textview.md-editor {{ font-size: {}%; }}",
+            ZOOM_STEPS[index]
+        )
+    };
+    provider.load_from_string(&css);
     WINDOWS.with_borrow(|ws| ws.iter().for_each(Win::refit_after_restyle));
 }
 
@@ -155,6 +161,8 @@ struct Win {
     /// The word count, recounted when idle after an edit.
     words: Cell<usize>,
     counting: Cell<bool>,
+    /// A rebuild for a zoom is waiting for its frame.
+    refit_pending: Cell<bool>,
 }
 
 /// The status line under the text: the file's folder, then whether it is modified, the line
@@ -287,6 +295,7 @@ impl Win {
             status,
             words: Cell::new(0),
             counting: Cell::new(false),
+            refit_pending: Cell::new(false),
         });
         win.connect_actions();
         win.connect_editor();
@@ -734,7 +743,19 @@ impl Win {
             .and_then(|f| f.parent())
             .and_then(|f| f.path());
         match link::resolve(href, folder.as_deref()) {
-            Target::Markdown(path) => self.open_here(gio::File::for_path(path)),
+            Target::Markdown(path) => {
+                let target = gio::File::for_path(path);
+                // A link to this same document (`README.md#usage` inside README.md) is an
+                // in-page jump, which does nothing, as `#usage` alone does.
+                let here = self
+                    .file
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|f| same_file(f, &target));
+                if !here {
+                    self.open_here(target);
+                }
+            }
             Target::External(uri) => {
                 let launcher = gtk::UriLauncher::new(&uri);
                 let weak = Rc::downgrade(self);
@@ -884,6 +905,7 @@ impl Win {
         win.stack.set_visible_child_name("edit");
         win.edit_action.set_state(&true.to_variant());
         win.editor.grab_focus();
+        win.update_status();
     }
 
     fn update_title(&self) {
@@ -901,13 +923,24 @@ impl Win {
         if self.counting.replace(true) {
             return;
         }
+        self.count_after_pause(self.edits.get());
+    }
+
+    /// Counts once 300 ms pass with no edit: a timer that, finding more edits since it was set,
+    /// sets itself again rather than counting between keystrokes.
+    fn count_after_pause(self: &Rc<Self>, edits: u64) {
         let weak = Rc::downgrade(self);
-        glib::idle_add_local_once(move || {
-            if let Some(win) = weak.upgrade() {
-                win.counting.set(false);
-                win.words.set(render::word_count(&win.source_text()));
-                win.update_status();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if win.edits.get() != edits {
+                win.count_after_pause(win.edits.get());
+                return;
             }
+            win.counting.set(false);
+            win.words.set(render::word_count(&win.source_text()));
+            win.update_status();
         });
     }
 
@@ -941,6 +974,10 @@ impl Win {
     /// measurements (column, indents, tables) come from that font, so it is rebuilt a frame
     /// later, keeping the place.
     fn refit_after_restyle(self: &Rc<Self>) {
+        // Several zoom steps before the next frame need only one rebuild, at the final size.
+        if self.refit_pending.replace(true) {
+            return;
+        }
         let weak = Rc::downgrade(self);
         let frames = Cell::new(0);
         self.window.add_tick_callback(move |_, _| {
@@ -949,6 +986,7 @@ impl Win {
                 return glib::ControlFlow::Continue;
             }
             if let Some(win) = weak.upgrade() {
+                win.refit_pending.set(false);
                 win.stale.set(true);
                 if win.editing() {
                     win.fit_editor_margins();
@@ -956,6 +994,9 @@ impl Win {
                     let line = win.top_line();
                     win.show_view();
                     win.scroll_view_to(line);
+                    if win.bar.is_open() {
+                        win.run_find(true, true);
+                    }
                 }
             }
             glib::ControlFlow::Break
@@ -1279,6 +1320,7 @@ impl Win {
         }
         self.stack.set_visible_child_name("view");
         self.edit_action.set_state(&false.to_variant());
+        self.update_status();
     }
 
     /// The source line at the top of whichever view is showing.
