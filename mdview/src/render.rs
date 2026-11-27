@@ -146,6 +146,9 @@ struct Builder {
     /// The next number of each open list, or `None` for a bullet list.
     lists: Vec<Option<u64>>,
     quotes: usize,
+    /// `quotes` when each open list item started, so a paragraph can tell whether its nearest
+    /// container is the item (a loose list) or a quote inside it.
+    item_quotes: Vec<usize>,
     /// A list item's marker, written with the item's first text, so a task box can replace it.
     marker: Option<(String, Style)>,
     /// Code, HTML or front matter being collected, so its trailing newline can be dropped.
@@ -176,7 +179,7 @@ impl Builder {
                 let start = self.len;
                 self.push(RULE);
                 self.span(start, Style::Rule);
-                self.gap = 2;
+                self.gap = self.block_gap();
             }
             Event::TaskListMarker(done) => {
                 let task = TASK_BOXES[usize::from(done)].to_owned();
@@ -210,9 +213,10 @@ impl Builder {
         }
         match tag {
             Tag::Paragraph => {
-                // Tight lists have no paragraphs, so one inside a list that isn't its item's first
-                // block (whose marker would still be pending) is in a loose list: blank line.
-                if !self.lists.is_empty() && self.marker.is_none() {
+                // Tight lists have no paragraphs, so one directly in a list item that isn't the
+                // item's first block (whose marker would still be pending) is in a loose list:
+                // blank line. A quote's paragraphs don't count: a quote always has them.
+                if self.marker.is_none() && self.item_quotes.last() == Some(&self.quotes) {
                     self.gap = self.gap.max(2);
                 }
                 self.begin_block();
@@ -238,6 +242,7 @@ impl Builder {
             }
             Tag::Item => {
                 self.begin_block();
+                self.item_quotes.push(self.quotes);
                 let depth = self.lists.len();
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
@@ -312,7 +317,7 @@ impl Builder {
                         self.out.tables.push(anchor);
                         self.append(&ANCHOR.to_string());
                     }
-                    self.gap = 2;
+                    self.gap = self.block_gap();
                 }
                 _ => {}
             }
@@ -322,19 +327,19 @@ impl Builder {
             TagEnd::Paragraph => self.gap = self.gap.max(2),
             TagEnd::Heading(_) => {
                 self.close();
-                self.gap = 2;
+                self.gap = self.block_gap();
             }
             TagEnd::BlockQuote(_) => {
                 self.close(); // Indent
                 self.close(); // Quote
                 self.quotes = self.quotes.saturating_sub(1);
-                self.gap = 2;
+                self.gap = self.block_gap();
             }
             TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) => {
                 let raw = self.raw.take().unwrap_or_default();
                 self.push(raw.trim_end_matches(['\n', '\r']));
                 self.close();
-                self.gap = 2;
+                self.gap = self.block_gap();
             }
             TagEnd::List(_) => {
                 self.lists.pop();
@@ -342,6 +347,7 @@ impl Builder {
                 self.gap = self.gap.max(if self.lists.is_empty() { 2 } else { 1 });
             }
             TagEnd::Item => {
+                self.item_quotes.pop();
                 // An item with no content still shows its marker.
                 if self.marker.is_some() {
                     self.push("");
@@ -420,8 +426,6 @@ impl Builder {
         self.pay_gap();
     }
 
-    /// Ends the text with `gap` newlines, counting those already there, so nested block starts
-    /// (a list, then its first item) don't stack up blank lines.
     /// A block other than a paragraph: an item's marker can't wait for this block's text (a
     /// nested item would replace it, a table has none, a code block would style it), so it is
     /// written first, on its own line.
@@ -432,6 +436,8 @@ impl Builder {
         self.begin_block();
     }
 
+    /// Ends the text with `gap` newlines, counting those already there, so nested block starts
+    /// (a list, then its first item) don't stack up blank lines.
     fn pay_gap(&mut self) {
         if self.started {
             for _ in self.newlines..self.gap {
@@ -439,6 +445,12 @@ impl Builder {
             }
         }
         self.gap = 0;
+    }
+
+    /// What a block other than a paragraph leaves before the next one: a blank line, or just a
+    /// line break inside a list, which a code block or heading in an item mustn't loosen.
+    fn block_gap(&self) -> usize {
+        if self.lists.is_empty() { 2 } else { 1 }
     }
 
     fn begin_raw(&mut self, style: Style) {
@@ -714,6 +726,14 @@ mod tests {
     #[test]
     fn loose_nested_list_keeps_its_blank_line() {
         assert_eq!(render("- a\n\n  - b\n\n  c\n").text, "• a\n\n◦ b\n\nc");
+    }
+
+    #[test]
+    fn blocks_inside_a_tight_list_keep_it_tight() {
+        assert_eq!(render("- > q\n").text, "• \nq");
+        assert_eq!(render("- a\n  > q\n").text, "• a\nq");
+        assert_eq!(render("- ```\n  x\n  ```\n- y\n").text, "• \nx\n• y");
+        assert_eq!(render("- # H\n  text\n").text, "• \nH\ntext");
     }
 
     #[test]

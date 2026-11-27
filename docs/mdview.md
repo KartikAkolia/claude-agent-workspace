@@ -72,7 +72,7 @@ The release binary is 967,856 bytes. Nearly all the cold time is gtk-rs's serial
 
 ## Checks
 
-`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (28 unit tests, in `render.rs` and `file.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
+`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (29 unit tests, in `render.rs` and `file.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
 
 Phase 1 manual check on `asus-vivobook`, KDE Plasma on Wayland, 2026-11-27, all passed:
 

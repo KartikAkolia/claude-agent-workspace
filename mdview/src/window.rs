@@ -40,7 +40,7 @@ pub fn open(app: &gtk::Application, file: gio::File) {
 
 /// The window showing `file`, or loading it, so a file opened twice quickly gets one window.
 fn showing(file: &gio::File) -> Option<Rc<Win>> {
-    let is = |f: &Option<gio::File>| f.as_ref().is_some_and(|f| f.equal(file));
+    let is = |f: &Option<gio::File>| f.as_ref().is_some_and(|f| same_file(f, file));
     WINDOWS.with_borrow(|ws| {
         ws.iter()
             .find(|w| is(&w.file.borrow()) || is(&w.pending.borrow()))
@@ -309,7 +309,9 @@ impl Win {
             column.set_right_margin(margin);
         }
         for (tag, offset) in &layout.indents {
-            tag.set_left_margin(margin + offset);
+            // A long number's marker can hang out past a narrow margin; GTK's margin can't go
+            // below zero (and glib panics on an out-of-range property).
+            tag.set_left_margin((margin + offset).max(0));
         }
         // TextView gives an anchored widget its minimum size, and both are wrong for a table:
         // a horizontal scroller's minimum width is near zero, and the grid's minimum height is
@@ -377,8 +379,11 @@ fn fill(view: &gtk::TextView, r: &Rendered, theme: &Theme) -> Layout {
     let mut anchors = Vec::new();
     for anchor in r.tables.iter().rev() {
         let mut at = buffer.iter_at_offset(offset(anchor.offset));
-        let mut next = at;
-        if next.forward_char() && at.char() == ANCHOR {
+        // forward_char reports false on reaching the end, so its result isn't the test: a table
+        // that ends the document has its placeholder as the last character.
+        if at.char() == ANCHOR {
+            let mut next = at;
+            next.forward_char();
             buffer.delete(&mut at, &mut next);
         }
         anchors.push((buffer.create_child_anchor(&mut at), anchor));
@@ -557,6 +562,13 @@ fn sentence(reason: &str) -> String {
     let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
     let end = if reason.ends_with('.') { "" } else { "." };
     format!("{}{}{end}", first.unwrap_or_default(), chars.as_str())
+}
+
+/// Whether two files are the same one, through symlinks and `..` as well (`File::equal` only
+/// compares URIs). Resolving a local path is a quick stat.
+fn same_file(a: &gio::File, b: &gio::File) -> bool {
+    let real = |f: &gio::File| f.path().and_then(|p| std::fs::canonicalize(p).ok());
+    a.equal(b) || real(a).is_some_and(|ra| real(b).is_some_and(|rb| ra == rb))
 }
 
 fn display_name(file: &gio::File) -> String {
