@@ -2,6 +2,7 @@
 //! the design; docs/mdview.md has usage.
 
 mod file;
+mod find;
 mod render;
 mod window;
 
@@ -44,15 +45,31 @@ fn startup(app: &gtk::Application) {
         );
     }
 
+    // Quit asks about each window's unsaved work first (window::quit).
     let quit = gio::SimpleAction::new("quit", None);
     let weak = app.downgrade();
     quit.connect_activate(move |_, _| {
         if let Some(app) = weak.upgrade() {
-            app.quit();
+            window::quit(&app);
         }
     });
     app.add_action(&quit);
-    app.set_accels_for_action("app.quit", &["<Control>q"]);
-    app.set_accels_for_action("win.open", &["<Control>o"]);
-    app.set_accels_for_action("win.close", &["<Control>w"]);
+    // Undo, redo, cut, copy, paste and select all are the TextView's own bindings.
+    let accels: [(&str, &[&str]); 12] = [
+        ("app.quit", &["<Control>q"]),
+        ("win.new", &["<Control>n"]),
+        ("win.open", &["<Control>o"]),
+        ("win.save", &["<Control>s"]),
+        ("win.save-as", &["<Control><Shift>s"]),
+        ("win.close", &["<Control>w"]),
+        ("win.edit", &["<Control>e"]),
+        ("win.find", &["<Control>f"]),
+        ("win.replace", &["<Control>h"]),
+        ("win.goto", &["<Control>l"]),
+        ("win.find-next", &["F3"]),
+        ("win.find-previous", &["<Shift>F3"]),
+    ];
+    for (action, keys) in accels {
+        app.set_accels_for_action(action, keys);
+    }
 }

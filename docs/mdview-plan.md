@@ -1,6 +1,6 @@
 # mdview plan
 
-Status, 2026-11-27: Phase 1, the viewer, is built and checked; Phases 2 and 3 and autosave are not started. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
+Status, 2026-11-27: Phases 1 and 2, the viewer and the editor, are built and checked; Phase 3 and autosave are not started. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
 
 mdview is a small native Markdown viewer and editor for Kartik's CachyOS laptop (`asus-vivobook`, KDE Plasma on Wayland). It opens on the rendered document, Ctrl+E flips the same window to the source, and it does the basic jobs of an ordinary text editor for Markdown files and nothing else. It draws with plain GTK4, so it takes on the system GTK theme (Nordic, Papirus-Dark, Noto Sans) and carries no colours of its own.
 
@@ -76,14 +76,15 @@ Autosave and crash recovery come after Phase 3 (Kartik, 2026-11-27: "This can be
 
 ## Shape
 
-One binary crate, `mdview/`, in four modules.
+One binary crate, `mdview/`, in five modules (`find.rs` was split out of `window.rs` in Phase 2).
 
 | Module | Owns |
 | --- | --- |
 | `main.rs` | `gtk::Application` (`HANDLES_OPEN`), the app's actions and accelerators, the Quit sequence across windows, and loading `style.css` |
 | `render.rs` | A pure function, no GTK, from Markdown to the rendered text, the styled character ranges and the anchored tables (Phase 2 adds a source line per block). It carries most of the unit tests. |
 | `file.rs` | The pre-read checks, load and save through `gio::File`, the conflict check and the `FileMonitor` |
-| `window.rs` | The `ApplicationWindow`, header bar, filling the view's `TextBuffer` from `render.rs`'s output, the `Stack` of view and edit `TextView`s, the shared find, replace and go-to-line bar, the status line, the changed-on-disk bar and the dialogs |
+| `find.rs` | The find, replace and go-to-line bar's widgets, and the search, replace and go-to-line functions over a `TextView` |
+| `window.rs` | The `ApplicationWindow`, header bar, filling the view's `TextBuffer` from `render.rs`'s output, the `Stack` of view and edit `TextView`s, wiring the find bar, the status line, the changed-on-disk bar and the dialogs |
 
 App id `io.github.kartikakolia.mdview`: a bare `mdview` fails `Gio.Application.id_is_valid`. The desktop file is `data/io.github.kartikakolia.mdview.desktop`, because KDE on Wayland matches a window to its desktop entry by app id. Debug builds use the id with `.Devel` appended, so a `cargo run` doesn't hand its files over D-Bus to an installed copy that's running.
 
@@ -104,7 +105,7 @@ One `TextView` per mode means one find bar and one zoom rule for both, and selec
 
 ### Editor
 
-A `TextView` in monospace with word-and-character wrap and the buffer's own undo stack (on by default, 200 levels). Find uses `TextIter::forward_search` and `backward_search` (with `CASE_INSENSITIVE` unless match case is on), and shows the current match by selecting it, so the highlight is the theme's own selection colour. Replace all runs between `begin_user_action` and `end_user_action`, so a single undo reverts it. The window's file `DropTarget` (`gdk::FileList`) runs in the capture phase, so a file dropped in edit mode opens instead of being pasted as a path by the `TextView`'s own drop handler.
+A `TextView` in monospace with word-and-character wrap and the buffer's own undo stack (on by default, 200 levels). Find uses `TextIter::forward_search` and `backward_search` (with `CASE_INSENSITIVE` unless match case is on), and shows the current match by selecting it. As built, the match is also marked with a tag in the theme's selection colours (`theme_selected_bg_color` and `theme_selected_fg_color`, read through probe widgets): a `TextView` only draws its selection while it has focus, and during a search the focus is in the find field. Replace all runs between `begin_user_action` and `end_user_action`, so a single undo reverts it. The window's file `DropTarget` (`gdk::FileList`) runs in the capture phase, so a file dropped in edit mode opens instead of being pasted as a path by the `TextView`'s own drop handler.
 
 ### Saving (`file.rs`)
 
@@ -141,7 +142,8 @@ Three PRs for the foundations, then autosave. Each ends with fmt, clippy and the
    - The tests cover each block type, the three GFM extensions, front matter, raw and inline HTML staying literal, the BOM skip, and tables' anchors and markup escaping. Source-line numbers moved to Phase 2, where the Ctrl+E scroll mapping is their only user.
    - Exit: the window visibly uses Nordic, and every `style.css` colour resolves; `AGENTS.md`, `docs/archival.md` and a table-heavy doc render correctly with no stall; a FIFO, a `/dev/zero` symlink, a NUL file and a non-UTF-8 file are each refused; cold and incremental build times are recorded. All met; [mdview.md](mdview.md) has the evidence.
 2. **Editor.** The Ctrl+E toggle with the scroll mapping and the source-line numbers it needs; New, Save and Save As; the unsaved-work prompts, including the Quit sequence and the load-then-prompt-then-swap order; the conflict check and the `FileMonitor`; and find, replace and go to line.
-   - Exit: an edit-save round trip leaves the bytes identical except for the edit (`cmp`); an outside edit is caught, the mtime-restoring kind included; Quit with two modified windows prompts twice.
+   - Exit: an edit-save round trip leaves the bytes identical except for the edit (`cmp`); an outside edit is caught, the mtime-restoring kind included; Quit with two modified windows prompts twice. All met on 2026-11-27, through the app's own actions over D-Bus with scripted prompt answers, since synthesised keystrokes don't reach Wayland windows; [mdview.md](mdview.md) has the evidence and what still needs a hand check.
+   - Found while building it: the top line for the Ctrl+E mapping has to come from `TextView::line_at_y`, because the view's top-left corner is in the margin, where `iter_at_location` finds no text; and the dialogs' buttons have mnemonics (Alt+D for Discard and so on).
 3. **Finish.** Zoom, F11, the status line, link handling, the desktop entry, install steps and the usage doc with its manual checklist.
    - Exit: the checklist passes, and mdview launches from the KDE menu and from Dolphin's "Open with".
 4. **Autosave and crash recovery.** Added at Kartik's request on 2026-11-27, after the foundations. To be designed then; it is the one place mdview would write anywhere but the file being edited.

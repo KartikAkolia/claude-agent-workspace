@@ -1,8 +1,8 @@
 # mdview
 
-mdview is a small GTK4 Markdown viewer, written in Rust, that takes on the system GTK theme (Nordic, Papirus-Dark and Noto Sans on `asus-vivobook`). It lives in `mdview/`. The design, the decisions behind it and the pitfalls the skeptic reviews found are in [mdview-plan.md](mdview-plan.md); read that before changing it.
+mdview is a small GTK4 Markdown viewer and editor, written in Rust, that takes on the system GTK theme (Nordic, Papirus-Dark and Noto Sans on `asus-vivobook`). It lives in `mdview/`. The design, the decisions behind it and the pitfalls the skeptic reviews found are in [mdview-plan.md](mdview-plan.md); read that before changing it.
 
-Status, 2026-11-27: Phase 1 (the viewer) is built and checked on `asus-vivobook`. Editing, saving and find come in Phase 2, links and the desktop entry in Phase 3, and autosave after that.
+Status, 2026-11-27: Phases 1 and 2 (the viewer and the editor) are built and checked on `asus-vivobook`. Links, zoom, the status line and the desktop entry come in Phase 3, and autosave after that.
 
 ## Build and run
 
@@ -22,9 +22,21 @@ The release build's app id is `io.github.kartikakolia.mdview`, and a debug build
 | Key or action | Does |
 | --- | --- |
 | Ctrl+O, or the header bar's open button | Open a Markdown file in this window, through the desktop's file dialog |
-| Drop a file on the window | Open it in this window |
+| Drop a file on the window | Open it in this window (several files: the first here, the rest in windows of their own) |
+| Ctrl+N | New document: in this window if it is empty, else in a new one |
+| Ctrl+E, or the pencil button | Switch between the rendered view and the source, keeping the place |
+| Ctrl+S, or the save button | Save (a new document asks for a name) |
+| Ctrl+Shift+S | Save As |
+| Ctrl+F, F3, Shift+F3 | Find, next, previous (Enter and Shift+Enter in the field too); works in both views |
+| Ctrl+H | Replace and Replace All, in the source |
+| Ctrl+L | Go to line, in the source |
+| Esc | Close the find bar |
+| Ctrl+Z, Ctrl+Shift+Z, Ctrl+X/C/V/A | Undo, redo, cut, copy, paste, select all (the text view's own) |
+| Tab | Four spaces, in the source |
 | Ctrl+W | Close the window |
 | Ctrl+Q | Quit |
+
+The menu (the header bar's last button) has New, Open, Save As, Find, Replace, Go to Line, Word Wrap and Quit.
 
 Only `.md` and `.markdown` files open, in any case (`README.MD` too). mdview refuses, with a dialog naming the reason, anything that:
 
@@ -35,13 +47,25 @@ Only `.md` and `.markdown` files open, in any case (`README.MD` too). mdview ref
 
 A refused file never replaces the document already showing.
 
+## Editing and saving
+
+The window opens on the rendered document; Ctrl+E shows the source, the exact text that is saved, and back. Switching keeps the source line at the top of the view, and the view is only re-rendered when it is shown after an edit. A modified document has a dot before its name in the title.
+
+Unsaved work is never lost silently. Closing a window, quitting, opening another file over it, or dropping one on it asks Save, Discard or Cancel; quit asks each window in turn and stops at the first Cancel. A file being opened is read and checked before that prompt, so one that fails to open costs nothing.
+
+Saving writes the text byte for byte, line endings included. Before writing, mdview re-reads the file and compares it with what it last read or wrote (a hash of the bytes, because the etag is only the modification time), and writes with that etag. If anything else changed the file, it asks: Overwrite, or Cancel and use Save As. Save As adds `.md` to a name without an extension, refuses any other extension, and asks before replacing an existing file the file dialog didn't ask about. A save that fails says why; where gio rewrites a file in place (a symlink, a hard link, a file in a read-only folder), it also warns the file may be incomplete.
+
+While a document is open, mdview watches its file. A change from outside reloads a document with nothing unsaved, keeping its place; a document with unsaved work gets a bar instead, offering Reload or Keep Mine. mdview's own saves are recognised by their hash and ignored.
+
 What renders: CommonMark, plus GFM tables, task lists and strikethrough, and YAML front matter as a dimmed block. Raw and inline HTML, HTML comments, math and footnote syntax show as literal text, and an image shows as its alt text in italics. mdview never loads image files or touches the network. Link clicks do nothing until Phase 3.
 
 ## How it follows the theme
 
-There are no colour literals. `mdview/style.css` uses only named colours from Nordic's gtk-4.0 sheet (`theme_fg_color`, `insensitive_fg_color`, `borders`). It loads at `STYLE_PROVIDER_PRIORITY_USER + 1`, because KDE's `~/.config/gtk-4.0/gtk.css` imports Nordic at USER priority and would otherwise override it.
+There are no colour literals. `mdview/style.css` uses only named colours from Nordic's gtk-4.0 sheet (`theme_fg_color`, `theme_bg_color`, `theme_selected_bg_color`, `theme_selected_fg_color`, `insensitive_fg_color`, `borders`). It loads at `STYLE_PROVIDER_PRIORITY_USER + 1`, because KDE's `~/.config/gtk-4.0/gtk.css` imports Nordic at USER priority and would otherwise override it.
 
-The rendered view is one read-only `TextView`. The reading column is centred by a tag spanning the whole text, not by the view's own margins, which would count toward the window's minimum width and stop it shrinking. Text tags take colour values rather than CSS. So the window keeps three hidden probe widgets and copies their computed colours into the tags: a `LinkButton` for the theme's link colour (Nordic has no named one), and two labels that `style.css` gives the dim and tint colours. On 2026-11-27 they returned `rgb(94,129,172)`, `rgb(142,149,164)` and `rgba(216,222,233,0.07)`, which are Nordic's own values.
+The rendered view is one read-only `TextView`. The reading column is centred by a tag spanning the whole text, not by the view's own margins, which would count toward the window's minimum width and stop it shrinking. Text tags take colour values rather than CSS. So the window keeps hidden probe widgets and copies their computed colours into the tags: a `LinkButton` for the theme's link colour (Nordic has no named one), and labels that `style.css` gives the dim, tint and selection colours. On 2026-11-27 the first three returned `rgb(94,129,172)`, `rgb(142,149,164)` and `rgba(216,222,233,0.07)`, which are Nordic's own values.
+
+The current search match is a tag in the theme's selection colours, not just the selection: a `TextView` only draws its selection while it has focus, and during a search the focus is in the find field.
 
 Tables are `Grid`s anchored in the text, sized on every width change to their natural width (capped at the reading column) and to the height their cells wrap to at that width. A `TextView` would otherwise give an anchored widget its minimum size. Cells wrap only between words, so a table that can't fit even then (a 30-column one, say) scrolls sideways inside the column rather than breaking its cells into single characters. A table's forced minimum width counts toward the window's, so it is set one indent step under the room the table has: a full-width table stops that step short of the column's right edge, and in exchange the window can always be narrowed, a step per layout pass.
 
@@ -51,10 +75,11 @@ A theme or font change needs a restart: GTK4 reads the user `gtk.css` once (GNOM
 
 | File | Holds |
 | --- | --- |
-| `src/main.rs` | The application, its app id, accelerators and the stylesheet |
-| `src/render.rs` | Markdown to text, styled character ranges and tables: pure Rust, no GTK, and most of the tests |
-| `src/file.rs` | The strict checks and the read |
-| `src/window.rs` | Windows, the rendered view, filling its buffer, tables, the centred column, open and drop |
+| `src/main.rs` | The application, its app id, accelerators, the quit action and the stylesheet |
+| `src/render.rs` | Markdown to text, styled character ranges, tables and each block's source line: pure Rust, no GTK, and most of the tests |
+| `src/file.rs` | The strict checks, the capped read, guarded saves and the Save As name rule |
+| `src/find.rs` | The find, replace and go-to-line bar, and the search and replace functions |
+| `src/window.rs` | Windows: the rendered view and the editor, open, drop, new, save, the prompts, the file watch and the switch between views |
 | `style.css` | The only stylesheet |
 
 ## Build time
@@ -72,7 +97,7 @@ The release binary is 967,856 bytes. Nearly all the cold time is gtk-rs's serial
 
 ## Checks
 
-`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (29 unit tests, in `render.rs` and `file.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
+`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (32 unit tests, in `render.rs` and `file.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
 
 Phase 1 manual check on `asus-vivobook`, KDE Plasma on Wayland, 2026-11-27, all passed:
 
@@ -84,4 +109,14 @@ Phase 1 manual check on `asus-vivobook`, KDE Plasma on Wayland, 2026-11-27, all 
 - A 30-column table scrolls sideways with whole words in its cells, and GTK logs nothing. With it showing, the view's minimum width is 629 px in a 900 px window, so the window isn't pinned.
 - In a list item, wrapped lines, later paragraphs, code blocks and tables all line up with the item's text, and tables inside quotes and items are indented with them.
 
-Not yet checked by hand: the Open dialog through the KDE portal, and dropping a file from Dolphin. Both need a person at the desktop.
+Phase 2 check on `asus-vivobook`, 2026-11-27, all passed. Synthesised keystrokes don't reach a Wayland session's windows, so an instrumented copy was driven through its real actions over the session bus (`org.gtk.Actions`), with the prompts answered by script:
+
+- Edit and save round trip on a file with a BOM, CRLF and LF mixed and no final newline: the file is exactly the typed character plus the original bytes (`cmp`).
+- An outside change to an unmodified document reloads it silently, keeping its place.
+- An outside edit that restores the old modification time, made while there is unsaved work, shows the changed-on-disk bar; saving then asks; Cancel leaves the outside version on disk, and Overwrite writes the user's.
+- Quit with two modified windows asks twice; Discard both quits and writes nothing. Quit answered Save saves, then quits. Cancel keeps the app running.
+- Replace All rewrites every match, and one undo reverts all of it.
+- Switching views deep in `docs/archival.md` lands on source line 514 both ways, on the same paragraph.
+- The find bar, the changed-on-disk bar and the match highlight are drawn in the theme, in both views.
+
+Not yet checked by hand, since each needs a person at the keyboard: the key bindings themselves, the Save, Discard and Cancel prompt's look and its Alt shortcuts, the Open and Save As dialogs through the KDE portal, New then Save As, dropping a file from Dolphin, Tab, go to line and word wrap.

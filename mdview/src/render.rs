@@ -92,13 +92,20 @@ pub struct Rendered {
     pub text: String,
     pub spans: Vec<Span>,
     pub tables: Vec<Anchor>,
+    /// Where each block starts, in order: its character offset in `text` and its zero-based line
+    /// in the source. Switching between the view and the source keeps the place with these.
+    pub blocks: Vec<(usize, usize)>,
 }
 
 pub fn render(source: &str) -> Rendered {
     // pulldown-cmark doesn't skip a byte-order mark, which would turn a first `# Title` into text.
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
     let mut b = Builder::default();
-    for event in Parser::new_ext(source, OPTIONS) {
+    for (event, range) in Parser::new_ext(source, OPTIONS).into_offset_iter() {
+        b.line = line_starts.partition_point(|&start| start <= range.start) - 1;
         b.event(event);
     }
     b.out
@@ -154,6 +161,8 @@ struct Builder {
     /// Code, HTML or front matter being collected, so its trailing newline can be dropped.
     raw: Option<String>,
     table: Option<TableBuild>,
+    /// The source line the current event starts on.
+    line: usize,
 }
 
 impl Builder {
@@ -424,6 +433,10 @@ impl Builder {
     fn begin_block(&mut self) {
         self.gap = self.gap.max(1);
         self.pay_gap();
+        // Nested starts at one offset (a list, then its first item) keep the first, outer line.
+        if self.out.blocks.last().is_none_or(|&(at, _)| at != self.len) {
+            self.out.blocks.push((self.len, self.line));
+        }
     }
 
     /// A block other than a paragraph: an item's marker can't wait for this block's text (a
@@ -734,6 +747,15 @@ mod tests {
         assert_eq!(render("- a\n  > q\n").text, "• a\nq");
         assert_eq!(render("- ```\n  x\n  ```\n- y\n").text, "• \nx\n• y");
         assert_eq!(render("- # H\n  text\n").text, "• \nH\ntext");
+    }
+
+    #[test]
+    fn blocks_record_their_source_lines() {
+        let r = render("# A\n\npara\nmore\n\n- x\n- y\n\n```\ncode\n```\n");
+        assert_eq!(r.text, "A\n\npara more\n\n• x\n• y\n\ncode");
+        assert_eq!(r.blocks, [(0, 0), (3, 2), (14, 5), (18, 6), (23, 8)]);
+        // A byte-order mark adds no line.
+        assert_eq!(render("\u{feff}a\n\nb\n").blocks, [(0, 0), (3, 2)]);
     }
 
     #[test]
