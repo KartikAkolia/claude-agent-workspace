@@ -1,0 +1,36 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Small GTK4 Markdown viewer and editor that follows the system GTK theme"
+publish = false
+
+# Two crates and no more (docs/mdview-plan.md): every other need is covered by GTK, glib and gio.
+[dependencies]
+# Plain GTK4, never libadwaita, which ignores the GTK theme. v4_12 covers FileDialog,
+# AlertDialog and UriLauncher (all 4.10) and CssProvider::load_from_string (4.12).
+gtk = { package = "gtk4", version = "0.11.5", features = ["v4_12"] }
+# Without the default features: no HTML writer and no getopts, neither of which is used.
+pulldown-cmark = { version = "0.13.6", default-features = false }
+
+# Copied from minecraft-tui (docs/minecraft-tui.md "Build time"): line tables keep file:line in
+# this crate's backtraces; dependency debug info is most of the build cost and rarely needed.
+# For a full debugger build: --config 'profile.dev.debug=true'.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Everyday release builds: Cargo's default codegen units and crate-local LTO, kept incremental.
+[profile.release]
+incremental = true
+strip = true
+
+# The smallest binary, for handing out: cargo build --profile dist (lands in target/dist/).
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+incremental = false
+lto = true

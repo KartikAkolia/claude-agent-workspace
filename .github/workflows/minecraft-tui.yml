@@ -1,6 +1,6 @@
 name: minecraft-tui
 
-# CI for minecraft-tui/, the only Rust crate in this repo: cargo fmt --check,
+# CI for minecraft-tui/ (mdview/ has its own, mdview.yml): cargo fmt --check,
 # clippy with warnings as errors and the unit tests, plus a release build
 # whose binary is kept as a short-lived artifact, so a pull request's build
 # can be downloaded and tried. Backstop for the local pre-commit hook

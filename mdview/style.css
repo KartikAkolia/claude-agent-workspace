@@ -1,0 +1,41 @@
+/* mdview's only stylesheet. No colour literals: only these named colours, all defined by
+   Nordic's gtk-4.0 sheet. A misspelt name fails silently, so keep to this list:
+     theme_fg_color, insensitive_fg_color, borders
+   Loaded at USER + 1 priority, because KDE's ~/.config/gtk-4.0/gtk.css imports Nordic at
+   USER priority and would otherwise win. Every class starts md-: Nordic styles .h1 to .h4. */
+
+/* Hidden probes: their computed colours become the rendered view's tag colours. */
+label.md-probe-dim {
+  color: @insensitive_fg_color;
+}
+
+label.md-probe-tint {
+  color: alpha(@theme_fg_color, 0.07);
+}
+
+/* The empty window. */
+label.md-empty-title {
+  font-size: 1.6em;
+  font-weight: bold;
+}
+
+label.md-empty-hint {
+  color: @insensitive_fg_color;
+}
+
+/* Tables: the grid draws the top and left edges, each cell its right and bottom ones. */
+grid.md-table {
+  border-top: 1px solid @borders;
+  border-left: 1px solid @borders;
+}
+
+label.md-cell {
+  padding: 0.3em 0.8em;
+  border-right: 1px solid @borders;
+  border-bottom: 1px solid @borders;
+}
+
+label.md-th {
+  font-weight: bold;
+  background-color: alpha(@theme_fg_color, 0.07);
+}
