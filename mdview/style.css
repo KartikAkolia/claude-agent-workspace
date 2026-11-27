@@ -60,3 +60,15 @@ box.md-bar {
 label.md-bar-status {
   color: @insensitive_fg_color;
 }
+
+/* The status line under the text. */
+box.md-status {
+  padding: 0.2em 0.8em;
+  border-top: 1px solid @borders;
+  background-color: @theme_bg_color;
+}
+
+label.md-status-text {
+  color: @insensitive_fg_color;
+  font-size: 0.9em;
+}

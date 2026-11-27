@@ -2,7 +2,21 @@
 
 mdview is a small GTK4 Markdown viewer and editor, written in Rust, that takes on the system GTK theme (Nordic, Papirus-Dark and Noto Sans on `asus-vivobook`). It lives in `mdview/`. The design, the decisions behind it and the pitfalls the skeptic reviews found are in [mdview-plan.md](mdview-plan.md); read that before changing it.
 
-Status, 2026-11-27: Phases 1 and 2 (the viewer and the editor) are built and checked on `asus-vivobook`. Links, zoom, the status line and the desktop entry come in Phase 3, and autosave after that.
+Status, 2026-11-27: Phases 1 to 3 (the viewer, the editor, and links, zoom, the status line and the desktop entry) are built and checked on `asus-vivobook`, and mdview is installed there for Kartik's user. Autosave comes next.
+
+## Install
+
+No root needed. From `mdview/`:
+
+```bash
+cargo build --release
+install -Dm755 target/release/mdview ~/.local/bin/mdview
+install -Dm644 data/io.github.kartikakolia.mdview.desktop ~/.local/share/applications/io.github.kartikakolia.mdview.desktop
+update-desktop-database ~/.local/share/applications
+kbuildsycoca6   # KDE's menu and "Open with" pick it up straight away
+```
+
+mdview then appears in the KDE menu and in Dolphin's "Open with" for Markdown files. With no default chosen for `text/markdown` in `~/.config/mimeapps.list`, the desktop picks the first registered app, and a user-installed one comes first: so installing makes mdview the effective default, as it did on `asus-vivobook` (where it had been `ai.storyteller.wordcraft.desktop`). To choose explicitly: `xdg-mime default <app>.desktop text/markdown`. To remove mdview, delete the two installed files and run the last two commands again.
 
 ## Build and run
 
@@ -33,10 +47,15 @@ The release build's app id is `io.github.kartikakolia.mdview`, and a debug build
 | Esc | Close the find bar |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+X/C/V/A | Undo, redo, cut, copy, paste, select all (the text view's own) |
 | Tab | Four spaces, in the source |
+| Ctrl+= or Ctrl++, Ctrl+-, Ctrl+0 | Zoom in, out, and back to the GTK font size: every window, both views |
+| F11 | Fullscreen |
+| Click a link | Follow it (see below); hovering shows the target |
 | Ctrl+W | Close the window |
 | Ctrl+Q | Quit |
 
 The menu (the header bar's last button) has New, Open, Save As, Find, Replace, Go to Line, Word Wrap and Quit.
+
+The status line under the text shows the file's folder (`~` for home), then whether it is modified, the line and column while editing, and the word count (runs of text with a letter or digit, so Markdown's own marks don't count). The count is redone when typing pauses.
 
 Only `.md` and `.markdown` files open, in any case (`README.MD` too). mdview refuses, with a dialog naming the reason, anything that:
 
@@ -57,7 +76,9 @@ Saving writes the text byte for byte, line endings included. Before writing, mdv
 
 While a document is open, mdview watches its file. A change from outside reloads a document with nothing unsaved, keeping its place; a document with unsaved work gets a bar instead, offering Reload or Keep Mine. mdview's own saves are recognised by their hash and ignored.
 
-What renders: CommonMark, plus GFM tables, task lists and strikethrough, and YAML front matter as a dimmed block. Raw and inline HTML, HTML comments, math and footnote syntax show as literal text, and an image shows as its alt text in italics. mdview never loads image files or touches the network. Link clicks do nothing until Phase 3.
+What renders: CommonMark, plus GFM tables, task lists and strikethrough, and YAML front matter as a dimmed block. Raw and inline HTML, HTML comments, math and footnote syntax show as literal text, and an image shows as its alt text in italics. mdview never loads image files or touches the network itself.
+
+Links, in the rendered view and in tables (`src/link.rs`): a relative or `file:` link to a `.md` or `.markdown` file opens in the same window, after the unsaved-work prompt; its `#fragment` and `?query` are dropped and percent-escapes decoded, and it resolves against the document's folder. `http`, `https` and `mailto` links go to the desktop through `gtk::UriLauncher` (and so the portal). Anything else does nothing: in-page anchors, other schemes, other file types, and relative links in a new document that has no folder yet. GTK never launches a link by itself.
 
 ## How it follows the theme
 
@@ -78,6 +99,7 @@ A theme or font change needs a restart: GTK4 reads the user `gtk.css` once (GNOM
 | `src/main.rs` | The application, its app id, accelerators, the quit action and the stylesheet |
 | `src/render.rs` | Markdown to text, styled character ranges, tables and each block's source line: pure Rust, no GTK, and most of the tests |
 | `src/file.rs` | The strict checks, the capped read, guarded saves and the Save As name rule |
+| `src/link.rs` | What a link click does: pure apart from glib's URI helpers, and unit-tested |
 | `src/find.rs` | The find, replace and go-to-line bar, and the search and replace functions |
 | `src/window.rs` | Windows: the rendered view and the editor, open, drop, new, save, the prompts, the file watch and the switch between views |
 | `style.css` | The only stylesheet |
@@ -97,7 +119,7 @@ The release binary is 967,856 bytes. Nearly all the cold time is gtk-rs's serial
 
 ## Checks
 
-`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (32 unit tests, in `render.rs` and `file.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
+`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` (37 unit tests, in `render.rs`, `file.rs` and `link.rs`). The pre-commit hook runs the first two whenever a commit touches `mdview/`, and `.github/workflows/mdview.yml` runs all three. CI is a single job with no release artifact: a GTK app is tried on the desktop, not downloaded from a run. [repo-tooling.md](repo-tooling.md) covers the hook and the workflow.
 
 Phase 1 manual check on `asus-vivobook`, KDE Plasma on Wayland, 2026-11-27, all passed:
 
@@ -120,4 +142,23 @@ Phase 2 check on `asus-vivobook`, 2026-11-27, all passed. Synthesised keystrokes
 - Two overlapping saves: the second is refused while the first runs, with no false conflict. A `touch` before saving isn't a conflict. A file swapped for a FIFO is refused at save time ("it isn't a regular file") with no hang.
 - The find bar, the changed-on-disk bar and the match highlight are drawn in the theme, in both views.
 
-Not yet checked by hand, since each needs a person at the keyboard: the key bindings themselves, the Save, Discard and Cancel prompt's look and its Alt shortcuts, the Open and Save As dialogs through the KDE portal, New then Save As, dropping a file from Dolphin, Tab, go to line and word wrap.
+Phase 3 check on `asus-vivobook`, 2026-11-27, all passed, the same way:
+
+- A relative link with a `%20` escape and a `#fragment` opens the file in the same window; with unsaved work it asks first, and Cancel keeps the document. A link to a `.sh` file, and a relative link in a new document, do nothing.
+- Zoom to 125%: text, headings, code and tables scale together and the column re-centres. Reset returns to the GTK size.
+- The status line shows the folder and word count, and while editing "Modified · Ln 1, Col 7 · 110 words".
+- F11 hides the header bar and back.
+- Installed to `~/.local`: launched through its desktop entry (`gtk-launch io.github.kartikakolia.mdview`), the release build runs as `io.github.kartikakolia.mdview` and renders this doc; `gio mime text/markdown` lists it.
+- The 19 phase 2 checks still pass.
+
+## Manual checklist
+
+These need a person at the keyboard and mouse; tick them off on a new build:
+
+- [ ] Ctrl+O, Ctrl+N, Ctrl+S, Ctrl+Shift+S, Ctrl+E, Ctrl+F/F3/Shift+F3, Ctrl+H, Ctrl+L, Esc, zoom keys, F11, Ctrl+W, Ctrl+Q all do what the table says
+- [ ] The Save, Discard and Cancel prompt looks right in Nordic, and Alt+S, Alt+D and Alt+C answer it
+- [ ] The Open and Save As dialogs come up through the KDE portal; New, type, Ctrl+S asks for a name and adds `.md`
+- [ ] Dropping one file from Dolphin opens it; dropping three opens the other two in new windows
+- [ ] Clicking a link follows it; dragging across one selects text instead; the pointer and tooltip change over a link; a web link opens the browser
+- [ ] Tab inserts four spaces; Go to Line jumps, and a non-number turns the field red; Word Wrap toggles
+- [ ] mdview is in the KDE menu, and in Dolphin's "Open with" for a `.md` file

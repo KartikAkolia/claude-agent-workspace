@@ -1,6 +1,6 @@
 # mdview plan
 
-Status, 2026-11-27: Phases 1 and 2, the viewer and the editor, are built and checked; Phase 3 and autosave are not started. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
+Status, 2026-11-27: Phases 1 to 3 are built and checked, and mdview is installed for Kartik's user on `asus-vivobook`; autosave is not started. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
 
 mdview is a small native Markdown viewer and editor for Kartik's CachyOS laptop (`asus-vivobook`, KDE Plasma on Wayland). It opens on the rendered document, Ctrl+E flips the same window to the source, and it does the basic jobs of an ordinary text editor for Markdown files and nothing else. It draws with plain GTK4, so it takes on the system GTK theme (Nordic, Papirus-Dark, Noto Sans) and carries no colours of its own.
 
@@ -76,7 +76,7 @@ Autosave and crash recovery come after Phase 3 (Kartik, 2026-11-27: "This can be
 
 ## Shape
 
-One binary crate, `mdview/`, in five modules (`find.rs` was split out of `window.rs` in Phase 2).
+One binary crate, `mdview/`, in six modules (`find.rs` was split out of `window.rs` in Phase 2, and `link.rs` added in Phase 3).
 
 | Module | Owns |
 | --- | --- |
@@ -145,7 +145,8 @@ Three PRs for the foundations, then autosave. Each ends with fmt, clippy and the
    - Exit: an edit-save round trip leaves the bytes identical except for the edit (`cmp`); an outside edit is caught, the mtime-restoring kind included; Quit with two modified windows prompts twice. All met on 2026-11-27, through the app's own actions over D-Bus with scripted prompt answers, since synthesised keystrokes don't reach Wayland windows; [mdview.md](mdview.md) has the evidence and what still needs a hand check.
    - Found while building it: the top line for the Ctrl+E mapping has to come from `TextView::line_at_y`, because the view's top-left corner is in the margin, where `iter_at_location` finds no text; and the dialogs' buttons have mnemonics (Alt+D for Discard and so on).
 3. **Finish.** Zoom, F11, the status line, link handling, the desktop entry, install steps and the usage doc with its manual checklist.
-   - Exit: the checklist passes, and mdview launches from the KDE menu and from Dolphin's "Open with".
+   - Exit: the checklist passes, and mdview launches from the KDE menu and from Dolphin's "Open with". Built 2026-11-27; the automated part passed and launching through the desktop entry works, and the hand checklist in [mdview.md](mdview.md) is Kartik's to run.
+   - As built: zoom is app-wide, a CSS font size above `style.css`'s priority, and the rendered view is rebuilt a frame after GTK applies it, since its measurements come from the font. Installing made mdview the effective default for `text/markdown`, as nothing was set explicitly; [mdview.md](mdview.md) says how to choose.
 4. **Autosave and crash recovery.** Added at Kartik's request on 2026-11-27, after the foundations. To be designed then; it is the one place mdview would write anywhere but the file being edited.
 
 ## Trade-offs

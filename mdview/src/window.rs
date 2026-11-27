@@ -10,6 +10,7 @@ use gtk::{gdk, gio, glib, pango};
 
 use crate::file::{self, Guard, Loaded, SaveError};
 use crate::find::{self, Bar, Mode};
+use crate::link::{self, Target};
 use crate::render::{self, ANCHOR, BULLETS, Marker, Rendered, Style, TASK_BOXES};
 
 thread_local! {
@@ -55,6 +56,56 @@ pub fn quit(app: &gtk::Application) {
         WINDOWS.with_borrow(|ws| ws.iter().for_each(|w| w.closing.set(true)));
         app.quit();
     });
+}
+
+/// Text sizes for zoom, in percent of the GTK font, and the one in use (100%).
+const ZOOM_STEPS: [u32; 12] = [50, 67, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
+const ZOOM_DEFAULT: usize = 4;
+
+thread_local! {
+    static ZOOM: Cell<usize> = const { Cell::new(ZOOM_DEFAULT) };
+    static ZOOM_CSS: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+}
+
+/// Zooms every window's text in (`1`), out (`-1`) or back to the GTK font size (`0`). A CSS
+/// font size, above `style.css`'s priority, so tables and code scale with the text.
+pub fn zoom(step: i32) {
+    let index = match step {
+        0 => ZOOM_DEFAULT,
+        _ => {
+            let current = ZOOM.get() as i64 + i64::from(step.signum());
+            current.clamp(0, ZOOM_STEPS.len() as i64 - 1) as usize
+        }
+    };
+    if index == ZOOM.get() && step != 0 {
+        return;
+    }
+    ZOOM.set(index);
+    let provider = ZOOM_CSS.with_borrow_mut(|css| {
+        css.get_or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            if let Some(display) = gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_USER + 2,
+                );
+            }
+            provider
+        })
+        .clone()
+    });
+    // At the default there is no rule at all, so a theme's own text size applies again.
+    let css = if index == ZOOM_DEFAULT {
+        String::new()
+    } else {
+        format!(
+            "textview.md-view, textview.md-editor {{ font-size: {}%; }}",
+            ZOOM_STEPS[index]
+        )
+    };
+    provider.load_from_string(&css);
+    WINDOWS.with_borrow(|ws| ws.iter().for_each(Win::refit_after_restyle));
 }
 
 /// The window showing `file`, or loading it, so a file opened twice quickly gets one window.
@@ -104,6 +155,22 @@ struct Win {
     /// `edits` when the user last chose Discard, so quit doesn't ask twice about the same text.
     discarded: Cell<Option<u64>>,
     layout: RefCell<Layout>,
+    /// The rendered view's links, from render::Rendered::links.
+    links: RefCell<Vec<render::Link>>,
+    status: Status,
+    /// The word count, recounted when idle after an edit.
+    words: Cell<usize>,
+    counting: Cell<bool>,
+    /// A rebuild for a zoom is waiting for its frame.
+    refit_pending: Cell<bool>,
+}
+
+/// The status line under the text: the file's folder, then whether it is modified, the line
+/// and column while editing, and the word count.
+struct Status {
+    bar: gtk::Box,
+    folder: gtk::Label,
+    details: gtk::Label,
 }
 
 /// The bar shown when the file changes on disk while there is unsaved work.
@@ -187,6 +254,8 @@ impl Win {
         content.append(&bar.revealer);
         content.append(&changed.revealer);
         content.append(&stack);
+        let status = Status::new();
+        content.append(&status.bar);
         content.append(&probe_box);
 
         let window = gtk::ApplicationWindow::builder()
@@ -222,6 +291,11 @@ impl Win {
             closing: Cell::new(false),
             discarded: Cell::new(None),
             layout: RefCell::new(Layout::default()),
+            links: RefCell::new(Vec::new()),
+            status,
+            words: Cell::new(0),
+            counting: Cell::new(false),
+            refit_pending: Cell::new(false),
         });
         win.connect_actions();
         win.connect_editor();
@@ -315,6 +389,22 @@ impl Win {
             }
         });
         self.window.add_action(&wrap);
+
+        let fullscreen = gio::SimpleAction::new_stateful("fullscreen", None, &false.to_variant());
+        let window = self.window.downgrade();
+        fullscreen.connect_activate(move |_, _| {
+            if let Some(window) = window.upgrade() {
+                window.set_fullscreened(!window.is_fullscreen());
+            }
+        });
+        // The window manager can change it too, so the state follows the window.
+        let action = fullscreen.downgrade();
+        self.window.connect_fullscreened_notify(move |window| {
+            if let Some(action) = action.upgrade() {
+                action.set_state(&window.is_fullscreen().to_variant());
+            }
+        });
+        self.window.add_action(&fullscreen);
     }
 
     fn action(self: &Rc<Self>, name: &str, run: impl Fn(Rc<Self>) + 'static) {
@@ -358,6 +448,13 @@ impl Win {
             if let Some(win) = weak.upgrade() {
                 win.edits.set(win.edits.get() + 1);
                 win.stale.set(true);
+                win.count_words_soon();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.source.connect_cursor_position_notify(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.update_status();
             }
         });
         let weak = Rc::downgrade(self);
@@ -516,8 +613,38 @@ impl Win {
         });
     }
 
-    /// The file drop, the resize hook and the close request.
+    /// The file drop, the resize hook, link clicks and the close request.
     fn connect_window(self: &Rc<Self>) {
+        // A click on a link follows it, unless the click ended a selection.
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_PRIMARY);
+        let weak = Rc::downgrade(self);
+        click.connect_released(move |_, presses, x, y| {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if presses != 1 || win.view.buffer().has_selection() {
+                return;
+            }
+            if let Some(url) = win.link_at(x, y) {
+                win.open_link(&url);
+            }
+        });
+        self.view.add_controller(click);
+        // Over a link: a pointing hand, and the target as a tooltip.
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(self);
+        motion.connect_motion(move |_, x, y| {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            let url = win.link_at(x, y);
+            win.view
+                .set_cursor_from_name(Some(if url.is_some() { "pointer" } else { "text" }));
+            win.view.set_tooltip_text(url.as_deref());
+        });
+        self.view.add_controller(motion);
+
         // Capture phase, so a file dropped on the text opens rather than being read as text.
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         drop.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -590,6 +717,63 @@ impl Win {
                 win.open_here(file);
             }
         });
+    }
+
+    /// The target of the link under a point in the rendered view, in widget coordinates.
+    fn link_at(&self, x: f64, y: f64) -> Option<String> {
+        let (bx, by) =
+            self.view
+                .window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let at = self.view.iter_at_location(bx, by)?;
+        let offset = usize::try_from(at.offset()).ok()?;
+        self.links
+            .borrow()
+            .iter()
+            .find(|l| l.start <= offset && offset < l.end)
+            .map(|l| l.url.clone())
+    }
+
+    /// Follows a link (link::resolve): a Markdown file opens here, after the unsaved-work
+    /// prompt; a web or mail link goes to the desktop; anything else does nothing.
+    fn open_link(self: &Rc<Self>, href: &str) {
+        let folder = self
+            .file
+            .borrow()
+            .as_ref()
+            .and_then(|f| f.parent())
+            .and_then(|f| f.path());
+        match link::resolve(href, folder.as_deref()) {
+            Target::Markdown(path) => {
+                let target = gio::File::for_path(path);
+                // A link to this same document (`README.md#usage` inside README.md) is an
+                // in-page jump, which does nothing, as `#usage` alone does.
+                let here = self
+                    .file
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|f| same_file(f, &target));
+                if !here {
+                    self.open_here(target);
+                }
+            }
+            Target::External(uri) => {
+                let launcher = gtk::UriLauncher::new(&uri);
+                let weak = Rc::downgrade(self);
+                let window = self.window.clone();
+                glib::spawn_future_local(async move {
+                    let Err(e) = launcher.launch_future(Some(&window)).await else {
+                        return;
+                    };
+                    // Closing the "open with" chooser isn't a failure.
+                    let dismissed = e.matches(gtk::DialogError::Dismissed)
+                        || e.matches(gtk::DialogError::Cancelled);
+                    if let (false, Some(win)) = (dismissed, weak.upgrade()) {
+                        win.alert(&format!("Couldn't open {uri}"), &sentence(e.message()));
+                    }
+                });
+            }
+            Target::Nothing => {}
+        }
     }
 
     /// Opens a file in this window, unless another window already shows it.
@@ -721,6 +905,7 @@ impl Win {
         win.stack.set_visible_child_name("edit");
         win.edit_action.set_state(&true.to_variant());
         win.editor.grab_focus();
+        win.update_status();
     }
 
     fn update_title(&self) {
@@ -730,6 +915,92 @@ impl Win {
             (true, false) => self.name(),
         };
         self.window.set_title(Some(&title));
+        self.update_status();
+    }
+
+    /// Counts words once the edits pause: on idle, so typing never waits for a count.
+    fn count_words_soon(self: &Rc<Self>) {
+        if self.counting.replace(true) {
+            return;
+        }
+        self.count_after_pause(self.edits.get());
+    }
+
+    /// Counts once 300 ms pass with no edit: a timer that, finding more edits since it was set,
+    /// sets itself again rather than counting between keystrokes.
+    fn count_after_pause(self: &Rc<Self>, edits: u64) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if win.edits.get() != edits {
+                win.count_after_pause(win.edits.get());
+                return;
+            }
+            win.counting.set(false);
+            win.words.set(render::word_count(&win.source_text()));
+            win.update_status();
+        });
+    }
+
+    fn update_status(&self) {
+        self.status.bar.set_visible(self.has_doc.get());
+        let folder = self
+            .file
+            .borrow()
+            .as_ref()
+            .and_then(|f| f.parent())
+            .map_or_else(|| "Not saved yet".to_owned(), |f| home_relative(&f));
+        self.status.folder.set_text(&folder);
+        let mut details = Vec::new();
+        if self.source.is_modified() {
+            details.push("Modified".to_owned());
+        }
+        if self.editing() {
+            let at = self.source.iter_at_mark(&self.source.get_insert());
+            details.push(format!(
+                "Ln {}, Col {}",
+                at.line() + 1,
+                at.line_offset() + 1
+            ));
+        }
+        let words = self.words.get();
+        details.push(format!("{words} word{}", if words == 1 { "" } else { "s" }));
+        self.status.details.set_text(&details.join("   ·   "));
+    }
+
+    /// After a zoom: GTK applies the new font at the next frame, and the rendered view's
+    /// measurements (column, indents, tables) come from that font, so it is rebuilt a frame
+    /// later, keeping the place.
+    fn refit_after_restyle(self: &Rc<Self>) {
+        // Several zoom steps before the next frame need only one rebuild, at the final size.
+        if self.refit_pending.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let frames = Cell::new(0);
+        self.window.add_tick_callback(move |_, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 2 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(win) = weak.upgrade() {
+                win.refit_pending.set(false);
+                win.stale.set(true);
+                if win.editing() {
+                    win.fit_editor_margins();
+                } else if win.has_doc.get() {
+                    let line = win.top_line();
+                    win.show_view();
+                    win.scroll_view_to(line);
+                    if win.bar.is_open() {
+                        win.run_find(true, true);
+                    }
+                }
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     fn name(&self) -> String {
@@ -1023,23 +1294,33 @@ impl Win {
             self.scroll_view_to(line);
         }
         self.edit_action.set_state(&edit.to_variant());
+        self.update_status();
         if self.bar.is_open() {
             self.run_find(true, true);
         }
     }
 
     /// Shows the rendered view, rebuilding it first if the source has changed.
-    fn show_view(&self) {
+    fn show_view(self: &Rc<Self>) {
         if self.stale.get() {
             let rendered = render::render(&self.source_text());
-            let layout = fill(&self.view, &rendered, &Theme::from(&self.probes));
+            let weak = Rc::downgrade(self);
+            let on_link: Rc<dyn Fn(&str)> = Rc::new(move |href| {
+                if let Some(win) = weak.upgrade() {
+                    win.open_link(href);
+                }
+            });
+            let theme = Theme::from(&self.probes);
+            let layout = fill(&self.view, &rendered, &theme, &on_link);
             self.blocks.replace(rendered.blocks);
+            self.links.replace(rendered.links);
             self.layout.replace(layout);
             self.relayout();
             self.stale.set(false);
         }
         self.stack.set_visible_child_name("view");
         self.edit_action.set_state(&false.to_variant());
+        self.update_status();
     }
 
     /// The source line at the top of whichever view is showing.
@@ -1228,6 +1509,30 @@ impl Drop for Busy<'_> {
     }
 }
 
+impl Status {
+    fn new() -> Self {
+        let folder = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(pango::EllipsizeMode::Start)
+            .build();
+        let details = gtk::Label::new(None);
+        for label in [&folder, &details] {
+            label.add_css_class("md-status-text");
+        }
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        bar.add_css_class("md-status");
+        bar.append(&folder);
+        bar.append(&details);
+        bar.set_visible(false);
+        Self {
+            bar,
+            folder,
+            details,
+        }
+    }
+}
+
 impl Changed {
     fn new() -> Self {
         let label = gtk::Label::builder()
@@ -1372,7 +1677,7 @@ impl From<&Probes> for Theme {
 }
 
 /// Builds a fresh buffer for the view from the rendered document.
-fn fill(view: &gtk::TextView, r: &Rendered, theme: &Theme) -> Layout {
+fn fill(view: &gtk::TextView, r: &Rendered, theme: &Theme, on_link: &Rc<dyn Fn(&str)>) -> Layout {
     let buffer = gtk::TextBuffer::new(None);
     buffer.set_text(&r.text);
     let em = text_width(view, "M");
@@ -1426,7 +1731,7 @@ fn fill(view: &gtk::TextView, r: &Rendered, theme: &Theme) -> Layout {
 
     view.set_buffer(Some(&buffer));
     for (child, anchor) in anchors {
-        let table = table_widget(&anchor.table);
+        let table = table_widget(&anchor.table, on_link);
         view.add_child_at_anchor(&table, &child);
         layout.tables.push((table, anchor.level));
     }
@@ -1505,7 +1810,7 @@ fn make_tag(
     tag
 }
 
-fn table_widget(table: &render::Table) -> gtk::ScrolledWindow {
+fn table_widget(table: &render::Table, on_link: &Rc<dyn Fn(&str)>) -> gtk::ScrolledWindow {
     let grid = gtk::Grid::new();
     grid.add_css_class("md-table");
     for (row, cells) in table.rows.iter().enumerate() {
@@ -1529,8 +1834,12 @@ fn table_widget(table: &render::Table) -> gtk::ScrolledWindow {
             };
             label.set_xalign(xalign);
             label.set_justify(justify);
-            // Never let GTK launch a link itself; Phase 3 handles links.
-            label.connect_activate_link(|_, _| glib::Propagation::Stop);
+            // Never let GTK launch a link itself: it goes through the same check as the text's.
+            let on_link = on_link.clone();
+            label.connect_activate_link(move |_, href| {
+                on_link(href);
+                glib::Propagation::Stop
+            });
             let (x, y) = (offset(column), offset(row));
             grid.attach(&label, x, y, 1, 1);
         }
@@ -1583,6 +1892,18 @@ fn sentence(reason: &str) -> String {
 fn same_file(a: &gio::File, b: &gio::File) -> bool {
     let real = |f: &gio::File| f.path().and_then(|p| std::fs::canonicalize(p).ok());
     a.equal(b) || real(a).is_some_and(|ra| real(b).is_some_and(|rb| ra == rb))
+}
+
+/// A folder for the status line, with the home folder shown as `~`.
+fn home_relative(folder: &gio::File) -> String {
+    let Some(path) = folder.path() else {
+        return folder.uri().into();
+    };
+    match path.strip_prefix(glib::home_dir()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 fn display_name(file: &gio::File) -> String {
