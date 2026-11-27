@@ -3,14 +3,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 
-use crate::file::{self, Guard, Loaded, SaveError};
+use crate::file::{self, Guard, LoadError, Loaded, SaveError};
 use crate::find::{self, Bar, Mode};
 use crate::link::{self, Target};
+use crate::recovery;
 use crate::render::{self, ANCHOR, BULLETS, Marker, Rendered, Style, TASK_BOXES};
 
 thread_local! {
@@ -18,8 +21,86 @@ thread_local! {
     static WINDOWS: RefCell<Vec<Rc<Win>>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The recovery folder while autosave is on, or why it is off (recovery::start).
+    static AUTOSAVE: RefCell<Result<PathBuf, String>> =
+        RefCell::new(Err("autosave hasn't started".to_owned()));
+    /// The copies startup found, reopened at the first activate or open, and how many it moved
+    /// to `failed/`.
+    static RECOVERED: RefCell<Vec<recovery::Recovered>> = const { RefCell::new(Vec::new()) };
+    static FAILED: Cell<usize> = const { Cell::new(0) };
+    /// A quit is asking about windows.
+    static QUITTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Records what startup found, before any window exists.
+pub fn set_recovery(start: recovery::Startup) {
+    let state = match start.off {
+        None => Ok(recovery::folder()),
+        Some(reason) => Err(reason),
+    };
+    AUTOSAVE.set(state);
+    RECOVERED.set(start.recovered);
+    FAILED.set(start.failed);
+}
+
+/// At shutdown, after the main loop: the final deletes' folder `fsync`, synchronously.
+pub fn sync_recovery() {
+    if let Some(dir) = recovery_dir() {
+        let _ = recovery::sync_folder(&dir);
+    }
+}
+
+fn recovery_dir() -> Option<PathBuf> {
+    AUTOSAVE.with_borrow(|a| a.as_ref().ok().cloned())
+}
+
+/// Opens the recovered copies, once: before any file argument, so `showing()` finds them.
+fn reopen_recovered(app: &gtk::Application) {
+    for copy in RECOVERED.take() {
+        Win::recover(app, copy);
+    }
+    let failed = FAILED.replace(0);
+    if failed > 0 {
+        // Once the first window exists, so the notice always has a parent.
+        glib::idle_add_local_once(move || failed_notice(failed));
+    }
+}
+
+/// Says where the copies that couldn't be reopened are kept.
+fn failed_notice(count: usize) {
+    let Some(window) = WINDOWS.with_borrow(|ws| ws.first().map(|w| w.window.clone())) else {
+        return;
+    };
+    let folder = gio::File::for_path(recovery::folder().join("failed"));
+    let copies = if count == 1 {
+        "1 copy".to_owned()
+    } else {
+        format!("{count} copies")
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Some recovered text couldn't be reopened")
+        .detail(format!(
+            "mdview kept {copies} in {}. Each is the text after one header line. Delete them \
+             when you no longer need them.",
+            home_relative(&folder)
+        ))
+        .buttons(["_Close", "_Open Folder"])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+    glib::spawn_future_local(async move {
+        if let Ok(1) = dialog.choose_future(Some(&window)).await {
+            let launcher = gtk::FileLauncher::new(Some(&folder));
+            let _ = launcher.launch_future(Some(&window)).await;
+        }
+    });
+}
+
 /// Presents a window: the first one open, or a new, empty one.
 pub fn activate(app: &gtk::Application) {
+    reopen_recovered(app);
     let first = WINDOWS.with_borrow(|ws| ws.first().cloned());
     first.unwrap_or_else(|| Win::new(app)).window.present();
 }
@@ -27,7 +108,8 @@ pub fn activate(app: &gtk::Application) {
 /// Opens a file from the command line or the desktop: in the window already showing it, else in
 /// an empty window, else in a new one.
 pub fn open(app: &gtk::Application, file: gio::File) {
-    if let Some(win) = showing(&file) {
+    reopen_recovered(app);
+    if let Some(win) = showing(&file, false) {
         win.window.present();
         return;
     }
@@ -40,6 +122,10 @@ pub fn open(app: &gtk::Application, file: gio::File) {
 /// Quits after asking about each window's unsaved work in turn; a Cancel anywhere stops it.
 /// GTK's own quit skips the windows' close requests, so it is only called once all agree.
 pub fn quit(app: &gtk::Application) {
+    // One quit at a time: a second Ctrl+Q while one is asking would ask about the same windows.
+    if QUITTING.replace(true) {
+        return;
+    }
     let app = app.clone();
     glib::spawn_future_local(async move {
         // Asked again until none is left: a prompt only blocks its own window, so another can
@@ -50,10 +136,25 @@ pub fn quit(app: &gtk::Application) {
                 break;
             };
             if !win.confirm_discard().await {
+                // A stopped quit agreed to nothing: a later one asks about every window again.
+                WINDOWS.with_borrow(|ws| ws.iter().for_each(|w| w.discarded.set(None)));
+                QUITTING.set(false);
                 return;
             }
+            // Still modified, so the answer was Discard: this quit has agreed to lose the text,
+            // and its next pass mustn't ask about it again. Only a quit marks it; a close or a
+            // load acts on its Discard at once (a superseded load's Discard does nothing).
+            if win.has_work() {
+                win.discarded.set(Some(win.edits.get()));
+            }
         }
-        WINDOWS.with_borrow(|ws| ws.iter().for_each(|w| w.closing.set(true)));
+        // GTK's quit closes no window, so each copy is deleted here (delete rule 2).
+        WINDOWS.with_borrow(|ws| {
+            ws.iter().for_each(|w| {
+                w.closing.set(true);
+                w.drop_copy(true);
+            });
+        });
         app.quit();
     });
 }
@@ -109,11 +210,26 @@ pub fn zoom(step: i32) {
 }
 
 /// The window showing `file`, or loading it, so a file opened twice quickly gets one window.
-fn showing(file: &gio::File) -> Option<Rc<Win>> {
-    let is = |f: &Option<gio::File>| f.as_ref().is_some_and(|f| same_file(f, file));
+/// `same_file` canonicalizes, which could hang on a dead mount, so URIs alone are compared for
+/// `uri_only` (a link followed from an unchecked recovered window), for a window that is itself
+/// unchecked, and for any load still pending, which may be of a path nothing has checked. (So
+/// one file opened twice through different symlinks while the first is loading gets two.)
+fn showing(file: &gio::File, uri_only: bool) -> Option<Rc<Win>> {
+    let matches = |f: &Option<gio::File>, by_uri: bool| {
+        f.as_ref().is_some_and(|f| {
+            if by_uri {
+                f.equal(file)
+            } else {
+                same_file(f, file)
+            }
+        })
+    };
     WINDOWS.with_borrow(|ws| {
         ws.iter()
-            .find(|w| is(&w.file.borrow()) || is(&w.pending.borrow()))
+            .find(|w| {
+                let by_uri = uri_only || w.unchecked.get();
+                matches(&w.file.borrow(), by_uri) || matches(&w.pending.borrow(), true)
+            })
             .cloned()
     })
 }
@@ -128,7 +244,9 @@ struct Win {
     /// The document's text, exactly as it is (or will be) on disk.
     source: gtk::TextBuffer,
     bar: Bar,
-    changed: Changed,
+    changed: InfoBar,
+    /// The bar over a recovered window: Discard or Keep.
+    recovered: InfoBar,
     edit_action: gio::SimpleAction,
     probes: Probes,
     /// The file, or `None` for a new document not yet saved.
@@ -152,7 +270,8 @@ struct Win {
     saving: Cell<bool>,
     /// Set once closing has been agreed to, so the close request lets it through.
     closing: Cell<bool>,
-    /// `edits` when the user last chose Discard, so quit doesn't ask twice about the same text.
+    /// `edits` when the user chose Discard in the quit under way, so it doesn't ask twice about
+    /// the same text; cleared if that quit stops.
     discarded: Cell<Option<u64>>,
     layout: RefCell<Layout>,
     /// The rendered view's links, from render::Rendered::links.
@@ -163,6 +282,23 @@ struct Win {
     counting: Cell<bool>,
     /// A rebuild for a zoom is waiting for its frame.
     refit_pending: Cell<bool>,
+    /// Names this window's recovery copy, `<uuid>.md`; the slot it shares with its writes.
+    uuid: String,
+    slot: recovery::SlotRef,
+    /// The copy write in flight (its sequence number), whether another is wanted after it, and
+    /// whether the 5-second timer is armed.
+    writing: Cell<Option<u64>>,
+    write_wanted: Cell<bool>,
+    timer_armed: Cell<bool>,
+    /// "Autosave failed" or "Too large to autosave", with the reason, for the status line.
+    note: RefCell<Option<(&'static str, String)>>,
+    /// A recovered file not yet found local: matched by URI only, and not watched.
+    unchecked: Cell<bool>,
+    /// Successful saves, so the recovered-file check can tell one happened meanwhile.
+    saves: Cell<u64>,
+    /// Save, Discard or Cancel prompts open on this window: a count, since a close and a quit
+    /// can each ask at once.
+    asking: Cell<u32>,
 }
 
 /// The status line under the text: the file's folder, then whether it is modified, the line
@@ -171,13 +307,16 @@ struct Status {
     bar: gtk::Box,
     folder: gtk::Label,
     details: gtk::Label,
+    /// "Autosave off" and the like, with the reason as its tooltip.
+    note: gtk::Label,
 }
 
-/// The bar shown when the file changes on disk while there is unsaved work.
-struct Changed {
+/// A bar over the text with an action and a keep button: the changed-on-disk bar (Reload,
+/// Keep Mine) and the recovered bar (Discard, Keep).
+struct InfoBar {
     revealer: gtk::Revealer,
     label: gtk::Label,
-    reload: gtk::Button,
+    act: gtk::Button,
     keep: gtk::Button,
 }
 
@@ -213,6 +352,10 @@ struct Layout {
 
 impl Win {
     fn new(app: &gtk::Application) -> Rc<Self> {
+        Self::build(app, glib::uuid_string_random().into(), 0)
+    }
+
+    fn build(app: &gtk::Application, uuid: String, attempts: u8) -> Rc<Self> {
         let view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -249,9 +392,11 @@ impl Win {
         probe_box.set_visible(false);
 
         let bar = Bar::new();
-        let changed = Changed::new();
+        let changed = InfoBar::new("Reload", "Keep Mine");
+        let recovered = InfoBar::new("Discard", "Keep");
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&bar.revealer);
+        content.append(&recovered.revealer);
         content.append(&changed.revealer);
         content.append(&stack);
         let status = Status::new();
@@ -276,6 +421,7 @@ impl Win {
             source,
             bar,
             changed,
+            recovered,
             edit_action: gio::SimpleAction::new_stateful("edit", None, &false.to_variant()),
             probes,
             file: RefCell::new(None),
@@ -296,21 +442,37 @@ impl Win {
             words: Cell::new(0),
             counting: Cell::new(false),
             refit_pending: Cell::new(false),
+            uuid,
+            slot: recovery::new_slot(attempts),
+            writing: Cell::new(None),
+            write_wanted: Cell::new(false),
+            timer_armed: Cell::new(false),
+            note: RefCell::new(None),
+            unchecked: Cell::new(false),
+            saves: Cell::new(0),
+            asking: Cell::new(0),
         });
         win.connect_actions();
         win.connect_editor();
         win.connect_bars();
         win.connect_window();
         win.update_actions();
+        // Empty, the status line shows only "Autosave off", if that.
+        win.update_status();
         WINDOWS.with_borrow_mut(|ws| ws.push(win.clone()));
         win
     }
 
-    /// Unsaved work the user hasn't already agreed to discard.
+    /// Unsaved work, while the window's close isn't agreed: what autosave keeps a copy of.
+    /// Text the user chose to discard counts while it is still in the window, since a quit
+    /// cancelled at another window leaves it open.
+    fn has_work(&self) -> bool {
+        self.has_doc.get() && self.source.is_modified() && !self.closing.get()
+    }
+
+    /// Unsaved work the quit under way hasn't already been told to discard: what it asks about.
     fn unsaved(&self) -> bool {
-        self.has_doc.get()
-            && self.source.is_modified()
-            && self.discarded.get() != Some(self.edits.get())
+        self.has_work() && self.discarded.get() != Some(self.edits.get())
     }
 
     fn is_empty(&self) -> bool {
@@ -442,27 +604,45 @@ impl Win {
         self.edit_action.set_enabled(has_doc);
     }
 
+    /// A handler for a signal whose only argument is its emitter (a button's clicked, an
+    /// entry's activate, a buffer's changed). It holds the window weakly, since the window owns
+    /// the widget, and does nothing once the window is gone.
+    fn on<T>(self: &Rc<Self>, run: impl Fn(&Rc<Self>) + 'static) -> impl Fn(&T) + 'static {
+        let weak = Rc::downgrade(self);
+        move |_| {
+            if let Some(win) = weak.upgrade() {
+                run(&win);
+            }
+        }
+    }
+
+    /// Runs `run` once after `delay`, if the window is still open.
+    fn after(self: &Rc<Self>, delay: Duration, run: impl FnOnce(&Rc<Self>) + 'static) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(delay, move || {
+            if let Some(win) = weak.upgrade() {
+                run(&win);
+            }
+        });
+    }
+
     fn connect_editor(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.source.connect_changed(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.edits.set(win.edits.get() + 1);
-                win.stale.set(true);
-                win.count_words_soon();
+        self.source.connect_changed(self.on(|win| {
+            win.edits.set(win.edits.get() + 1);
+            win.stale.set(true);
+            win.count_words_soon();
+            win.arm_autosave();
+        }));
+        self.source
+            .connect_cursor_position_notify(self.on(|win| win.update_status()));
+        self.source.connect_modified_changed(self.on(|win| {
+            // Delete rule 1: nothing unsaved, so no copy (a save, a load, or an undo back to
+            // the saved text).
+            if !win.source.is_modified() {
+                win.drop_copy(false);
             }
-        });
-        let weak = Rc::downgrade(self);
-        self.source.connect_cursor_position_notify(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.update_status();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.source.connect_modified_changed(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.update_title();
-            }
-        });
+            win.update_title();
+        }));
 
         // Tab inserts four spaces: CommonMark reads a tab as up to four columns anyway, and
         // spaces show the same everywhere.
@@ -488,56 +668,22 @@ impl Win {
 
     fn connect_bars(self: &Rc<Self>) {
         let bar = &self.bar;
-        let weak = Rc::downgrade(self);
-        bar.find.connect_search_changed(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.run_find(true, true);
-            }
-        });
-        for (forward, button) in [(true, &bar.next), (false, &bar.previous)] {
-            let weak = Rc::downgrade(self);
-            button.connect_clicked(move |_| {
-                if let Some(win) = weak.upgrade() {
-                    win.run_find(forward, false);
-                }
-            });
-        }
-        let weak = Rc::downgrade(self);
-        bar.find.connect_activate(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.run_find(true, false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.find.connect_next_match(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.run_find(true, false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.find.connect_previous_match(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.run_find(false, false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.case.connect_toggled(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.run_find(true, true);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.find.connect_stop_search(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.close_bar();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.close.connect_clicked(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.close_bar();
-            }
-        });
+        bar.find
+            .connect_search_changed(self.on(|win| win.run_find(true, true)));
+        bar.find
+            .connect_activate(self.on(|win| win.run_find(true, false)));
+        bar.find
+            .connect_next_match(self.on(|win| win.run_find(true, false)));
+        bar.find
+            .connect_previous_match(self.on(|win| win.run_find(false, false)));
+        bar.find.connect_stop_search(self.on(|win| win.close_bar()));
+        bar.next
+            .connect_clicked(self.on(|win| win.run_find(true, false)));
+        bar.previous
+            .connect_clicked(self.on(|win| win.run_find(false, false)));
+        bar.case
+            .connect_toggled(self.on(|win| win.run_find(true, true)));
+        bar.close.connect_clicked(self.on(|win| win.close_bar()));
 
         // Shift+Enter finds backwards, and Escape closes the bar from any of its fields.
         let keys = gtk::EventControllerKey::new();
@@ -561,56 +707,39 @@ impl Win {
         });
         bar.revealer.add_controller(keys);
 
-        let weak = Rc::downgrade(self);
-        bar.replace.connect_clicked(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.replace(false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.replace_all.connect_clicked(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.replace(true);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.replacement.connect_activate(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.replace(false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        bar.line.connect_activate(move |entry| {
-            let Some(win) = weak.upgrade() else {
-                return;
-            };
-            match entry.text().trim().parse::<i32>() {
+        bar.replace
+            .connect_clicked(self.on(|win| win.replace(false)));
+        bar.replace_all
+            .connect_clicked(self.on(|win| win.replace(true)));
+        bar.replacement
+            .connect_activate(self.on(|win| win.replace(false)));
+        bar.line.connect_activate(
+            self.on(|win| match win.bar.line.text().trim().parse::<i32>() {
                 Ok(line) => {
                     win.set_editing(true);
                     find::go_to_line(&win.editor, line);
                     win.close_bar();
                 }
                 Err(_) => win.bar.line_error(true),
-            }
-        });
+            }),
+        );
 
-        let weak = Rc::downgrade(self);
-        self.changed.reload.connect_clicked(move |_| {
-            let Some(win) = weak.upgrade() else {
-                return;
-            };
+        self.changed.act.connect_clicked(self.on(|win| {
             win.changed.revealer.set_reveal_child(false);
             let file = win.file.borrow().clone();
             if let Some(file) = file {
                 win.load(file, false);
             }
-        });
-        let weak = Rc::downgrade(self);
-        self.changed.keep.connect_clicked(move |_| {
-            if let Some(win) = weak.upgrade() {
-                win.changed.revealer.set_reveal_child(false);
-            }
-        });
+        }));
+        self.changed
+            .keep
+            .connect_clicked(self.on(|win| win.changed.revealer.set_reveal_child(false)));
+        self.recovered
+            .act
+            .connect_clicked(self.on(|win| win.discard_recovered()));
+        self.recovered
+            .keep
+            .connect_clicked(self.on(|win| win.recovered.revealer.set_reveal_child(false)));
     }
 
     /// The file drop, the resize hook, link clicks and the close request.
@@ -659,7 +788,7 @@ impl Win {
             let (Some(win), Some(first)) = (weak.upgrade(), files.next()) else {
                 return false;
             };
-            win.open_here(first);
+            win.open_here(first, false);
             if let Some(app) = win.window.application() {
                 files.for_each(|file| open(&app, file));
             }
@@ -668,14 +797,9 @@ impl Win {
         self.window.add_controller(drop);
 
         // GTK4 has no resize signal; the scroller's horizontal page size is its width.
-        let weak = Rc::downgrade(self);
         self.scroller
             .hadjustment()
-            .connect_page_size_notify(move |_| {
-                if let Some(win) = weak.upgrade() {
-                    win.relayout();
-                }
-            });
+            .connect_page_size_notify(self.on(|win| win.relayout()));
 
         // Unsaved work holds the close until the prompt is answered.
         let weak = Rc::downgrade(self);
@@ -684,6 +808,8 @@ impl Win {
                 return glib::Propagation::Proceed;
             };
             if win.closing.get() || !win.has_doc.get() || !win.source.is_modified() {
+                // Delete rule 2: a closing window leaves no copy, and none can land after.
+                win.drop_copy(true);
                 WINDOWS.with_borrow_mut(|ws| ws.retain(|w| &w.window != window));
                 return glib::Propagation::Proceed;
             }
@@ -702,10 +828,7 @@ impl Win {
             .title("Open Markdown file")
             .modal(true)
             .build();
-        markdown_filter(&dialog);
-        if let Some(folder) = self.file.borrow().as_ref().and_then(|f| f.parent()) {
-            dialog.set_initial_folder(Some(&folder));
-        }
+        self.prepare_dialog(&dialog);
         let weak = Rc::downgrade(self);
         let window = self.window.clone();
         glib::spawn_future_local(async move {
@@ -714,7 +837,7 @@ impl Win {
                 return;
             };
             if let Some(win) = weak.upgrade() {
-                win.open_here(file);
+                win.open_here(file, false);
             }
         });
     }
@@ -741,19 +864,24 @@ impl Win {
             .borrow()
             .as_ref()
             .and_then(|f| f.parent())
+            .filter(|f| self.may_ask_path(f))
             .and_then(|f| f.path());
         match link::resolve(href, folder.as_deref()) {
             Target::Markdown(path) => {
                 let target = gio::File::for_path(path);
                 // A link to this same document (`README.md#usage` inside README.md) is an
-                // in-page jump, which does nothing, as `#usage` alone does.
-                let here = self
-                    .file
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|f| same_file(f, &target));
+                // in-page jump, which does nothing, as `#usage` alone does. In an unchecked
+                // recovered window the target is in an unchecked folder: URIs only.
+                let uri_only = self.unchecked.get();
+                let here = self.file.borrow().as_ref().is_some_and(|f| {
+                    if uri_only {
+                        f.equal(&target)
+                    } else {
+                        same_file(f, &target)
+                    }
+                });
                 if !here {
-                    self.open_here(target);
+                    self.open_here(target, uri_only);
                 }
             }
             Target::External(uri) => {
@@ -777,8 +905,8 @@ impl Win {
     }
 
     /// Opens a file in this window, unless another window already shows it.
-    fn open_here(self: &Rc<Self>, file: gio::File) {
-        match showing(&file) {
+    fn open_here(self: &Rc<Self>, file: gio::File, uri_only: bool) {
+        match showing(&file, uri_only) {
             Some(other) if !Rc::ptr_eq(&other, self) => other.window.present(),
             _ => self.load(file, true),
         }
@@ -806,7 +934,7 @@ impl Win {
                     win.pending.replace(None);
                     win.alert(
                         &format!("Couldn't open “{}”", display_name(&file)),
-                        &sentence(&reason),
+                        &sentence(&reason.to_string()),
                     );
                 }
                 Ok(loaded) => {
@@ -828,10 +956,7 @@ impl Win {
 
     fn show(self: &Rc<Self>, file: &gio::File, loaded: Loaded, keep_place: bool) {
         let place = keep_place.then(|| (self.editing(), self.top_line()));
-        // Not undoable: undo never reaches back into the previous document.
-        self.source.begin_irreversible_action();
-        self.source.set_text(&loaded.text);
-        self.source.end_irreversible_action();
+        self.set_text_irreversibly(&loaded.text);
         // file::check_text keeps out what TextBuffer refuses, but a text the buffer didn't take
         // whole must never be saved back over the file.
         let held = usize::try_from(self.source.char_count()).unwrap_or(0);
@@ -850,6 +975,9 @@ impl Win {
         self.guard.replace(Some(loaded.guard));
         self.file.replace(Some(file.clone()));
         self.has_doc.set(true);
+        // The file has just been read: an ordinary window from here on.
+        self.unchecked.set(false);
+        self.recovered.revealer.set_reveal_child(false);
         self.watch(file);
         self.changed.revealer.set_reveal_child(false);
         self.update_title();
@@ -867,12 +995,39 @@ impl Win {
         }
     }
 
+    /// A file dialog for Markdown files, starting in the document's folder (never an unchecked
+    /// one: the portal would read it).
+    fn prepare_dialog(&self, dialog: &gtk::FileDialog) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Markdown"));
+        // Suffixes match without regard to case.
+        filter.add_suffix("md");
+        filter.add_suffix("markdown");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&filter));
+        let folder = self.file.borrow().as_ref().and_then(|f| f.parent());
+        if let (false, Some(folder)) = (self.unchecked.get(), folder) {
+            dialog.set_initial_folder(Some(&folder));
+        }
+    }
+
+    /// Puts in a whole new text, which undo never reaches back past into the previous one.
+    fn set_text_irreversibly(&self, text: &str) {
+        self.source.begin_irreversible_action();
+        self.source.set_text(text);
+        self.source.end_irreversible_action();
+    }
+
     /// Back to an empty window, after a document that couldn't be held.
     fn close_document(&self) {
         self.file.replace(None);
         self.guard.replace(None);
         self.monitor.replace(None);
         self.has_doc.set(false);
+        self.unchecked.set(false);
+        self.recovered.revealer.set_reveal_child(false);
         self.stack.set_visible_child_name("empty");
         self.edit_action.set_state(&false.to_variant());
         self.update_title();
@@ -891,9 +1046,7 @@ impl Win {
             win.window.present();
             win
         };
-        win.source.begin_irreversible_action();
-        win.source.set_text("");
-        win.source.end_irreversible_action();
+        win.set_text_irreversibly("");
         win.source.set_modified(false);
         win.file.replace(None);
         win.guard.replace(None);
@@ -901,11 +1054,7 @@ impl Win {
         win.has_doc.set(true);
         win.update_title();
         win.update_actions();
-        win.fit_editor_margins();
-        win.stack.set_visible_child_name("edit");
-        win.edit_action.set_state(&true.to_variant());
-        win.editor.grab_focus();
-        win.update_status();
+        win.set_editing(true);
     }
 
     fn update_title(&self) {
@@ -929,11 +1078,7 @@ impl Win {
     /// Counts once 300 ms pass with no edit: a timer that, finding more edits since it was set,
     /// sets itself again rather than counting between keystrokes.
     fn count_after_pause(self: &Rc<Self>, edits: u64) {
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-            let Some(win) = weak.upgrade() else {
-                return;
-            };
+        self.after(Duration::from_millis(300), move |win| {
             if win.edits.get() != edits {
                 win.count_after_pause(win.edits.get());
                 return;
@@ -945,13 +1090,18 @@ impl Win {
     }
 
     fn update_status(&self) {
-        self.status.bar.set_visible(self.has_doc.get());
+        let has_doc = self.has_doc.get();
+        let off = AUTOSAVE.with_borrow(|a| a.as_ref().err().cloned());
+        // An empty window shows only "Autosave off", so it is never missed.
+        self.status.bar.set_visible(has_doc || off.is_some());
+        self.status.folder.set_visible(has_doc);
+        self.status.details.set_visible(has_doc);
         let folder = self
             .file
             .borrow()
             .as_ref()
             .and_then(|f| f.parent())
-            .map_or_else(|| "Not saved yet".to_owned(), |f| home_relative(&f));
+            .map_or_else(|| "Not saved yet".to_owned(), |f| self.folder_name(&f));
         self.status.folder.set_text(&folder);
         let mut details = Vec::new();
         if self.source.is_modified() {
@@ -968,6 +1118,19 @@ impl Win {
         let words = self.words.get();
         details.push(format!("{words} word{}", if words == 1 { "" } else { "s" }));
         self.status.details.set_text(&details.join("   ·   "));
+        let note = off
+            .map(|reason| ("Autosave off", reason))
+            .or_else(|| self.note.borrow().clone());
+        self.status.note.set_visible(note.is_some());
+        if let Some((text, reason)) = note {
+            let text = if has_doc {
+                format!("·   {text}")
+            } else {
+                text.to_owned()
+            };
+            self.status.note.set_text(&text);
+            self.status.note.set_tooltip_text(Some(&sentence(&reason)));
+        }
     }
 
     /// After a zoom: GTK applies the new font at the next frame, and the rendered view's
@@ -1003,6 +1166,22 @@ impl Win {
         });
     }
 
+    /// Whether `path()` may be asked of a file on the main thread. For an unchecked recovered
+    /// window's non-`file:` URI it would ask gvfsd over D-Bus, so it isn't; a `file:` URI's
+    /// path is only its text.
+    fn may_ask_path(&self, file: &gio::File) -> bool {
+        !self.unchecked.get() || file.has_uri_scheme("file")
+    }
+
+    /// The folder for the status line: `~`-relative, or the URI while it can't be asked.
+    fn folder_name(&self, folder: &gio::File) -> String {
+        if self.may_ask_path(folder) {
+            home_relative(folder)
+        } else {
+            folder.uri().into()
+        }
+    }
+
     fn name(&self) -> String {
         self.file
             .borrow()
@@ -1013,9 +1192,53 @@ impl Win {
     /// Asks before unsaved work is lost: Save, Discard or Cancel. True to go ahead (saved or
     /// discarded), false to stay.
     async fn confirm_discard(self: &Rc<Self>) -> bool {
-        if !self.has_doc.get() || !self.source.is_modified() {
-            return true;
+        loop {
+            // Asked again after a save that left the document modified (typing during it),
+            // rather than going ahead with that typing's copy deleted; and not at all once
+            // another prompt has agreed to this window's close.
+            let clean = !self.has_doc.get() || !self.source.is_modified();
+            if clean || self.closing.get() {
+                return true;
+            }
+            if self.still_saving() {
+                return false;
+            }
+            let answer = self.ask_save().await;
+            // While this prompt was open, another may have closed the window (its answer then
+            // stands) or started a save.
+            if self.closing.get() {
+                return true;
+            }
+            if answer.is_some() && self.still_saving() {
+                return false;
+            }
+            match answer {
+                Some(true) => {
+                    if !self.save().await {
+                        return false;
+                    }
+                }
+                Some(false) => return true,
+                None => return false,
+            }
         }
+    }
+
+    /// A save under way, or its Save As chooser, would turn a Save away silently, and a Discard
+    /// would close the window under it: so it is said instead.
+    fn still_saving(&self) -> bool {
+        if self.saving.get() {
+            self.window.present();
+            self.alert(
+                "Still saving",
+                "Finish or cancel the save that is under way, then try again.",
+            );
+        }
+        self.saving.get()
+    }
+
+    /// Save (`Some(true)`), Discard (`Some(false)`) or Cancel (`None`).
+    async fn ask_save(&self) -> Option<bool> {
         self.window.present();
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
@@ -1025,13 +1248,13 @@ impl Win {
             .cancel_button(0)
             .default_button(2)
             .build();
-        match dialog.choose_future(Some(&self.window)).await {
-            Ok(1) => {
-                self.discarded.set(Some(self.edits.get()));
-                true
-            }
-            Ok(2) => self.save().await,
-            _ => false,
+        self.asking.set(self.asking.get() + 1);
+        let answer = dialog.choose_future(Some(&self.window)).await;
+        self.asking.set(self.asking.get() - 1);
+        match answer {
+            Ok(1) => Some(false),
+            Ok(2) => Some(true),
+            _ => None,
         }
     }
 
@@ -1052,7 +1275,7 @@ impl Win {
         let text = self.source_text();
         let edits = self.edits.get();
         let mut guard = self.guard.borrow().clone();
-        loop {
+        let saved = loop {
             match file::save(&file, &text, guard.as_ref()).await {
                 Err(SaveError::Conflict) => {
                     if !self.ask_overwrite(&file).await {
@@ -1068,13 +1291,18 @@ impl Win {
                                 message,
                                 in_place: false,
                             };
-                            return self.finish_save(&file, Err(failed), edits);
+                            break self.finish_save(&file, Err(failed), edits);
                         }
                     };
                 }
-                result => return self.finish_save(&file, result, edits),
+                result => break self.finish_save(&file, result, edits),
             }
+        };
+        // A copy of any typing during the save, with the new guard.
+        if saved {
+            self.autosave();
         }
+        saved
     }
 
     /// Saves to a file the user picks, which then becomes the document's file.
@@ -1099,10 +1327,7 @@ impl Win {
             .modal(true)
             .initial_name(initial)
             .build();
-        markdown_filter(&dialog);
-        if let Some(folder) = current.as_ref().and_then(|f| f.parent()) {
-            dialog.set_initial_folder(Some(&folder));
-        }
+        self.prepare_dialog(&dialog);
         let Ok(chosen) = dialog.save_future(Some(&self.window)).await else {
             return false;
         };
@@ -1128,7 +1353,7 @@ impl Win {
                 target
             }
         };
-        if showing(&target).is_some_and(|other| !Rc::ptr_eq(&other, self)) {
+        if showing(&target, false).is_some_and(|other| !Rc::ptr_eq(&other, self)) {
             let heading = format!("Couldn't save as “{}”", display_name(&target));
             self.alert(&heading, "It is open in another window.");
             return false;
@@ -1139,8 +1364,11 @@ impl Win {
         let saved = self.finish_save(&target, result, edits);
         if saved {
             self.file.replace(Some(target.clone()));
+            self.unchecked.set(false);
             self.watch(&target);
             self.update_title();
+            // Edits during the save need a copy under the new name.
+            self.autosave();
         }
         saved
     }
@@ -1149,11 +1377,14 @@ impl Win {
         match result {
             Ok(guard) => {
                 self.guard.replace(Some(guard));
+                self.saves.set(self.saves.get() + 1);
                 // Typing during the save leaves the document modified: that text isn't saved.
                 if self.edits.get() == edits {
                     self.source.set_modified(false);
                 }
                 self.changed.revealer.set_reveal_child(false);
+                // Saved: nothing recovered is left to keep or discard.
+                self.recovered.revealer.set_reveal_child(false);
                 self.update_title();
                 true
             }
@@ -1174,26 +1405,25 @@ impl Win {
     }
 
     async fn ask_overwrite(&self, file: &gio::File) -> bool {
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(format!("“{}” changed on disk", display_name(file)))
-            .detail(
-                "Another program changed it since mdview last read or saved it. Overwrite it \
-                 with your version, or cancel and use Save As to keep both.",
-            )
-            .buttons(["_Cancel", "_Overwrite"])
-            .cancel_button(0)
-            .default_button(0)
-            .build();
-        matches!(dialog.choose_future(Some(&self.window)).await, Ok(1))
+        let message = format!("“{}” changed on disk", display_name(file));
+        let detail = "Another program changed it since mdview last read or saved it. Overwrite \
+                      it with your version, or cancel and use Save As to keep both.";
+        self.confirm(&message, detail, "_Overwrite").await
     }
 
     async fn ask_replace(&self, file: &gio::File) -> bool {
+        let message = format!("“{}” already exists", display_name(file));
+        self.confirm(&message, "Replace it with this document?", "_Replace")
+            .await
+    }
+
+    /// Cancel, the default, or `action`; true for `action`.
+    async fn confirm(&self, message: &str, detail: &str, action: &str) -> bool {
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
-            .message(format!("“{}” already exists", display_name(file)))
-            .detail("Replace it with this document?")
-            .buttons(["_Cancel", "_Replace"])
+            .message(message)
+            .detail(detail)
+            .buttons(["_Cancel", action])
             .cancel_button(0)
             .default_button(0)
             .build();
@@ -1275,6 +1505,286 @@ impl Win {
             display_name(file)
         ));
         self.changed.revealer.set_reveal_child(true);
+    }
+
+    /// Arms the 5-second autosave timer, unless it is armed. A late fire after a close does
+    /// nothing: the gate and the closed slot refuse it.
+    fn arm_autosave(self: &Rc<Self>) {
+        if recovery_dir().is_none() || self.timer_armed.replace(true) {
+            return;
+        }
+        self.after(Duration::from_secs(5), |win| {
+            win.timer_armed.set(false);
+            win.autosave();
+        });
+    }
+
+    /// The write gate: a copy of the unsaved work, written on the thread pool. One write at a
+    /// time; one asked for meanwhile runs when it finishes.
+    fn autosave(self: &Rc<Self>) {
+        let Some(dir) = recovery_dir() else {
+            return;
+        };
+        if !self.has_work() {
+            return;
+        }
+        if self.writing.get().is_some() {
+            self.write_wanted.set(true);
+            return;
+        }
+        let uri = self.file.borrow().as_ref().map(|f| String::from(f.uri()));
+        let guard = self.guard.borrow().clone();
+        let text = self.source_text();
+        // The attempts digit is stamped from the slot when the write lands (recovery::run).
+        let Some(bytes) =
+            recovery::encode(0, recovery::now(), uri.as_deref(), guard.as_ref(), &text)
+        else {
+            let reason = "only documents up to 8 MiB, with a path that fits, are autosaved";
+            self.set_note(Some(("Too large to autosave", reason.to_owned())));
+            return;
+        };
+        let Some(job) = recovery::begin(&self.slot, &dir, &self.uuid, bytes) else {
+            return;
+        };
+        let n = job.n;
+        self.writing.set(Some(n));
+        let handle = gio::spawn_blocking(move || recovery::run(job));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = handle.await;
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            win.writing.set(None);
+            let failure = match result {
+                Ok(Ok(true)) => {
+                    win.set_note(None);
+                    None
+                }
+                // Dropped by a delete or close: it says nothing about an earlier note.
+                Ok(Ok(false)) => None,
+                Ok(Err(e)) => Some(format!("the last copy couldn't be written: {e}")),
+                Err(_) => Some("the last copy's write failed unexpectedly".to_owned()),
+            };
+            // Tried again in 5 seconds, so the copy catches up once the cause clears.
+            if let Some(reason) = failure {
+                win.set_note(Some(("Autosave failed", reason)));
+                win.arm_autosave();
+            }
+            if win.write_wanted.replace(false) {
+                win.autosave();
+            }
+        });
+        self.after(Duration::from_secs(30), move |win| {
+            if win.writing.get() == Some(n) {
+                let reason = "the last copy has taken over 30 seconds to write";
+                win.set_note(Some(("Autosave failed", reason.to_owned())));
+            }
+        });
+    }
+
+    /// Deletes this window's copy (delete rules 1 and 2). A final delete also closes the slot,
+    /// so no write lands after it.
+    fn drop_copy(&self, final_delete: bool) {
+        let Some(dir) = recovery_dir() else {
+            return;
+        };
+        match recovery::delete(&self.slot, &dir, &self.uuid, final_delete) {
+            Ok(()) if !final_delete => self.set_note(None),
+            Ok(()) => {}
+            // It would come back at the next start.
+            Err(e) => {
+                let reason = format!("the recovery copy couldn't be deleted: {e}");
+                self.set_note(Some(("Autosave failed", reason)));
+            }
+        }
+    }
+
+    fn set_note(&self, note: Option<(&'static str, String)>) {
+        self.note.replace(note);
+        self.update_status();
+    }
+
+    /// A window for a recovered copy: its text, modified, in edit mode, under the recovered
+    /// bar. Its file isn't touched until the deferred check finds the path local.
+    fn recover(app: &gtk::Application, recovered: recovery::Recovered) {
+        let copy = recovered.copy;
+        // As in show(): text a buffer didn't take whole must never be saved over the file. It
+        // is tried in a spare buffer, before any window exists; one that fails joins failed/
+        // and the failed-copies notice.
+        let held = {
+            let spare = gtk::TextBuffer::new(None);
+            spare.set_text(&copy.text);
+            usize::try_from(spare.char_count()).unwrap_or(0)
+        };
+        if held != copy.text.chars().count() {
+            if let Some(dir) = recovery_dir()
+                && recovery::move_to_failed(&dir, &recovered.uuid).is_ok()
+            {
+                FAILED.set(FAILED.get() + 1);
+            }
+            return;
+        }
+        let win = Self::build(app, recovered.uuid, copy.attempts);
+        let file = copy.uri.as_deref().map(gio::File::for_uri);
+        // Not undoable, so undo can't make the window look clean. The timer counts as armed
+        // meanwhile, so putting the text back doesn't rewrite the copy with a new time.
+        win.timer_armed.set(true);
+        win.set_text_irreversibly(&copy.text);
+        win.timer_armed.set(false);
+        win.source.place_cursor(&win.source.start_iter());
+        win.source.set_modified(true);
+        win.unchecked.set(file.is_some());
+        win.file.replace(file.clone());
+        win.guard.replace(copy.guard.clone());
+        win.has_doc.set(true);
+        let when = autosaved_at(copy.time);
+        let message = match &file {
+            Some(file) => format!(
+                "Recovered unsaved changes to “{}” (autosaved {when}). Keep them, or discard \
+                 them and reload the file.",
+                display_name(file)
+            ),
+            None => format!(
+                "Recovered an unsaved new document (autosaved {when}). Keep it, or discard it \
+                 and close this window."
+            ),
+        };
+        win.recovered.label.set_text(&message);
+        win.recovered.revealer.set_reveal_child(true);
+        win.update_title();
+        win.update_actions();
+        win.window.present();
+        win.set_editing(true);
+        // Up for 10 seconds: the crash counter goes back to 0.
+        win.after(Duration::from_secs(10), |win| {
+            if let Some(dir) = recovery_dir() {
+                recovery::reset_attempts(&win.slot, &dir, &win.uuid);
+            }
+        });
+        if let Some(file) = file {
+            win.check_recovered(file, copy.text, copy.guard);
+        }
+    }
+
+    /// The deferred check, off the main thread: whether the recovered file's path is local,
+    /// and what the file holds now against the copy and its guard.
+    fn check_recovered(self: &Rc<Self>, file: gio::File, text: String, guard: Option<Guard>) {
+        let (edits, saves) = (self.edits.get(), self.saves.get());
+        // path() too, since for a gvfs URI it asks gvfsd over D-Bus.
+        let target = file.clone();
+        let handle = gio::spawn_blocking(move || read_if_local(target.path()));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // A path that isn't local, or a check that never returns, leaves the bar as it was.
+            let Ok(Some(disk)) = handle.await else {
+                return;
+            };
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            let same = win.file.borrow().as_ref().is_some_and(|f| f.equal(&file));
+            // A pending load's file is matched by URI in showing() whatever this finds.
+            if same {
+                win.unchecked.set(false);
+                if win.monitor.borrow().is_none() {
+                    win.watch(&file);
+                }
+            }
+            // Still the copy's guard: no save or load since has set one from newer bytes.
+            let guard_ours = same && win.saves.get() == saves && *win.guard.borrow() == guard;
+            let unchanged = guard_ours && win.edits.get() == edits;
+            let matches_guard = |bytes: &[u8]| guard.as_ref().is_some_and(|g| g.matches(bytes));
+            let note = match disk {
+                Disk::Bytes(bytes) if bytes == text.as_bytes() => {
+                    // The copy adds nothing. The guard follows the disk, so a save doesn't
+                    // report a change nobody made; untouched, it is an ordinary clean window
+                    // (delete rule 1).
+                    if guard_ours {
+                        win.guard.replace(Some(Guard::of(&bytes)));
+                    }
+                    if unchanged {
+                        win.source.set_modified(false);
+                        win.recovered.revealer.set_reveal_child(false);
+                    }
+                    None
+                }
+                Disk::Bytes(bytes) if matches_guard(&bytes) => None,
+                Disk::Missing if guard.is_none() => None,
+                Disk::Bytes(_) => {
+                    Some("It has changed on disk since; saving will ask before overwriting.")
+                }
+                Disk::Missing => Some("The file no longer exists; saving recreates it."),
+                Disk::Unreadable => None,
+            };
+            let showing_bar = win.recovered.revealer.reveals_child();
+            if let (Some(note), true, true) = (note, showing_bar, win.saves.get() == saves) {
+                let text = format!("{} {note}", win.recovered.label.text());
+                win.recovered.label.set_text(&text);
+            }
+        });
+    }
+
+    /// The recovered bar's Discard: reload the file without a second prompt, or close the
+    /// window when the file is gone or it is a new document.
+    fn discard_recovered(self: &Rc<Self>) {
+        let file = self.file.borrow().clone();
+        let Some(file) = file else {
+            if self.saving.get() || self.asking.get() > 0 {
+                self.not_discarded();
+            } else {
+                self.close_agreed();
+            }
+            return;
+        };
+        let (edits, saves) = (self.edits.get(), self.saves.get());
+        let this_load = self.loads.get() + 1;
+        self.loads.set(this_load);
+        self.pending.replace(Some(file.clone()));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = file::load(&file).await;
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if win.loads.get() != this_load {
+                return;
+            }
+            win.pending.replace(None);
+            // Keep (or a save) since the click has hidden the bar: the user's later choice wins.
+            if !win.recovered.revealer.reveals_child() {
+                return;
+            }
+            // Typed or saved after the click, saving now, or asking whether to: that work isn't
+            // thrown away, and the window isn't closed under its prompt.
+            let busy = win.edits.get() != edits
+                || win.saves.get() != saves
+                || win.saving.get()
+                || win.asking.get() > 0;
+            match result {
+                Err(LoadError::Failed(reason)) => win.alert(
+                    &format!("Couldn't reload “{}”", display_name(&file)),
+                    &sentence(&reason),
+                ),
+                _ if busy => win.not_discarded(),
+                Err(LoadError::NotFound) => win.close_agreed(),
+                Ok(loaded) => win.show(&file, loaded, false),
+            }
+        });
+    }
+
+    fn not_discarded(&self) {
+        self.alert(
+            "Not discarded",
+            "The document changed, is being saved, or is waiting on a prompt, so it was kept. \
+             Discard again once that is done.",
+        );
+    }
+
+    /// Closes with the close already agreed, so there is no prompt.
+    fn close_agreed(&self) {
+        self.closing.set(true);
+        self.window.close();
     }
 
     /// Switches between the rendered view and the source, keeping the place in the document.
@@ -1517,35 +2027,39 @@ impl Status {
             .ellipsize(pango::EllipsizeMode::Start)
             .build();
         let details = gtk::Label::new(None);
-        for label in [&folder, &details] {
+        let note = gtk::Label::new(None);
+        note.set_visible(false);
+        for label in [&folder, &details, &note] {
             label.add_css_class("md-status-text");
         }
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         bar.add_css_class("md-status");
         bar.append(&folder);
         bar.append(&details);
+        bar.append(&note);
         bar.set_visible(false);
         Self {
             bar,
             folder,
             details,
+            note,
         }
     }
 }
 
-impl Changed {
-    fn new() -> Self {
+impl InfoBar {
+    fn new(act: &str, keep: &str) -> Self {
         let label = gtk::Label::builder()
             .wrap(true)
             .xalign(0.0)
             .hexpand(true)
             .build();
-        let reload = gtk::Button::with_label("Reload");
-        let keep = gtk::Button::with_label("Keep Mine");
+        let act = gtk::Button::with_label(act);
+        let keep = gtk::Button::with_label(keep);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         row.add_css_class("md-bar");
         row.append(&label);
-        row.append(&reload);
+        row.append(&act);
         row.append(&keep);
         let revealer = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -1554,7 +2068,7 @@ impl Changed {
         Self {
             revealer,
             label,
-            reload,
+            act,
             keep,
         }
     }
@@ -1613,18 +2127,6 @@ fn main_menu() -> gio::Menu {
     );
     menu.append_section(None, &section(&[("Quit", "app.quit")]));
     menu
-}
-
-fn markdown_filter(dialog: &gtk::FileDialog) {
-    let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Markdown"));
-    // Suffixes match without regard to case.
-    filter.add_suffix("md");
-    filter.add_suffix("markdown");
-    let filters = gio::ListStore::new::<gtk::FileFilter>();
-    filters.append(&filter);
-    dialog.set_filters(Some(&filters));
-    dialog.set_default_filter(Some(&filter));
 }
 
 async fn exists(file: &gio::File) -> bool {
@@ -1904,6 +2406,55 @@ fn home_relative(folder: &gio::File) -> String {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     }
+}
+
+/// What a recovered file holds now, read off the main thread.
+enum Disk {
+    Bytes(Vec<u8>),
+    Missing,
+    Unreadable,
+}
+
+/// `None` when the path isn't local (recovery::is_local_path), so it was never touched.
+fn read_if_local(path: Option<PathBuf>) -> Option<Disk> {
+    use std::io::Read;
+    let path = path?;
+    if !recovery::is_local_path(&path) {
+        return None;
+    }
+    let limit = file::MAX_BYTES.unsigned_abs();
+    Some(match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Disk::Missing,
+        // Capped, in case it grew since the check.
+        Ok(meta) if meta.is_file() && meta.len() <= limit => {
+            let mut bytes = Vec::new();
+            let read =
+                std::fs::File::open(&path).and_then(|f| f.take(limit + 1).read_to_end(&mut bytes));
+            match read {
+                Ok(_) if bytes.len() as u64 <= limit => Disk::Bytes(bytes),
+                _ => Disk::Unreadable,
+            }
+        }
+        _ => Disk::Unreadable,
+    })
+}
+
+/// A copy's time for the recovered bar: the time today, else the date too.
+fn autosaved_at(time: i64) -> String {
+    let (Ok(at), Ok(now)) = (
+        glib::DateTime::from_unix_local(time),
+        glib::DateTime::now_local(),
+    ) else {
+        return "at an unknown time".to_owned();
+    };
+    let pattern = if at.ymd() == now.ymd() {
+        "%H:%M"
+    } else if at.year() == now.year() {
+        "%-d %b, %H:%M"
+    } else {
+        "%-d %b %Y, %H:%M"
+    };
+    at.format(pattern).map(String::from).unwrap_or_default()
 }
 
 fn display_name(file: &gio::File) -> String {

@@ -1,6 +1,6 @@
 # mdview plan
 
-Status, 2026-11-27: Phases 1 to 3 are built and checked, and mdview is installed for Kartik's user on `asus-vivobook`; autosave is not started. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
+Status, 2026-11-27: Phases 1 to 4 are built and checked, and installed for Kartik's user on `asus-vivobook`. [mdview.md](mdview.md) is the usage doc and records what was verified. `mdview` is a working name.
 
 mdview is a small native Markdown viewer and editor for Kartik's CachyOS laptop (`asus-vivobook`, KDE Plasma on Wayland). It opens on the rendered document, Ctrl+E flips the same window to the source, and it does the basic jobs of an ordinary text editor for Markdown files and nothing else. It draws with plain GTK4, so it takes on the system GTK theme (Nordic, Papirus-Dark, Noto Sans) and carries no colours of its own.
 
@@ -23,7 +23,7 @@ File handling:
 - New (Ctrl+N), Save (Ctrl+S), Save As (Ctrl+Shift+S), Close window (Ctrl+W) and Quit (Ctrl+Q).
 - Unsaved work prompts Save, Discard or Cancel before a close or a quit, and before a link click or a drop replaces the document. Quit asks each window with unsaved work in turn, and quits only if none cancels. GTK's own `quit` skips `close-request` entirely, which a probe confirmed, so the app's Quit can't simply call it.
 - Replacing the document always goes: load and validate the new file, then prompt, then swap. A file that fails to load never costs the current one.
-- Changed on disk: if the buffer is unmodified, mdview reloads it silently through a `gio::FileMonitor`. If the buffer is modified, a bar offers Reload or Keep mine. A save never overwrites an outside change silently (see "Saving").
+- Changed on disk: if the buffer is unmodified, mdview reloads it silently through a `gio::FileMonitor`. If the buffer is modified, a bar offers Reload or Keep Mine. A save never overwrites an outside change silently (see "Saving").
 
 Editing, in source mode:
 
@@ -51,7 +51,7 @@ Strictness:
 
 ### Non-functional
 
-- **Dependencies:** exactly two direct crates. The first is `gtk4` 0.11.5 with feature `v4_12`, which covers `FileDialog`, `AlertDialog` and `UriLauncher` (all `v4_10`) and `CssProvider::load_from_string`; `load_from_data` is deprecated since 4.12 and would trip clippy. The host has GTK 4.24 and CI 4.22. The second is `pulldown-cmark` 0.13.6 with `default-features = false`, which drops only its HTML writer and `getopts`. gtk4 has no default features to trim, and its proc-macro crates aren't optional. No clap: `gtk::Application`'s `HANDLES_OPEN` takes the file arguments. No serde, no regex, no hashing crate (std's `DefaultHasher` is enough) and no async runtime: glib's main loop and gio's `_future` calls cover all I/O.
+- **Dependencies:** exactly two direct crates. The first is `gtk4` 0.11.5 with feature `v4_12`, which covers `FileDialog`, `AlertDialog` and `UriLauncher` (all `v4_10`) and `CssProvider::load_from_string`; `load_from_data` is deprecated since 4.12 and would trip clippy. The host has GTK 4.24 and CI 4.22. The second is `pulldown-cmark` 0.13.6 with `default-features = false`, which drops only its HTML writer and `getopts`. gtk4 has no default features to trim, and its proc-macro crates aren't optional. No clap: `gtk::Application`'s `HANDLES_OPEN` takes the file arguments. No serde, no regex, no hashing crate (glib's `compute_checksum_for_data` gives SHA-256) and no async runtime: glib's main loop and gio's `_future` calls cover all I/O.
 - **Build time:** measured on this 16-thread laptop with Rust 1.100.0, using a 48-line probe app built on Application, Stack, TextView and pulldown-cmark (62 crates compiled):
 
   | Build | Time |
@@ -120,11 +120,16 @@ gio's save isn't always atomic. It writes a temporary file and renames it over t
 | Wrong extension, not a regular file, over 8 MiB, unreadable, not UTF-8, or contains NUL | Error dialog naming the file and the reason; the current document stays open |
 | Save fails | Error dialog; the buffer stays marked modified. On the atomic path the file is untouched; on the in-place path the dialog warns it may be damaged and suggests Save As |
 | File changed on disk, buffer unmodified | Reloaded silently |
-| File changed on disk, buffer modified | Bar: Reload or Keep mine. A later save hits the conflict check |
+| File changed on disk, buffer modified | Bar: Reload or Keep Mine. A later save hits the conflict check |
 | File deleted while open | Save recreates it (confirmed by probe) |
 | Save As to an existing `name.md` that the dialog never saw | Asks before overwriting |
 | Quit with unsaved work in several windows | Prompts per window; any Cancel stops the quit |
 | Theme changed while running | Restart needed (see Non-functional) |
+| Crash, kill, SIGTERM or power cut with unsaved work | The next start reopens the work from its recovery copy (Phase 4) |
+| A recovery copy can't be reopened | It moves to `recovery/failed/`, and one notice names the folder |
+| Another mdview holds the recovery lock, the recovery folder is unsafe or not local, or a copy can't be moved, opened for writing or bumped at startup | This one runs with "Autosave off" in its status line, its reason in the tooltip |
+| A recovery copy can't be written or deleted | "Autosave failed" in that window's status line, until a write succeeds |
+| A document too large to copy | "Too large to autosave"; its last copy, with older text, is kept |
 
 ## Repo integration
 
@@ -147,7 +152,147 @@ Three PRs for the foundations, then autosave. Each ends with fmt, clippy and the
 3. **Finish.** Zoom, F11, the status line, link handling, the desktop entry, install steps and the usage doc with its manual checklist.
    - Exit: the checklist passes, and mdview launches from the KDE menu and from Dolphin's "Open with". Built 2026-11-27; the automated part passed and launching through the desktop entry works, and the hand checklist in [mdview.md](mdview.md) is Kartik's to run.
    - As built: zoom is app-wide, a CSS font size above `style.css`'s priority, and the rendered view is rebuilt a frame after GTK applies it, since its measurements come from the font. Installing made mdview the effective default for `text/markdown`, as nothing was set explicitly; [mdview.md](mdview.md) says how to choose.
-4. **Autosave and crash recovery.** Added at Kartik's request on 2026-11-27, after the foundations. To be designed then; it is the one place mdview would write anywhere but the file being edited.
+4. **Autosave and crash recovery.** Added at Kartik's request on 2026-11-27, after the foundations. Designed below ("Phase 4 design"); it is the one place mdview writes anywhere but the file being edited.
+
+## Phase 4 design
+
+Revision 9, 2026-11-27. Nine rounds of skeptic review (state correctness, platform and APIs, simplicity and UX) shaped it, most findings probed on this machine:
+
+- **Round 1:** the first draft was unsound (non-atomic first writes, a two-file pair, resurrected copies, two primaries, `0644` files, a gated glib call, an unstable hash).
+- **Round 2:** revision 2 was over-built, and had holes around in-flight writes, Save As and the meaning of "unsaved work".
+- **Round 3:** deletes fenced only running writes, two writes shared a `.tmp`, the crash counter was async, and a startup comparison could hang.
+- **Round 4:** only the timer checked for unsaved work, the deferred check could mark typing clean, and the startup `fsync`s were costly.
+- **Round 5:** found no path that loses or resurrects text, but faulted revision 5's reworked same-file check, which reintroduced two windows on one file; that rework is reverted here. It also faulted an in-flight write undoing the crash counter's reset, a too-narrow mount denylist, a final `fsync` missed on the most common exit, and a quit that stopped silently after a save with typing during it.
+- **Round 6:** all three lenses converged on one blocker. The mount check ran on the path string, so a local symlink into a FUSE mount passed it; and a recovered window's file watch, and `same_file`'s canonicalize when another file is opened, both touched the recovered path on the main thread before anything had checked it, so a dead mount could hang the launch. Smaller findings covered the re-ask after another path closed the window, the reset as one critical section, a failed delete, and several unstated fallbacks.
+- **Round 7:** found no path that loses text, and prototyped the local-path walk under `strace` in a private mount namespace; it held for mount points, relative and chained symlinks, loops and overmounted ancestors. Its blocker was a mount point listed twice, where "last wins" can pick a mount hidden beneath another. Its other findings: `open_link` canonicalizing an unverified recovered path; a second window opened through a symlink at launch; autosave turning off partway through the scan; how a missing component counts; the order of the folder test and `mkdir`; `set_text` versus an undoable insert; Discard's reload installing a watch; and the re-ask's return value.
+- **Round 8:** the platform lens found it ready, after re-running the prototype with the every-entry rule under `strace`. The others found two specification gaps. A link clicked in an unchecked recovered window could still canonicalize on the main thread. And the rule closing another window found to hold the same file was under-gated (mid-dialog, mid-load, or after a Save As); that rule is dropped. It also found that a copy whose bump fails could burn the others' counts.
+
+- **Round 9:** all three lenses found it ready to implement, asking for small additions (a reload's pending file under the URI-only rule, the folder handed to the file dialogs, a typed load error for Discard, and wording), which are folded in below.
+
+Revision 9 is the design that was implemented. The code then went through its own skeptic rounds, on the same three lenses, each with a `/code-review` pass. Their fixes changed five details of the design above, recorded here rather than rewritten into it:
+
+- Autosave's gate leaves out the Discard marker: text the user chose to discard is still copied while it stays on screen (a quit cancelled at a later window leaves it open). The marker only stops the quit loop asking twice.
+- Discard on the recovered bar has its own load, `discard_recovered`, not `load(file, ask = false)`. A Discard whose bar has since been hidden, by Keep or a save, does nothing. A reload that fails keeps the bar and says why. If the document was edited or saved after the click, or a save or its prompt is under way, it keeps everything and says "Not discarded"; otherwise a missing file closes the window. For a new document, Discard closes the window at once unless a save or prompt is under way, which gets the same "Not discarded".
+- A recovered text is first tried in a spare text buffer; one the buffer can't hold exactly goes to `failed/`, counted in the failed-copies notice, and no window opens for it.
+- `showing()` compares a pending load's file by URI only, in every window, since it may be a path nothing has checked. A file opened twice through different symlinks while the first is still loading gets two windows.
+- A passing I/O error reading a copy at startup leaves every copy for a later start with autosave off, rather than treating that copy as failed; and the newest copy of a file is chosen among all decoded copies, so an older one never reopens in place of a newer one that failed.
+
+**Goal.** A crash, a `kill`, a SIGTERM or a power cut loses at most about 5 seconds of unsaved typing, as far as the filesystem honours `fsync`. **Not a goal:** writing to the document's own file without being asked. Saving stays explicit.
+
+**Where.** `$XDG_STATE_HOME/mdview/recovery/` (or `~/.local/state/…` when the variable is unset or relative), computed by hand, with `recovery-devel/` for a debug build. Folders, `failed/` included, are created `0700` with `std::fs::DirBuilder`. At startup `recovery/` must pass the local-path test (below), must not be a symlink, and its owner must be the current user (`gio::Credentials::new().unix_user()`); a wider mode is tightened to `0700`. If any of that fails, autosave is off for the session. With autosave off, this instance neither writes nor deletes copies.
+
+**The recovery lock.** In `startup` the app takes an exclusive `flock` on `recovery/lock` (`std::fs::File::try_lock`, Rust 1.89) and keeps the `File` in a `static LOCK: OnceLock<File>` for the life of the process. Only the holder writes or recovers copies. Another primary runs with autosave off.
+
+**What.** One file per window with unsaved work, `recovery/<window-uuid>.md`. Its header line is `mdview-recovery 1 <attempts> <time> <length> <uri> <guard>`, and the text follows byte for byte.
+
+- `attempts` is a single digit at a fixed offset (byte 18), so it can be changed in place.
+- `time` is the Unix time of the write.
+- `length` is the text's exact byte count.
+- `uri` is the document's URI, normalised by `gio::File::for_uri(…).uri()` (percent-encoded, no filesystem access), or `-` for a new document.
+- `guard` is the SHA-256 of the file as last read or written, or `-`.
+
+The text may be up to `file::MAX_BYTES` (8 MiB) and the header up to 16 KiB, enough for any local path, since a `PATH_MAX` path percent-encodes to about 12 KiB. A copy over either limit isn't written, and "Too large to autosave" shows. `file::Guard` moves to SHA-256 (`glib::compute_checksum_for_data`).
+
+**Unsaved work** means `has_doc`, the modified flag, and the window's close not yet agreed.
+
+**Same file.** Unchanged from Phase 3 for ordinary windows: `same_file` canonicalizes both paths on the main thread (see Not covered). A recovered window is the exception until its path has passed the local-path test. Until then, `showing()` matches it by normalised URI only and never canonicalizes its path. The rule covers the window's pending load too: a Discard reload of an unchecked path that never returns leaves it pending, and `showing()` still matches it by URI only. The URI-only state ends when the path passes the deferred check, or when a load or Save As in that window succeeds, since the file has then just been read or written. While a window is unchecked, Open and Save As don't hand its folder to the file dialog as the starting folder. The same rule holds for `open_link` in such a window: its same-document check, and the `showing()` check for a link it follows (a relative link resolves into the recovered file's unchecked folder), both match by normalised URI only. The link's file itself is then read by gio's asynchronous load, off the main thread. Recovery's own duplicate check compares normalised URIs only, and touches nothing.
+
+Because recovered windows open before file arguments and before any check finishes, `mdview /symlink/to/X` with X recovered opens a second window on X. Both stay, and each save's guard keeps either from silently overwriting the other. Nothing later closes or merges them.
+
+**The local-path test.** This decides whether a path can be touched without risk of an uninterruptible wait. It runs on `gio::File::path()`, which gio has already normalised (`..` collapsed), the same string `watch` and `canonicalize` use. A file with no local path (`path()` is `None`) isn't local. It walks the path one component at a time from `/`. Before touching each prefix, it finds that prefix's mount by the longest path-component prefix in `/proc/self/mountinfo` (with `\040`-style escapes decoded). The type is read after mountinfo's ` - ` separator. If the filesystem type isn't on the allowlist, the path isn't local, and nothing inside that mount is touched, the mount point included. A mount point listed more than once (an overmount, or a mount placed beneath another) is local only if every entry for it is allowlisted, since the later line isn't always the visible mount. Otherwise it `lstat`s the prefix. `ENOENT` counts as local, because the missing component's parent was local; this is how "The file no longer exists" is reached. Any other `lstat` error counts as not local. A symlink is followed with `readlink`, which reads the local directory it sits in, and the walk continues through the target, stopping as not local after 40 links.
+
+- The allowlist: ext4, ext3, ext2, btrfs, xfs, f2fs, bcachefs, zfs, tmpfs, vfat, exfat and ntfs3. Anything else (FUSE, NFS, CIFS, autofs, overlay, 9p and the rest) isn't local.
+- A FUSE request the daemon has read waits uninterruptibly, so touching a dead one could keep the process from exiting.
+- The test runs off the main thread, except for `recovery/` itself at startup. That check runs once, before `DirBuilder` creates anything, so a `~/.local/state` symlink into a dead mount can't hang the `mkdir`. The symlink, owner and mode checks on `recovery/` come after `DirBuilder`, since on a first run there is nothing to check before it.
+- `/proc/self/mountinfo` is a snapshot: a mount that appears between the test and the touch isn't caught.
+
+**The slot.** Each window shares an `Arc<Mutex<Slot>>` with the thread pool, holding a generation, a write sequence number, a `closed` flag and the window's current `attempts`. The slot mutex is locked with `lock().unwrap_or_else(PoisonError::into_inner)`, and the main thread never holds it across an `.await`.
+
+- **The write gate** is used by the timer, the post-save call and the follow-up. On the main thread, it does nothing unless there is unsaved work. If a write is in flight, it marks one wanted. Otherwise, under the slot mutex, it does nothing if `closed` is set; if not, it records the generation, takes the next sequence number `n`, and snapshots the text, URI and guard.
+- **The blocking write**, on `gio::spawn_blocking`, writes `<uuid>.<n>.tmp`, created with `create_new` at mode `0600`, and calls `sync_all`. Under the slot mutex it does two things. First, if the generation is unchanged and `closed` is unset, it writes the slot's current `attempts` digit into the `.tmp` at byte 18 (`write_at`, never `append`) and renames the `.tmp` over `<uuid>.md`. Otherwise it removes the `.tmp`, ignoring `ENOENT`. The stamped digit isn't `fsync`ed again, so after a power cut a copy can show its pre-reset digit and fail one crash early; no text is lost. With the slot mutex released, it `sync_all`s the folder. Every write has its own `.tmp`, and the digit stamped last is always the current one, so a write that started before a reset can't undo it.
+- **A delete** runs on the main thread. Under the slot mutex it raises the generation and removes `<uuid>.md`; the folder `fsync` follows on the pool. A removal that fails with anything but `ENOENT` shows "Autosave failed", since the copy would otherwise come back at the next start. `recovery/` is local (checked at startup), so the unlink can't stall the main thread. A **final delete** also sets `closed`, so no write can start or land afterwards.
+- **When a write's handle resolves**, and only then, the in-flight flag clears. A panic counts as a failure in a debug build; a release build aborts on panic (`Cargo.toml`), so it ends the app and the last written copy, if any, reopens at the next start. A failed write re-arms the 5-second timer, so the copy catches up once the cause clears. If a write was wanted, the gate runs again at once; edits alone wait for the timer. A write outstanding for over 30 seconds shows "Autosave failed".
+
+**When.** An edit arms a 5-second one-shot timer unless one is armed. There are no timer handles: a late fire after a close is harmless, because the gate and `closed` refuse it. After `save` and after `choose_and_save`, once the file and the guard are both updated (after `finish_save`, and for Save As after `file.replace`), the gate is called, and it writes only if edits came in during the save. A document that grows past the limits keeps its last copy, which holds older text, and "Too large to autosave" shows.
+
+**Deleting** follows two rules:
+
+1. The modified flag goes false: a save with no edits during it, `show` replacing the text, or an undo back to the saved text.
+2. A **final** delete whenever a window closes, by any path, including the existing fast path for a window with nothing unsaved; and for every window just before `app.quit()`. GApplication's `shutdown`, which runs after the main loop ends, including after the last window closes, then `fsync`s the folder synchronously. It doesn't run on SIGTERM, on an abort, or when GTK exits because the compositor connection dropped. Copies then remain (the intent), and a delete whose folder `fsync` hadn't run can come back after a power cut, where the bar's Discard deals with it.
+
+A clean quit leaves only `lock`.
+
+**Prompts.** `confirm_discard`'s Save now re-asks if the save succeeded but the document is still modified (typing during the save), instead of closing or quitting with the copy that holds that typing deleted. It re-asks only while the window has unsaved work. If another path has agreed the window's close meanwhile, it returns true without presenting the window, so a quit carries on. It returns true only when the document is saved or discarded, and false on Cancel or a failed save. The quit loop then simply asks the next window that has unsaved work.
+
+**Crash counter.** `attempts` counts starts that recovered a copy without its window then staying up for 10 seconds.
+
+- In `startup`, before any window exists, a copy whose digit reads 2 or more moves to `failed/`.
+- Any other copy has its digit raised by one in place: one `write_at` with no `fsync`, leaving `time` unchanged. A process crash keeps the page cache, and a power cut only loses one count. So a copy fails after two starts that recovered it and then crashed.
+- The recovered window holds the raised value in its slot, so its own writes carry it.
+- After 10 seconds up, the window, in one critical section under the slot mutex and unless `closed` is set, sets the slot's `attempts` to 0 and writes 0 into `<uuid>.md` if that file exists, opened by path and never created.
+- The moves to `failed/` happen first. Then every remaining copy is opened for writing, and only once all have opened is any digit bumped. If a move fails, or any copy can't be opened for writing (any error: `EROFS`, `EACCES`, `EMFILE` and so on), autosave is off, nothing is bumped, and no copy opens on this start. The copies are left as they are for a later one (those already moved to `failed/` stay there), and the "Autosave off" tooltip says how many. A bump that fails after others succeeded leaves those others one count higher; no text is lost. A Discard bar exists only when autosave is on, so its Discard always deletes.
+
+**Recovery**, in `startup` and only when the lock is taken, in this order: sweep, decode, filter, then bump the copies that remain.
+
+- Stray `*.tmp` files are swept. Names that aren't a uuid with `.md` are ignored.
+- Each uuid-named `.md` is read synchronously after a `symlink_metadata` check: it must be a regular file, not a symlink, within the limits. A FIFO swapped in by the same user between the check and the open is accepted as a risk.
+- It is then decoded, with `length` required to match exactly.
+- Copies that fail, read 2 or more attempts, or are older than another copy with the same normalised URI (newest by `time`; on a tie, the byte-wise greater lowercase uuid string wins) move to `failed/`.
+- Nothing reads the documents' own files during `startup`.
+
+The recovered windows open at the first `activate` or `open` (a launch with files gets only `open`), before any file arguments, so `showing()` finds a recovered document rather than opening it twice. They open directly, one window each, through a path that never sets the modified flag false:
+
+- in edit mode
+- with the recovered text, put in by `set_text` (which can't be undone, so the buffer stays modified), marked modified
+- with the copy's uuid, URI and guard, and the raised attempts
+- not yet watching its file: `watch` (whose `inotify_add_watch` walks the path on the main thread) waits until the deferred check has found the path local
+
+A recovered window shows a bar with **Keep** and **Discard**, styled like the changed-on-disk bar. The two can show at once, one above the other, so "Keep" and "Keep Mine" may appear together.
+
+- **For a file:** "Recovered unsaved changes to “name” (autosaved 27 Nov, 18:02). Keep them, or discard them and reload the file."
+- **For a new document:** "Recovered an unsaved new document (autosaved …). Keep it, or discard it and close this window."
+- **Times** use `glib::DateTime::from_unix_local`, formatted `%H:%M` today, `%-d %b, %H:%M` this year, and `%-d %b %Y, %H:%M` otherwise.
+- **Keep** hides the bar. Nothing else changes.
+- **Discard** for a file reloads it without a second prompt (built as `discard_recovered`; see the five details above), so the modified flag goes false and rule 1 deletes the copy. `file::load` gains a typed error so this can be told apart: if the file no longer exists (`NOT_FOUND`), or for a new document, Discard closes the window, with its close marked agreed first so there is no second prompt. Any other load error keeps the bar and the copy, and shows the error.
+
+**The deferred check.** After the windows open, each recovered file is checked off the main thread on `spawn_blocking`. It first runs the local-path test. A path that isn't local is left alone: the window keeps no file watch and URI-only matching, and gets no "changed on disk" note. A local path gets the rest of the check, and then, if the window's file is still the one snapshotted and it isn't already watched, the window starts watching it and matches it through `same_file` like any other. A Discard that reloads the file goes through `show`, which watches it: that is an ordinary window from then on, its path having just been read successfully.
+
+- The check snapshots the window's edit count, its save count and its file, then reads `metadata().is_file()`, the length and the bytes.
+- **Disk equals the recovered text:** the copy is redundant. If the edit count, the save count and the file are all unchanged, the window becomes an ordinary clean one: its guard is set from the disk bytes, the modified flag goes false (rule 1 deletes the copy), and the bar goes. If the user has typed since, only the guard is set from the disk bytes (unless a save or a load has set it meanwhile), so a save doesn't report a change nobody made.
+- **Disk matches the copy's guard:** nothing to add.
+- **Disk differs from both, or is missing:** if the bar is still showing and no save has happened since the snapshot, it gains "It has changed on disk since; saving will ask before overwriting." or "The file no longer exists; saving recreates it."
+- A check that never returns leaves the bar as it was. A note that arrives after Keep has hidden the bar is dropped; a save's guard still catches the change.
+
+**Failed copies.** If any copies moved to `failed/` on this start, one `AlertDialog` (via `choose_future`) shows over the first window, never parentless:
+
+- Message: "Some recovered text couldn't be reopened".
+- Detail: "mdview kept 1 copy (or N copies) in `<failed folder>`. Each is the text after one header line. Delete them when you no longer need them." The folder is the real `recovery/failed/` (or `recovery-devel/failed/`), with `~` for home as the status line shows it.
+- Buttons: Open Folder (`gtk::FileLauncher`) and Close.
+
+**Status line.** "Autosave off" shows in every window, with its reason in the tooltip: the lock is held elsewhere; the folder is unsafe or not local; or a copy couldn't be moved, opened for writing or bumped at startup, in which case the tooltip also gives how many were left for a later start. "Autosave failed" (until a write succeeds) and "Too large to autosave" show in the affected window. Each joins the existing " · " list, with its reason as a tooltip.
+
+**Logout.** Plasma 6 first asks every window to close (`xdg_toplevel.close`), so mdview's prompts appear. After 10 seconds Plasma offers to log out anyway. The process then ends either by SIGTERM, which GApplication doesn't handle, or when KWin goes away first and GTK exits on the lost compositor connection. Either way its copies remain unless that window's close was agreed. This comes from KWin's source and bug tracker and hasn't been observed here; a real logout is on the manual checklist.
+
+**Not covered.**
+
+- A copy is plain text in the home folder, so a document on an encrypted mount has an unencrypted copy until it is saved or discarded.
+- A power cut is covered only as far as the filesystem keeps `fsync`'s promise.
+- A recovered file whose path isn't local (by the local-path test, symlinks followed) gets no file watch, until a Discard reloads it, and no "changed on disk since" note, though a save still guards it.
+- A mount point listed more than once counts as not local, so an automounted filesystem (`autofs` beneath the real one) is never local. An `overlay` (toolbox, distrobox) or an `ecryptfs` home isn't either, being off the allowlist. If `recovery/` is on one, autosave is off.
+- gio's inotify backend rescans missing paths on its own thread under the lock `watch` also takes, so a mount appearing later could still stall a later `watch`; ordinary windows share that exposure.
+- The existing `same_file` canonicalizes on the main thread, and so can stall on a dead network mount for windows the user opened; Phase 4 never applies it to a recovered path that hasn't passed the local-path test.
+- The pre-existing Save As race (another window opening the target during the save) can still bind two windows to one file. Recovery then keeps the newer copy and puts the older in `failed/`.
+- The usage doc says where copies live, and that deleting the folder while mdview isn't running clears them.
+
+**Shape.** A new `recovery.rs`, holding:
+
+- the paths, folder checks and recovery lock
+- the header encode and decode (pure, unit-tested)
+- the slot, the blocking write, the delete, and the in-place digit write
+- the local-path test (mountinfo parsing and the prefix lookup pure and unit-tested)
+- the startup scan
+
+`window.rs` gains the write state, the gate, the two delete rules, the post-save calls, the reworked Save answer in `confirm_discard`, the recovered windows and bar, and the deferred check. `main.rs` gains the `startup` scan, the `shutdown` folder `fsync`, and the recovery step in `activate` and `open`. No new crate; `rust-version` rises from 1.88 to 1.89.
 
 ## Trade-offs
 

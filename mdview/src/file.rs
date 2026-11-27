@@ -3,7 +3,6 @@
 //! Each refusal is a lower-case clause ("it isn't a regular file"), shown under a heading such
 //! as "Couldn't open ...".
 
-use std::hash::{DefaultHasher, Hasher};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -45,34 +44,77 @@ pub fn check_text(bytes: &[u8]) -> Result<&str, String> {
         .map_err(|e| format!("it isn't valid UTF-8 (from byte {})", e.valid_up_to()))
 }
 
-/// What the file held when mdview last read or wrote it, as a hash of its bytes. The bytes, not
-/// the modification time: an outside edit that restored the old time still shows, and a `touch`
-/// that changed nothing else doesn't.
-#[derive(Clone, Debug)]
+/// What the file held when mdview last read or wrote it, as the SHA-256 of its bytes. The bytes,
+/// not the modification time: an outside edit that restored the old time still shows, and a
+/// `touch` that changed nothing else doesn't. SHA-256 rather than a process-local hash, since a
+/// recovery copy carries it to a later run.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Guard {
-    hash: u64,
+    hex: String,
 }
 
 impl Guard {
     pub fn of(bytes: &[u8]) -> Self {
-        Self { hash: hash(bytes) }
+        Self { hex: sha256(bytes) }
     }
 
     /// Whether `bytes` are what the file held when this guard was taken.
     pub fn matches(&self, bytes: &[u8]) -> bool {
-        self.hash == hash(bytes)
+        self.hex == sha256(bytes)
+    }
+
+    /// The hash as 64 lowercase hex digits, for a recovery copy's header.
+    pub fn to_hex(&self) -> &str {
+        &self.hex
+    }
+
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let valid = hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        valid.then(|| Self {
+            hex: hex.to_owned(),
+        })
     }
 }
 
-fn hash(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(bytes);
-    hasher.finish()
+fn sha256(bytes: &[u8]) -> String {
+    // None only for a checksum type GLib doesn't know; an empty guard would match every file.
+    glib::compute_checksum_for_data(glib::ChecksumType::Sha256, bytes)
+        .map(String::from)
+        .expect("GLib always has SHA-256")
 }
 
 pub struct Loaded {
     pub text: String,
     pub guard: Guard,
+}
+
+/// Why a file didn't load. Missing is told apart, so a recovered window's Discard can close
+/// when its file is gone.
+#[derive(Debug)]
+pub enum LoadError {
+    NotFound,
+    Failed(String),
+}
+
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for LoadError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("it doesn't exist"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 /// A file's bytes, with its etag as it was just before they were read.
@@ -83,12 +125,12 @@ pub struct OnDisk {
 
 /// Reads a Markdown file, refusing anything that isn't a regular file of at most `MAX_BYTES`
 /// with a Markdown name.
-pub async fn load(file: &gio::File) -> Result<Loaded, String> {
+pub async fn load(file: &gio::File) -> Result<Loaded, LoadError> {
     let name = file.basename().ok_or("it has no file name")?;
     if !is_markdown_name(&name) {
-        return Err("only .md and .markdown files open in mdview".to_owned());
+        return Err("only .md and .markdown files open in mdview".into());
     }
-    let disk = read_checked(file).await?.ok_or("it doesn't exist")?;
+    let disk = read_checked(file).await?.ok_or(LoadError::NotFound)?;
     let text = check_text(&disk.bytes)?.to_owned();
     Ok(Loaded {
         text,
