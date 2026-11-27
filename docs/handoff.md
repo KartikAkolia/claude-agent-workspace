@@ -2,9 +2,28 @@
 
 Continuing Kartik's Cowork setup and titus-ai/Claude Code integration work. Read the files below before doing anything else, they carry the context this note doesn't repeat.
 
-## Where things stand (as of 2026-11-17)
+## Where things stand (as of 2026-11-22)
 
 All six roadmap phases are complete; `ROADMAP.md` is the authoritative phase-by-phase record. Work since then has been host setup and repo tooling across `dell-optiplex`, `asus-vivobook`, the AdGuardHome Pi, Windows and macOS. Session entries since 2026-10-11 are kept below, newest first. Everything older was moved verbatim to `docs/archival.md` on 2026-10-11, together with the closed open items.
+
+### This session's work (2026-11-22, on the CachyOS laptop): `br0` deleted and recreated from scratch; `br0net` libvirt network added
+
+Kartik asked for every `br0` profile to be removed and the bridge rebuilt, because he'd had to diagnose a broken connection after each reboot. The journal for boots −2 and −3 shows the old causes, all fixed on 2026-11-21: the dongle in `cdc_ncm` mode, `Wired connection 1` taking the NIC from `br0`, and the 45 s DHCP timeout failing the bridge. Boots −1 and 0 brought `br0` up cleanly, with a lease within 3 s.
+
+1. **Rebuilt (one `pkexec` script with automatic rollback, keyfile backup in `/var/tmp/br0-rebuild-20261122-104923/`):** the two old profiles were deleted. The first run rolled itself back because `connection.autoconnect-ports` takes `true`, not `yes`. The new `br0` (`a1198034-…`) keeps the settings that worked: `bridge.stp no`, `bridge.mac-address 9C:69:D3:00:2C:84`, DHCP on IPv4 and IPv6 at `route-metric 700`, `ipv4.dhcp-timeout infinity`, and autoconnect plus `autoconnect-ports true`. The new `br0-port1` (`5a44d5e3-…`) is `type ethernet controller br0 port-type bridge` (`bridge-slave` is deprecated in nmcli 1.58), matched by MAC rather than `ifname`, because the dongle's name follows its USB port. The udev rule `70-ax88179b-cdc-ether.rules` is unchanged.
+2. **Verified live:** `bridge link` shows `enp100s0f3u3c3 master br0 state forwarding`, `br0` has `192.168.0.120/24`, Wi-Fi keeps the primary default route (metric 600 against 700), `ping -I br0 192.168.0.1` gets replies, and DNS resolves.
+3. **`br0net`:** defined from `<forward mode='bridge'/><bridge name='br0'/>`, started and set to autostart (no root needed on `qemu:///system`). `win11` still uses `<interface type='bridge'><source bridge='br0'/>` directly, which is equivalent, so it wasn't changed.
+4. **Other network managers:** nothing to disable. `systemd-networkd` (and its socket), `dhcpcd`, `dnsmasq.service` and `systemd-resolved` are already disabled and inactive, and netplan, dhclient, wicd, iwd and connman aren't installed. The `dnsmasq` process that is running is NetworkManager's own DNS plugin, not the standalone service.
+5. **`win11` NIC:** at first the domain showed `model type='rtl8139'` (MAC `52:54:00:54:ca:69`, no vhost). By the time Kartik asked for virtio with vhost, the domain was already `virtio` on `<source network='br0net'/>`, changed outside this session. `virt-xml` then added `<driver name='vhost' queues='4'/>` (old XML in the session scratchpad only). The VM was running at the time, so the vhost driver applies only after a full power-off. The live NIC is `vnet2`, forwarding on `br0`.
+6. **Pending:** boot persistence is config-inspected only (item 62).
+
+### This session's work (2026-11-21, on the CachyOS laptop): `win11` moved to a virtio disk on the USB SN730; TRIM enabled on the host for this session only
+
+Kartik asked for help setting up the `win11` VM on the WD SN730 in a Sabrent USB enclosure (`sda`). The full record is in `docs/laptop-win11-usb-ssd-vm.md`.
+
+1. **Done and verified in the domain XML:** the disk is on `bus='virtio'` with `discard='unmap'`, using the drive's `ata-…_202694800158` by-id path. There's also a virtio mouse and keyboard, and the `br0` NIC has `<driver name='vhost' queues='4'/>`. A short trial of emulated NVMe (`bus='nvme'`) was reverted. Kartik confirmed Windows boots from the virtio disk.
+2. **The fix that got virtio booting:** `viostor` was in the driver store but had no service. A 1 GiB virtio volume hot-plugged into the running VM made Windows create the service as `BOOT_START`, followed by one Safe Mode boot. The temporary volume is deleted.
+3. **TRIM:** Windows allows it (`DisableDeleteNotify = 0`). The host's `provisioning_mode` was set to `unmap` by hand, and `lsblk -D` now shows `DISC-MAX 4G`. That isn't persistent, and no real TRIM has gone through yet (item 61).
 
 ### This session's work (2026-11-17, on the CachyOS laptop): first real dwm-titus login crashed; root cause found, fixed, pushed to `main` and installed
 
@@ -437,7 +456,7 @@ Kartik asked for frontend-design, Playwright MCP, MemPalace, the OmniRoute plugi
 
 ## Open items for Kartik
 
-Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 61.
+Item numbers are stable and never reused: closed items move to `docs/archival.md` under their original number, and the next new item is 63.
 
 - **12.** **Loopwire Dashboard real data source.** Blocked on a decision only Kartik can make: what backs the Dashboard's stats/chart/table (`personal-website/SPEC.md` non-goals, `personal-website/ROADMAP.md` Phase 5). AI hooking's own Anthropic-billing blocker (2026-08-26) is separate and out of scope until Kartik has a working way to pay for API usage.
 - **13.** **Cloudflare items deliberately left open** (2026-08-26): account 2FA (dashboard-only, can't be scripted), Hotlink Protection (likely safe but held for explicit confirmation because of `personal-website`'s deliberately-embeddable `/embed/widget/` route), and HSTS preload (effectively irreversible once submitted). See `docs/cloudflare-zone-settings.md`.
@@ -481,6 +500,8 @@ Item numbers are stable and never reused: closed items move to `docs/archival.md
 
 - **59.** **Raspberry Pi: put the RSS stack online through its own tunnel.** (2026-11-15) FreshRSS runs LAN-only at `http://192.168.0.166:8080`. Follow "Adding the tunnel" in `docs/rss-stack-pi.md`: create a new tunnel token (not `kartikpassbolt`'s), run `sudo /opt/rss-stack/rss-stack.sh update --domain rss.<domain> --tunnel-token '<token>'`, point the public hostname at `http://freshrss:80`, add Access (email login, Bypass `/api/*`), then `sudo ufw delete allow from 192.168.0.0/24 to any port 8080 proto tcp`. Also delete the leftover dry-run folder: `rm -r ~/rss-dry` on the Pi.
 - **60.** **Change the FreshRSS admin and API passwords shown in chat on 2026-11-15.** They were pasted from the install output. The risk is low while FreshRSS is LAN-only, but the API password will face the internet once item 59 is done. Change both under FreshRSS's profile settings, then put the same values in `/opt/rss-stack/.env` (7–72 letters and digits) so `credentials` stays accurate, since `.env` doesn't track changes made in the web UI.
+- **61.** **CachyOS laptop: test TRIM through the RTL9210 USB enclosure, then make it persistent.** (2026-11-21) `provisioning_mode` on `sda` is set to `unmap` until the next replug or reboot. Start `win11`, run Optimize on C: in Windows, then on the host check `journalctl -k | grep -iE 'sda|uas|I/O error|reset'`. If it's clean, create `/etc/udev/rules.d/50-rtl9210-unmap.rules` from `docs/laptop-win11-usb-ssd-vm.md`, run `pkexec udevadm control --reload`, replug, and check that `lsblk -D /dev/sda` shows a non-zero `DISC-MAX`. If there are errors, replug the enclosure and leave TRIM off.
+- **62.** **CachyOS laptop: confirm the rebuilt `br0` survives a reboot.** (2026-11-22) After rebooting with the dongle plugged in, run `nmcli -f NAME,DEVICE con show --active` (expect `br0` and `br0-port1` on `enp100s0f3u3c3`), `bridge link` (expect `master br0 state forwarding`), `ip route | grep default` (expect `wlp2s0` at metric 600 and `br0` at 700), `virsh -c qemu:///system net-list` (expect `br0net` active), and `journalctl -b -u NetworkManager | grep -iE 'br0.*(fail|timeout)'` (expect nothing). The old profiles are in `/var/tmp/br0-rebuild-20261122-104923/` if they're ever needed. After a full `win11` power-off and start, `virsh -c qemu:///system dumpxml win11 | grep -A6 '<interface'` should show `driver name='vhost' queues='4'`, and Windows should still get a `192.168.0.x` lease.
 
 ## Notes
 
