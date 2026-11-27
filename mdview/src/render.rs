@@ -6,7 +6,9 @@
 //! Each table has an `ANCHOR` character in the text where it goes, so the styles around it (a
 //! quote's or a list item's indent) cover it.
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CowStr, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
+};
 
 /// CommonMark plus tables, task lists and strikethrough, and front matter so that a `---` block
 /// isn't read as a rule and a heading. Nothing else (docs/mdview-plan.md, "Strictness").
@@ -95,6 +97,33 @@ pub struct Rendered {
     /// Where each block starts, in order: its character offset in `text` and its zero-based line
     /// in the source. Switching between the view and the source keeps the place with these.
     pub blocks: Vec<(usize, usize)>,
+    /// Every link outside a table, in order (tables' links are in their cells' markup).
+    pub links: Vec<Link>,
+}
+
+/// A link's text, as character offsets into `Rendered::text`, and where it points.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+/// A link's target: an email autolink becomes a `mailto:` URI.
+fn link_url(link_type: LinkType, dest_url: &CowStr) -> String {
+    match link_type {
+        LinkType::Email => format!("mailto:{dest_url}"),
+        _ => dest_url.to_string(),
+    }
+}
+
+/// Words in the source, for the status line: whitespace-separated runs holding a letter or
+/// digit, so Markdown's own marks (`#`, `-`, `|`, `>`) don't count.
+pub fn word_count(source: &str) -> usize {
+    source
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count()
 }
 
 pub fn render(source: &str) -> Rendered {
@@ -177,6 +206,8 @@ struct Builder {
     /// Code, HTML or front matter being collected, so its trailing newline can be dropped.
     raw: Option<String>,
     table: Option<TableBuild>,
+    /// The targets of the links open outside a table.
+    urls: Vec<String>,
     /// The source line the current event starts on.
     line: usize,
 }
@@ -226,8 +257,13 @@ impl Builder {
                 Tag::Emphasis => t.open("<i>", "</i>"),
                 Tag::Strong => t.open("<b>", "</b>"),
                 Tag::Strikethrough => t.open("<s>", "</s>"),
-                Tag::Link { dest_url, .. } => {
-                    let open = format!("<a href=\"{}\">", escape(&dest_url));
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                } => {
+                    let url = link_url(link_type, &dest_url);
+                    let open = format!("<a href=\"{}\">", escape(&url));
                     t.cell.push_str(&open);
                     t.closers.push("</a>");
                 }
@@ -301,7 +337,14 @@ impl Builder {
             Tag::Emphasis => self.open_inline(Style::Emphasis),
             Tag::Strong => self.open_inline(Style::Strong),
             Tag::Strikethrough => self.open_inline(Style::Strike),
-            Tag::Link { .. } => self.open_inline(Style::Link),
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                self.urls.push(link_url(link_type, &dest_url));
+                self.open_inline(Style::Link);
+            }
             Tag::Image { .. } => self.open_inline(Style::ImageAlt),
             // Table parts only arrive inside a table, handled above. Footnotes, definition
             // lists, superscript and subscript are off in OPTIONS.
@@ -390,7 +433,19 @@ impl Builder {
                 }
                 self.close();
             }
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+            TagEnd::Link => {
+                let start = self.open.last().map_or(self.len, |&(_, start)| start);
+                self.close();
+                let url = self.urls.pop().unwrap_or_default();
+                if self.len > start {
+                    self.out.links.push(Link {
+                        start,
+                        end: self.len,
+                        url,
+                    });
+                }
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.close();
             }
             _ => {}
@@ -763,6 +818,39 @@ mod tests {
         assert_eq!(render("- a\n  > q\n").text, "• a\nq");
         assert_eq!(render("- ```\n  x\n  ```\n- y\n").text, "• \nx\n• y");
         assert_eq!(render("- # H\n  text\n").text, "• \nH\ntext");
+    }
+
+    #[test]
+    fn links_keep_their_targets() {
+        let r = render("See [the *plan*](docs/plan.md#top), <https://x.org> and <a@b.org>.\n");
+        assert_eq!(r.text, "See the plan, https://x.org and a@b.org.");
+        let links: Vec<(&str, &str)> = r
+            .links
+            .iter()
+            .map(|l| (&r.text[l.start..l.end], l.url.as_str()))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("the plan", "docs/plan.md#top"),
+                ("https://x.org", "https://x.org"),
+                ("a@b.org", "mailto:a@b.org"),
+            ]
+        );
+        let r = render("| <a@b.org> |\n|---|\n");
+        assert_eq!(
+            r.tables[0].table.rows[0],
+            ["<a href=\"mailto:a@b.org\">a@b.org</a>"]
+        );
+    }
+
+    #[test]
+    fn words_count_text_not_markup() {
+        assert_eq!(
+            word_count("# Title\n\n- one, two\n| a | 3 |\n> --- ok\n"),
+            6
+        );
+        assert_eq!(word_count(""), 0);
     }
 
     #[test]

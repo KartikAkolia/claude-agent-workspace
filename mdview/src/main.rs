@@ -3,6 +3,7 @@
 
 mod file;
 mod find;
+mod link;
 mod render;
 mod window;
 
@@ -54,8 +55,21 @@ fn startup(app: &gtk::Application) {
         }
     });
     app.add_action(&quit);
+    // Zoom is app-wide (window::zoom): every window's text, both views.
+    for (name, step) in [("zoom-in", 1), ("zoom-out", -1), ("zoom-reset", 0)] {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate(move |_, _| window::zoom(step));
+        app.add_action(&action);
+    }
     // Undo, redo, cut, copy, paste and select all are the TextView's own bindings.
-    let accels: [(&str, &[&str]); 12] = [
+    let accels: [(&str, &[&str]); 16] = [
+        (
+            "app.zoom-in",
+            &["<Control>plus", "<Control>equal", "<Control>KP_Add"],
+        ),
+        ("app.zoom-out", &["<Control>minus", "<Control>KP_Subtract"]),
+        ("app.zoom-reset", &["<Control>0", "<Control>KP_0"]),
+        ("win.fullscreen", &["F11"]),
         ("app.quit", &["<Control>q"]),
         ("win.new", &["<Control>n"]),
         ("win.open", &["<Control>o"]),
