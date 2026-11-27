@@ -9,13 +9,36 @@ publish = false
 [dependencies]
 libc = "0.2.191"
 portable-pty = "0.9.0"
-ratatui = "0.30.2"
+# Only the crossterm backend: no calendar widget (and its `time` dependency) or ratatui-macros,
+# which nothing here uses. ratatui-crossterm turns underline-color on regardless.
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
 serde_json = "1.0.154"
 # tui-term 0.3.4 renders vt100 0.16 screens, so the two versions move together.
 tui-term = "0.3.4"
 vt100 = "0.16.2"
 
+# Line tables keep file:line in this crate's backtraces; dependency debug info is most of the
+# build cost and rarely needed. For a full debugger build: --config 'profile.dev.debug=true'.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Everyday release builds: Cargo's default codegen units and crate-local LTO, kept incremental,
+# so a rebuild after an edit takes well under a second. Still unwinds on panic, as the threads
+# and the Drop impls that kill child processes rely on.
 [profile.release]
-codegen-units = 1
-lto = true
+incremental = true
 strip = true
+
+# The smallest binary, for handing out: cargo build --profile dist (lands in target/dist/).
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+incremental = false
+lto = true
