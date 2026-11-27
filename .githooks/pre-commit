@@ -80,18 +80,21 @@ while IFS= read -r -d '' f; do
 	python) python_files+=("$f") ;;
 	esac
 done <"$tmp/staged"
-# Any change under minecraft-tui/ counts, deletions and either side of a rename included: the
-# pathspec applies before rename detection, so a file moved out still shows as deleted here.
-rust_staged=0
-git diff --cached --quiet -- minecraft-tui
-case $? in
-0) ;;
-1) rust_staged=1 ;;
-*)
-	printf 'pre-commit: could not tell whether this commit touches minecraft-tui/\n' >&2
-	rust_staged=1
-	;;
-esac
+# The Rust crates, each linted when the commit touches it. Any change under the crate counts,
+# deletions and either side of a rename included: the pathspec applies before rename
+# detection, so a file moved out still shows as deleted here.
+rust_crates=()
+for crate in minecraft-tui mdview; do
+	git diff --cached --quiet -- "$crate"
+	case $? in
+	0) ;;
+	1) rust_crates+=("$crate") ;;
+	*)
+		printf 'pre-commit: could not tell whether this commit touches %s/\n' "$crate" >&2
+		rust_crates+=("$crate")
+		;;
+	esac
+done
 
 setup_error=0
 link_files=("${markdown_files[@]}")
@@ -178,15 +181,17 @@ if [ "${#python_files[@]}" -gt 0 ] || [ "$ruff_version_changed" -eq 1 ]; then
 	LINT_VERSIONS_MODE=index ./lint-python.sh "${python_files[@]}" || status=1
 fi
 
-if [ "$rust_staged" -eq 1 ] && [ ! -f minecraft-tui/Cargo.toml ]; then
-	: # The commit removes the crate, so there is nothing left to lint.
-elif [ "$rust_staged" -eq 1 ] && ! command -v cargo >/dev/null 2>&1; then
-	printf 'pre-commit: cargo not found on PATH, needed to lint minecraft-tui/ (install Rust with rustfmt and clippy)\n' >&2
-	status=1
-elif [ "$rust_staged" -eq 1 ]; then
+for crate in "${rust_crates[@]}"; do
+	# A commit that removes the crate leaves nothing to lint.
+	[ -f "$crate/Cargo.toml" ] || continue
+	if ! command -v cargo >/dev/null 2>&1; then
+		printf 'pre-commit: cargo not found on PATH, needed to lint %s/ (install Rust with rustfmt and clippy)\n' "$crate" >&2
+		status=1
+		break
+	fi
 	# The real checkout's target/ keeps the dependencies built, so only the crate recompiles.
-	(cd minecraft-tui && export CARGO_TARGET_DIR="$real_root/minecraft-tui/target" &&
+	(cd "$crate" && export CARGO_TARGET_DIR="$real_root/$crate/target" &&
 		cargo fmt --check && cargo clippy --quiet --locked --all-targets -- -D warnings) || status=1
-fi
+done
 
 exit "$status"

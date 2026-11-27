@@ -1,0 +1,80 @@
+name: mdview
+
+# CI for mdview/, the GTK4 Markdown viewer: cargo fmt --check, clippy with
+# warnings as errors, and the unit tests. Backstop for the local pre-commit
+# hook (.githooks/pre-commit), which runs fmt and clippy but not the tests.
+#
+# Deliberately one slim job, not a copy of minecraft-tui.yml: no release
+# artifact (a GTK app needs the desktop to try, not a download) and no timing
+# harness. The action and toolchain pins match minecraft-tui.yml; bump them
+# together. docs/mdview.md and docs/repo-tooling.md describe it.
+on:
+  push:
+    # Branches only: GitHub ignores `paths` for tag pushes.
+    branches: ["**"]
+    paths:
+      - "mdview/**"
+      - ".github/workflows/mdview.yml"
+  pull_request:
+    paths:
+      - "mdview/**"
+      - ".github/workflows/mdview.yml"
+
+# A newer push to the same branch or pull request makes a running build moot;
+# on master every merged commit keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The same pinned toolchain as minecraft-tui.yml and the local hook's Rust.
+  RUSTUP_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+    working-directory: mdview
+
+jobs:
+  check:
+    # ubuntu-latest is Ubuntu 26.04 (GTK 4.22) since late 2026; the crate
+    # needs GTK 4.12 or newer (the gtk4 crate's v4_12 feature).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # gtk4-rs links against the system GTK, found through pkg-config.
+      - name: GTK development files
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev
+          pkg-config --modversion gtk4
+
+      # The image's own stable is uninstalled so it can't change rust-cache's key.
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup toolchain uninstall stable >/dev/null 2>&1 || true
+          rustc --version
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: mdview
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        if: ${{ !cancelled() }}
+        run: cargo test --locked
