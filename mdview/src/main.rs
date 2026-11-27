@@ -4,6 +4,7 @@
 mod file;
 mod find;
 mod link;
+mod recovery;
 mod render;
 mod window;
 
@@ -24,6 +25,8 @@ fn main() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     app.connect_startup(startup);
+    // After the main loop ends: the last copy deletes reach the disk.
+    app.connect_shutdown(|_| window::sync_recovery());
     app.connect_activate(window::activate);
     app.connect_open(|app, files, _hint| {
         for file in files {
@@ -34,6 +37,9 @@ fn main() -> glib::ExitCode {
 }
 
 fn startup(app: &gtk::Application) {
+    // Before any window: the recovery lock, and the copies a crash left (recovery::start).
+    window::set_recovery(recovery::start());
+
     // One above USER priority: KDE's ~/.config/gtk-4.0/gtk.css imports the whole Nordic sheet
     // at USER priority, and GTK compares priority before specificity.
     let provider = gtk::CssProvider::new();
